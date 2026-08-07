@@ -61,7 +61,10 @@ func newAskFixture(t *testing.T, toolName, sessionID, userID string, timeout, po
 	exec.SetAdmissionChain(NewChain(
 		[]Hook{fixedHook{decision: Decision{Kind: Ask}}},
 		nil,
-		NewHITLAskResolver(store, timeout, poll),
+		// nil notifier: these seam tests assert the approve/reject/timeout
+		// decision, not the pending-emit; a nil notifier disables the emit and
+		// leaves the hold behavior unchanged.
+		NewHITLAskResolver(store, timeout, poll, nil),
 	))
 
 	return askFixture{
@@ -126,6 +129,9 @@ func (failingHumanStore) ListPending(context.Context) ([]*HumanRequest, error) {
 }
 func (failingHumanStore) ListBySession(context.Context, string) ([]*HumanRequest, error) {
 	return nil, fmt.Errorf("hitl store unavailable")
+}
+func (failingHumanStore) RespondToRequest(context.Context, string, string, string, string, map[string]interface{}) error {
+	return fmt.Errorf("hitl store unavailable")
 }
 func (failingHumanStore) Close() error { return nil }
 
@@ -243,7 +249,9 @@ func TestAskHITL_StoreFailure_DeniesFailClosed(t *testing.T) {
 	exec.SetAdmissionChain(NewChain(
 		[]Hook{fixedHook{decision: Decision{Kind: Ask}}},
 		nil,
-		NewHITLAskResolver(failingHumanStore{}, time.Second, 10*time.Millisecond),
+		// nil notifier: the store fails before any emit could fire; this case
+		// only asserts the fail-closed deny.
+		NewHITLAskResolver(failingHumanStore{}, time.Second, 10*time.Millisecond, nil),
 	))
 
 	res, err := exec.Execute(session.WithSessionID(context.Background(), "sess-1"), "needs_approval", nil)

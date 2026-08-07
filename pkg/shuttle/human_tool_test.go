@@ -26,6 +26,11 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// AC1: RespondToRequest is a member of the HumanRequestStore interface, and the
+// in-memory store satisfies that interface at build time. This assignment fails
+// to compile if the method is dropped from the interface or from the store.
+var _ HumanRequestStore = (*InMemoryHumanRequestStore)(nil)
+
 func TestContactHumanTool_Metadata(t *testing.T) {
 	tool := NewContactHumanTool(ContactHumanConfig{})
 
@@ -345,12 +350,16 @@ func TestInMemoryHumanRequestStore(t *testing.T) {
 		assert.Len(t, session2Reqs, 1)
 	})
 
+	// AC2: resolving a pending, non-expired request stamps
+	// status/responded_by/responded_at/response exactly once.
 	t.Run("RespondToRequest", func(t *testing.T) {
 		store = NewInMemoryHumanRequestStore()
 
+		now := time.Now()
 		req := &HumanRequest{
-			ID:     "respond-test",
-			Status: "pending",
+			ID:        "respond-test",
+			Status:    "pending",
+			ExpiresAt: now.Add(5 * time.Minute),
 		}
 		err := store.Store(ctx, req)
 		require.NoError(t, err)
@@ -377,20 +386,56 @@ func TestInMemoryHumanRequestStore(t *testing.T) {
 		assert.Contains(t, err.Error(), "not found")
 	})
 
-	t.Run("RespondToRequest_AlreadyResponded", func(t *testing.T) {
+	// AC3: a second respond on an already-decided row is a no-op that returns nil
+	// (not an error) and does not mutate the row — the original outcome stands.
+	t.Run("RespondToRequest_AlreadyDecidedIsNoOp", func(t *testing.T) {
 		store = NewInMemoryHumanRequestStore()
 
+		now := time.Now()
 		req := &HumanRequest{
-			ID:     "already-responded",
-			Status: "approved",
+			ID:        "already-responded",
+			Status:    "pending",
+			ExpiresAt: now.Add(5 * time.Minute),
 		}
 		err := store.Store(ctx, req)
 		require.NoError(t, err)
 
-		// Try to respond again
-		err = store.RespondToRequest(ctx, "already-responded", "rejected", "No", "test@example.com", nil)
-		assert.Error(t, err)
-		assert.Contains(t, err.Error(), "already responded")
+		// Resolve once.
+		err = store.RespondToRequest(ctx, "already-responded", "approved", "Yes", "alice@example.com", nil)
+		require.NoError(t, err)
+
+		// A conflicting second response is a no-op: nil, first outcome preserved.
+		err = store.RespondToRequest(ctx, "already-responded", "rejected", "No", "bob@example.com", nil)
+		require.NoError(t, err)
+
+		unchanged, err := store.Get(ctx, "already-responded")
+		require.NoError(t, err)
+		assert.Equal(t, "approved", unchanged.Status)
+		assert.Equal(t, "Yes", unchanged.Response)
+		assert.Equal(t, "alice@example.com", unchanged.RespondedBy)
+	})
+
+	// AC4: respond on a request whose ExpiresAt is already past does not resolve
+	// it and returns nil (not an error); the row stays pending.
+	t.Run("RespondToRequest_ExpiredIsNoOp", func(t *testing.T) {
+		store = NewInMemoryHumanRequestStore()
+
+		now := time.Now()
+		req := &HumanRequest{
+			ID:        "expired",
+			Status:    "pending",
+			ExpiresAt: now.Add(-1 * time.Minute),
+		}
+		err := store.Store(ctx, req)
+		require.NoError(t, err)
+
+		err = store.RespondToRequest(ctx, "expired", "approved", "Yes", "alice@example.com", nil)
+		require.NoError(t, err)
+
+		unresolved, err := store.Get(ctx, "expired")
+		require.NoError(t, err)
+		assert.Equal(t, "pending", unresolved.Status)
+		assert.Empty(t, unresolved.RespondedBy)
 	})
 }
 

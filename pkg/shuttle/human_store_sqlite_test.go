@@ -18,6 +18,11 @@ import (
 	"github.com/teradata-labs/loom/pkg/observability"
 )
 
+// AC1: RespondToRequest is a member of the HumanRequestStore interface, and the
+// SQLite store satisfies that interface at build time. This assignment fails to
+// compile if the method is dropped from the interface or from the store.
+var _ HumanRequestStore = (*SQLiteHumanRequestStore)(nil)
+
 func TestSQLiteHumanRequestStore_BasicOperations(t *testing.T) {
 	store := newTestSQLiteStore(t)
 	defer func() { _ = store.Close() }()
@@ -259,13 +264,16 @@ func TestSQLiteHumanRequestStore_RespondToRequest(t *testing.T) {
 	assert.Equal(t, "Backup verified", updated.ResponseData["reason"])
 }
 
-func TestSQLiteHumanRequestStore_RespondToRequest_AlreadyResponded(t *testing.T) {
+// AC3: a second RespondToRequest on an already-decided row is a no-op that
+// returns nil (not an error) and does not mutate the row — Get reads back the
+// original outcome.
+func TestSQLiteHumanRequestStore_RespondToRequest_AlreadyDecidedIsNoOp(t *testing.T) {
 	store := newTestSQLiteStore(t)
 	defer func() { _ = store.Close() }()
 
 	ctx := context.Background()
 
-	// Create and respond to a request
+	// Create and resolve a request once.
 	now := time.Now()
 	req := &HumanRequest{
 		ID:          "req-1",
@@ -286,10 +294,51 @@ func TestSQLiteHumanRequestStore_RespondToRequest_AlreadyResponded(t *testing.T)
 	err = store.RespondToRequest(ctx, "req-1", "approved", "Yes", "alice@example.com", nil)
 	require.NoError(t, err)
 
-	// Try to respond again
+	// A conflicting second response is a no-op: it returns nil and leaves the
+	// first outcome intact.
 	err = store.RespondToRequest(ctx, "req-1", "rejected", "No", "bob@example.com", nil)
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "already responded")
+	require.NoError(t, err)
+
+	unchanged, err := store.Get(ctx, "req-1")
+	require.NoError(t, err)
+	assert.Equal(t, "approved", unchanged.Status)
+	assert.Equal(t, "Yes", unchanged.Response)
+	assert.Equal(t, "alice@example.com", unchanged.RespondedBy)
+}
+
+// AC4: RespondToRequest on a request whose ExpiresAt is already past does not
+// resolve it and returns nil (not an error); the row stays pending.
+func TestSQLiteHumanRequestStore_RespondToRequest_ExpiredIsNoOp(t *testing.T) {
+	store := newTestSQLiteStore(t)
+	defer func() { _ = store.Close() }()
+
+	ctx := context.Background()
+
+	// A pending request whose ExpiresAt is already in the past.
+	now := time.Now()
+	req := &HumanRequest{
+		ID:          "req-expired",
+		AgentID:     "agent-1",
+		SessionID:   "session-1",
+		Question:    "Question expired?",
+		RequestType: "approval",
+		Priority:    "high",
+		Timeout:     5 * time.Minute,
+		CreatedAt:   now.Add(-10 * time.Minute),
+		ExpiresAt:   now.Add(-1 * time.Minute),
+		Status:      "pending",
+	}
+
+	err := store.Store(ctx, req)
+	require.NoError(t, err)
+
+	err = store.RespondToRequest(ctx, "req-expired", "approved", "Yes", "alice@example.com", nil)
+	require.NoError(t, err)
+
+	unresolved, err := store.Get(ctx, "req-expired")
+	require.NoError(t, err)
+	assert.Equal(t, "pending", unresolved.Status)
+	assert.Empty(t, unresolved.RespondedBy)
 }
 
 func TestSQLiteHumanRequestStore_RespondToRequest_NotFound(t *testing.T) {

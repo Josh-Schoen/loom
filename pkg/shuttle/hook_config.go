@@ -25,7 +25,7 @@ type HooksConfig struct {
 // the policy-specific parameters. A binding is turned into a live Hook by
 // BuildChainFromConfig; a malformed binding fails serve startup (fail-closed).
 type HookBinding struct {
-	// Kind selects the policy: "gated-allowlist" | "denylist" | "audit" | "custom".
+	// Kind selects the policy: "gated-allowlist" | "denylist" | "audit" | "ask" | "custom".
 	Kind string `mapstructure:"kind"`
 	// Scope is the tool selector: an exact tool name or a "<prefix>*" pattern,
 	// with the same match semantics as tools.permissions.

@@ -1546,6 +1546,7 @@ func runServe(cmd *cobra.Command, args []string) {
 		hitlStore,
 		time.Duration(config.Tools.Permissions.TimeoutSeconds)*time.Second,
 		time.Second,
+		nil,
 	)
 	admissionChain, err := createAdmissionChain(config, shuttle.ChainDeps{Perm: permissionChecker, Ask: askResolver, Custom: shuttle.ProcessCustomHookRegistry()}, logger)
 	if err != nil {

@@ -58,8 +58,10 @@ type fakeRenderGrantReadTool struct {
 	stmts []string
 }
 
-func (t *fakeRenderGrantReadTool) Name() string        { return admRenderTool }
-func (t *fakeRenderGrantReadTool) Description() string { return "Returns the view and read-grant SQL to be approved" }
+func (t *fakeRenderGrantReadTool) Name() string { return admRenderTool }
+func (t *fakeRenderGrantReadTool) Description() string {
+	return "Returns the view and read-grant SQL to be approved"
+}
 func (t *fakeRenderGrantReadTool) InputSchema() *shuttle.JSONSchema {
 	return &shuttle.JSONSchema{
 		Type:       "object",

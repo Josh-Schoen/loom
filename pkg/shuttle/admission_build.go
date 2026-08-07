@@ -30,11 +30,13 @@ type CustomHookRegistry interface {
 // ChainDeps carries the collaborators BuildChainFromConfig needs to turn
 // bindings into live hooks: the name-level permission checker (folded in as the
 // first hook), the approved-set accessor a gated-allowlist reads, the resolver
-// an Ask verdict defers to, and the registry a custom binding resolves against.
+// an Ask verdict defers to, the pending-emit collaborator the composition layer
+// hands the ask resolver, and the registry a custom binding resolves against.
 type ChainDeps struct {
 	Perm        *PermissionChecker
 	ApprovedSet ApprovedSetAccessor
 	Ask         AskResolver
+	Notifier    Notifier
 	Custom      CustomHookRegistry
 }
 
@@ -72,12 +74,71 @@ func BuildChainFromConfig(cfg HooksConfig, deps ChainDeps) (*Chain, error) {
 	return NewChain(hooks, postHooks, deps.Ask), nil
 }
 
-// buildHook compiles one binding into a Hook, validating every field the kind
-// requires. Selection (scope ∧ matcher) is compiled here for every kind; the
-// decision body is the kind's policy.
-func buildHook(b HookBinding, deps ChainDeps) (Hook, error) {
+// ValidateHooksConfig reports the first structurally invalid binding in a
+// tools.hooks config: an unknown kind, an empty scope, an uncompilable
+// matcher/read_pattern, or a kind missing a required field. It shares
+// validateBinding with BuildChainFromConfig, so a config that validates clean
+// here builds without a structural error, and it wraps each fault with the
+// offending binding's index and kind in BuildChainFromConfig's style. It is
+// deps-free — callable at save time without a live ChainDeps — so a custom
+// binding's name-registry membership is left to build (an unregistered name
+// fails closed there).
+func ValidateHooksConfig(cfg HooksConfig) error {
+	for i, b := range cfg.Bindings {
+		if err := validateBinding(b); err != nil {
+			return fmt.Errorf("tools.hooks[%d] (kind %q): %w", i, b.Kind, err)
+		}
+	}
+	return nil
+}
+
+// validateBinding runs the binding's structural checks that need no live deps:
+// scope presence, matcher and read_pattern compilability, and the per-kind
+// required fields. It is the single source of a binding's field rules —
+// buildHook runs it before constructing the live hook and ValidateHooksConfig
+// runs it at save time — so build and save validation cannot drift. A custom
+// binding's name-registry membership is not checked here: a save-time validator
+// holds no runtime registry, so an unregistered name is caught at build instead
+// (fail-closed).
+func validateBinding(b HookBinding) error {
 	if strings.TrimSpace(b.Scope) == "" {
-		return nil, fmt.Errorf("scope is required")
+		return fmt.Errorf("scope is required")
+	}
+	if _, err := b.Matcher.Compile(); err != nil {
+		return err
+	}
+	switch b.Kind {
+	case "denylist", "audit", "ask":
+		return nil
+	case "gated-allowlist":
+		if strings.TrimSpace(b.StateKey) == "" {
+			return fmt.Errorf("gated-allowlist requires state_key")
+		}
+		if strings.TrimSpace(b.SourceTool) == "" {
+			return fmt.Errorf("gated-allowlist requires source_tool")
+		}
+		if b.ReadPattern != "" {
+			if _, err := regexp.Compile(b.ReadPattern); err != nil {
+				return fmt.Errorf("invalid read_pattern %q: %w", b.ReadPattern, err)
+			}
+		}
+		return nil
+	case "custom":
+		if strings.TrimSpace(b.Name) == "" {
+			return fmt.Errorf("custom hook requires name")
+		}
+		return nil
+	default:
+		return fmt.Errorf("unknown kind (want gated-allowlist|denylist|audit|ask|custom)")
+	}
+}
+
+// buildHook compiles one binding into a Hook. Its field rules are enforced by
+// validateBinding first; selection (scope ∧ matcher) is then compiled for every
+// kind, and the decision body is the kind's policy.
+func buildHook(b HookBinding, deps ChainDeps) (Hook, error) {
+	if err := validateBinding(b); err != nil {
+		return nil, err
 	}
 	scope := NewToolScope(b.Scope)
 	matcher, err := b.Matcher.Compile()
@@ -88,6 +149,8 @@ func buildHook(b HookBinding, deps ChainDeps) (Hook, error) {
 	switch b.Kind {
 	case "denylist":
 		return denylist{scope: scope, matcher: matcher}, nil
+	case "ask":
+		return askRule{scope: scope, matcher: matcher}, nil
 	case "gated-allowlist":
 		return gatedAllowlistHook(b, scope, matcher, deps)
 	case "audit":
@@ -95,7 +158,7 @@ func buildHook(b HookBinding, deps ChainDeps) (Hook, error) {
 	case "custom":
 		return customHook(b, deps)
 	default:
-		return nil, fmt.Errorf("unknown kind (want gated-allowlist|denylist|audit|custom)")
+		return nil, fmt.Errorf("unknown kind (want gated-allowlist|denylist|audit|ask|custom)")
 	}
 }
 
@@ -122,14 +185,10 @@ func (h libraryHook) Evaluate(req AdmissionRequest) Decision {
 // gatedAllowlistHook admits a governed write only when its call identity is in
 // the approved set at the binding's state_key; a read-pattern match is admitted
 // with no entry. A missing entry, an accessor error, or no accessor wired is a
-// hard deny (fail-closed) — never an ask.
+// hard deny (fail-closed) — never an ask. The binding's field rules (state_key,
+// source_tool, read_pattern compilability) are enforced by validateBinding
+// before this constructs; read_pattern is compiled again here for the closure.
 func gatedAllowlistHook(b HookBinding, scope ToolScope, matcher Matcher, deps ChainDeps) (Hook, error) {
-	if strings.TrimSpace(b.StateKey) == "" {
-		return nil, fmt.Errorf("gated-allowlist requires state_key")
-	}
-	if strings.TrimSpace(b.SourceTool) == "" {
-		return nil, fmt.Errorf("gated-allowlist requires source_tool")
-	}
 	var readRe *regexp.Regexp
 	if b.ReadPattern != "" {
 		re, err := regexp.Compile(b.ReadPattern)
@@ -168,12 +227,11 @@ func gatedAllowlistHook(b HookBinding, scope ToolScope, matcher Matcher, deps Ch
 }
 
 // customHook resolves a custom binding's Name to its constructor and builds the
-// hook from the binding, so the binding's scope and matcher apply. An unnamed
-// binding, an unconfigured registry, or an unregistered name is a build error.
+// hook from the binding, so the binding's scope and matcher apply. Name presence
+// is enforced by validateBinding; an unconfigured registry or an unregistered
+// name is a build error (fail-closed), deferred here because a save-time
+// validator holds no runtime registry.
 func customHook(b HookBinding, deps ChainDeps) (Hook, error) {
-	if strings.TrimSpace(b.Name) == "" {
-		return nil, fmt.Errorf("custom hook requires name")
-	}
 	if deps.Custom == nil {
 		return nil, fmt.Errorf("custom hook %q named but no custom hook registry is configured", b.Name)
 	}

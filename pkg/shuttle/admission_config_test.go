@@ -139,8 +139,9 @@ hooks: []
 	require.Equal(t, 1, toolOff.ExecuteCount)
 }
 
-// -- AC2: each library policy (gated-allowlist, denylist, audit) is enable-able
-// and parameterizable — scope, matcher, and its own params — purely from config
+// -- AC2: each library policy (gated-allowlist, denylist, audit, ask) is
+// enable-able and parameterizable — scope, matcher, and its own params — purely
+// from config
 
 func TestBuildChain_AC2_EachPolicyParameterizedFromConfig(t *testing.T) {
 	const fixture = `
@@ -161,11 +162,22 @@ hooks:
   - kind: audit
     scope: file_write
     matcher: {}
+  - kind: ask
+    scope: admin_grant
+    matcher:
+      param_path: sql
+      op: contains
+      value: GRANT
 `
 	approvedGrant := "GRANT SELECT ON t TO alice"
-	deps := ChainDeps{ApprovedSet: fakeApprovedSet{allowed: map[string]map[CallIdentity]bool{
-		"approved_grants": {CallIdentity(approvedGrant): true},
-	}}}
+	deps := ChainDeps{
+		ApprovedSet: fakeApprovedSet{allowed: map[string]map[CallIdentity]bool{
+			"approved_grants": {CallIdentity(approvedGrant): true},
+		}},
+		// A resolver that refuses: the ask binding's held call surfaces its
+		// refusal, which is what makes the binding's selection observable.
+		Ask: resolveTo{decision: Decision{Kind: Deny, Reason: "ask resolver refused"}},
+	}
 
 	chain, err := BuildChainFromConfig(hooksFromYAML(t, fixture), deps)
 	require.NoError(t, err)
@@ -230,6 +242,26 @@ hooks:
 		require.NoError(t, err)
 		require.True(t, res2.Success, "a tool outside the audit scope is unaffected")
 		require.Equal(t, 1, otherTool.ExecuteCount)
+	})
+
+	// ask: an ask binding built from config is scoped to admin_grant and
+	// parameterized by its matcher over "sql". A call meeting both is held for
+	// the resolver — which refuses, so the refusal reaches the caller and the
+	// body never runs. A call to the same tool whose sql misses the matcher is
+	// not governed and runs, proving scope and matcher both came from config.
+	t.Run("ask holds its configured selection for the resolver", func(t *testing.T) {
+		heldTool := countingTool("admin_grant")
+		res, err := execFor(chain, heldTool).Execute(context.Background(), "admin_grant", map[string]interface{}{"sql": "GRANT ROLE admin TO alice"})
+		require.NoError(t, err)
+		require.Equal(t, "permission_denied", res.Error.Code)
+		require.Equal(t, "ask resolver refused", res.Error.Message)
+		require.Equal(t, 0, heldTool.ExecuteCount)
+
+		missTool := countingTool("admin_grant")
+		res2, err := execFor(chain, missTool).Execute(context.Background(), "admin_grant", map[string]interface{}{"sql": "SELECT 1"})
+		require.NoError(t, err)
+		require.True(t, res2.Success, "a call whose sql misses the ask matcher is unaffected")
+		require.Equal(t, 1, missTool.ExecuteCount)
 	})
 }
 
@@ -519,6 +551,12 @@ hooks:
   - kind: audit
     scope: file_write
     matcher: {}
+  - kind: ask
+    scope: admin_grant
+    matcher:
+      param_path: sql
+      op: contains
+      value: GRANT
   - kind: custom
     scope: admin_tool
     name: clearance

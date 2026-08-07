@@ -48,9 +48,19 @@ type HumanRequest struct {
 	Context     map[string]interface{} `json:"context"`
 	RequestType string                 `json:"request_type"` // "approval", "decision", "input", "review"
 	Priority    string                 `json:"priority"`     // "low", "normal", "high", "critical"
+	Kind        string                 `json:"kind"`         // "approval" (hook-held) | "question" (contact_human); absent → question
+	Summary     string                 `json:"summary"`      // display digest: tool+args (approval) | question text (question)
 	Timeout     time.Duration          `json:"timeout"`
 	CreatedAt   time.Time              `json:"created_at"`
 	ExpiresAt   time.Time              `json:"expires_at"`
+
+	// Params carries the held call's full parameter map for an approval; a
+	// question has no held call and leaves it empty. Stamped at origin, never
+	// re-derived downstream.
+	Params map[string]interface{} `json:"params"`
+	// ParamsTruncated reports that the paramsMaxBytes bound cut whole pairs out
+	// of Params.
+	ParamsTruncated bool `json:"params_truncated"`
 
 	// Response fields (populated when human responds)
 	Status       string                 `json:"status"` // "pending", "approved", "rejected", "timeout", "responded"
@@ -76,6 +86,11 @@ type HumanRequestStore interface {
 
 	// ListBySession returns all requests for a session
 	ListBySession(ctx context.Context, sessionID string) ([]*HumanRequest, error)
+
+	// RespondToRequest resolves a pending, non-expired request exactly once.
+	// On an already-decided or expired request it is a no-op returning nil (the
+	// caller reads current state via Get). Errors only on a missing row / store failure.
+	RespondToRequest(ctx context.Context, requestID, status, response, respondedBy string, responseData map[string]interface{}) error
 
 	// Close releases any resources held by the store.
 	Close() error
@@ -242,6 +257,8 @@ func (t *ContactHumanTool) Execute(ctx context.Context, params map[string]interf
 		Context:     contextData,
 		RequestType: requestType,
 		Priority:    priority,
+		Kind:        "question",
+		Summary:     question,
 		Timeout:     timeout,
 		CreatedAt:   now,
 		ExpiresAt:   now.Add(timeout),
@@ -420,26 +437,33 @@ func NewInMemoryHumanRequestStore() *InMemoryHumanRequestStore {
 	}
 }
 
+// cloneHumanRequest copies req with its maps duplicated, so stored state and
+// caller-visible state never share a map. Nil maps stay nil.
+func cloneHumanRequest(req *HumanRequest) *HumanRequest {
+	reqCopy := *req
+	reqCopy.Context = cloneStringMap(req.Context)
+	reqCopy.ResponseData = cloneStringMap(req.ResponseData)
+	reqCopy.Params = cloneStringMap(req.Params)
+	return &reqCopy
+}
+
+// cloneStringMap returns a copy of m one level deep; nil in, nil out.
+func cloneStringMap(m map[string]interface{}) map[string]interface{} {
+	if m == nil {
+		return nil
+	}
+	c := make(map[string]interface{}, len(m))
+	for k, v := range m {
+		c[k] = v
+	}
+	return c
+}
+
 func (s *InMemoryHumanRequestStore) Store(ctx context.Context, req *HumanRequest) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// Deep copy to prevent external modification
-	reqCopy := *req
-	if req.Context != nil {
-		reqCopy.Context = make(map[string]interface{})
-		for k, v := range req.Context {
-			reqCopy.Context[k] = v
-		}
-	}
-	if req.ResponseData != nil {
-		reqCopy.ResponseData = make(map[string]interface{})
-		for k, v := range req.ResponseData {
-			reqCopy.ResponseData[k] = v
-		}
-	}
-
-	s.requests[req.ID] = &reqCopy
+	s.requests[req.ID] = cloneHumanRequest(req)
 	return nil
 }
 
@@ -452,22 +476,7 @@ func (s *InMemoryHumanRequestStore) Get(ctx context.Context, id string) (*HumanR
 		return nil, fmt.Errorf("request not found: %s", id)
 	}
 
-	// Deep copy to prevent external modification
-	reqCopy := *req
-	if req.Context != nil {
-		reqCopy.Context = make(map[string]interface{})
-		for k, v := range req.Context {
-			reqCopy.Context[k] = v
-		}
-	}
-	if req.ResponseData != nil {
-		reqCopy.ResponseData = make(map[string]interface{})
-		for k, v := range req.ResponseData {
-			reqCopy.ResponseData[k] = v
-		}
-	}
-
-	return &reqCopy, nil
+	return cloneHumanRequest(req), nil
 }
 
 func (s *InMemoryHumanRequestStore) Update(ctx context.Context, req *HumanRequest) error {
@@ -478,22 +487,7 @@ func (s *InMemoryHumanRequestStore) Update(ctx context.Context, req *HumanReques
 		return fmt.Errorf("request not found: %s", req.ID)
 	}
 
-	// Deep copy
-	reqCopy := *req
-	if req.Context != nil {
-		reqCopy.Context = make(map[string]interface{})
-		for k, v := range req.Context {
-			reqCopy.Context[k] = v
-		}
-	}
-	if req.ResponseData != nil {
-		reqCopy.ResponseData = make(map[string]interface{})
-		for k, v := range req.ResponseData {
-			reqCopy.ResponseData[k] = v
-		}
-	}
-
-	s.requests[req.ID] = &reqCopy
+	s.requests[req.ID] = cloneHumanRequest(req)
 	return nil
 }
 
@@ -504,15 +498,7 @@ func (s *InMemoryHumanRequestStore) ListPending(ctx context.Context) ([]*HumanRe
 	var pending []*HumanRequest
 	for _, req := range s.requests {
 		if req.Status == "pending" {
-			// Deep copy
-			reqCopy := *req
-			if req.Context != nil {
-				reqCopy.Context = make(map[string]interface{})
-				for k, v := range req.Context {
-					reqCopy.Context[k] = v
-				}
-			}
-			pending = append(pending, &reqCopy)
+			pending = append(pending, cloneHumanRequest(req))
 		}
 	}
 	return pending, nil
@@ -525,22 +511,15 @@ func (s *InMemoryHumanRequestStore) ListBySession(ctx context.Context, sessionID
 	var sessionRequests []*HumanRequest
 	for _, req := range s.requests {
 		if req.SessionID == sessionID {
-			// Deep copy
-			reqCopy := *req
-			if req.Context != nil {
-				reqCopy.Context = make(map[string]interface{})
-				for k, v := range req.Context {
-					reqCopy.Context[k] = v
-				}
-			}
-			sessionRequests = append(sessionRequests, &reqCopy)
+			sessionRequests = append(sessionRequests, cloneHumanRequest(req))
 		}
 	}
 	return sessionRequests, nil
 }
 
-// RespondToRequest updates a human request with a response.
-// This is called by the human review interface (CLI, Web UI, API).
+// RespondToRequest resolves a pending, non-expired request exactly once.
+// On an already-decided or expired request it is a no-op returning nil, so the
+// caller reads current state via Get. Errors only on a missing request.
 func (s *InMemoryHumanRequestStore) RespondToRequest(ctx context.Context, requestID, status, response, respondedBy string, responseData map[string]interface{}) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -550,11 +529,13 @@ func (s *InMemoryHumanRequestStore) RespondToRequest(ctx context.Context, reques
 		return fmt.Errorf("request not found: %s", requestID)
 	}
 
-	if req.Status != "pending" {
-		return fmt.Errorf("request already responded to (status: %s)", req.Status)
+	now := time.Now()
+	// Resolve only a pending, non-expired request; a decided or expired row is
+	// left untouched so the caller reads its current state via Get.
+	if req.Status != "pending" || now.After(req.ExpiresAt) {
+		return nil
 	}
 
-	now := time.Now()
 	req.Status = status
 	req.Response = response
 	req.ResponseData = responseData
