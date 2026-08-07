@@ -156,6 +156,17 @@ func NewAgent(backend fabric.ExecutionBackend, llmProvider LLMProvider, opts ...
 		a.executor.SetPermissionChecker(a.permissionChecker)
 	}
 
+	// Attach the admission hook chain if provided. A nil chain leaves the
+	// executor as a pure pass-through.
+	if a.admissionChain != nil {
+		a.executor.SetAdmissionChain(a.admissionChain)
+	}
+
+	// Wire the caller-identity resolver so admission requests carry UserID.
+	if a.identityResolver != nil {
+		a.executor.SetIdentityResolver(a.identityResolver)
+	}
+
 	// Set up system prompt function for memory
 	// This allows dynamic prompt loading from PromptRegistry
 	// Context is threaded through for proper RLS user_id propagation in PostgreSQL.
@@ -226,6 +237,11 @@ func NewAgent(backend fabric.ExecutionBackend, llmProvider LLMProvider, opts ...
 			threshold = a.sharedMemoryThreshold
 		}
 		a.executor.SetSharedMemory(a.sharedMemory, threshold)
+
+		// Back the approved-set accessor with the same store so a gated-allowlist
+		// reads it as AdmissionRequest.State; membership inherits the store's
+		// per-session isolation.
+		a.executor.SetApprovedSet(shuttle.NewApprovedSet(a.sharedMemory))
 	}
 
 	// The findings channel is retired: neither the record_finding tool nor automatic
@@ -492,6 +508,25 @@ func WithCompressionProfile(profile *CompressionProfile) Option {
 func WithPermissionChecker(checker *shuttle.PermissionChecker) Option {
 	return func(a *Agent) {
 		a.permissionChecker = checker
+	}
+}
+
+// WithAdmissionHooks sets the admission hook chain consulted before every tool
+// body runs. The chain carries the name-level permission check as its first
+// hook; a nil chain leaves tool execution as a pure pass-through.
+func WithAdmissionHooks(chain *shuttle.Chain) Option {
+	return func(a *Agent) {
+		a.admissionChain = chain
+	}
+}
+
+// WithIdentityResolver sets the resolver that reads the caller identity
+// (AdmissionRequest.UserID) from the call context. The value lookup is injected
+// by the composition root because pkg/agent cannot import the storage layer
+// that owns the user-id context key without an import cycle.
+func WithIdentityResolver(resolver func(context.Context) string) Option {
+	return func(a *Agent) {
+		a.identityResolver = resolver
 	}
 }
 
@@ -1997,6 +2032,25 @@ type ToolExecution struct {
 	Input    map[string]interface{}
 	Result   *shuttle.Result
 	Error    error
+
+	// AdmissionDecision is the audit verdict ("allow"|"deny"|"ask") for a call
+	// matched by an audit binding, stamped by the executor onto
+	// Result.Metadata["admission.decision"]. Empty means the call was not
+	// audited; empty rows are not counted as audit records (SC-004).
+	AdmissionDecision string
+}
+
+// admissionDecisionOf reads the audit verdict the executor stamps onto a
+// governed call's Result.Metadata["admission.decision"]. An ungoverned or
+// unaudited call carries no such key, yielding "".
+func admissionDecisionOf(result *shuttle.Result) string {
+	if result == nil || result.Metadata == nil {
+		return ""
+	}
+	if v, ok := result.Metadata["admission.decision"].(string); ok {
+		return v
+	}
+	return ""
 }
 
 // emitProgress sends a progress event if a callback is configured.
@@ -2686,10 +2740,11 @@ func (a *Agent) runConversationLoop(ctx Context) (*Response, error) {
 
 			// Record execution
 			execution := ToolExecution{
-				ToolName: toolCall.Name,
-				Input:    toolCall.Input,
-				Result:   result,
-				Error:    err,
+				ToolName:          toolCall.Name,
+				Input:             toolCall.Input,
+				Result:            result,
+				Error:             err,
+				AdmissionDecision: admissionDecisionOf(result),
 			}
 			allToolExecutions = append(allToolExecutions, execution)
 
@@ -3643,6 +3698,11 @@ func (a *Agent) SetSharedMemory(sharedMemory *storage.SharedMemoryStore) {
 			threshold = a.sharedMemoryThreshold
 		}
 		a.executor.SetSharedMemory(sharedMemory, threshold)
+
+		// Back the approved-set accessor with the same store so a gated-allowlist
+		// reads it as AdmissionRequest.State; membership inherits the store's
+		// per-session isolation.
+		a.executor.SetApprovedSet(shuttle.NewApprovedSet(sharedMemory))
 	}
 
 	// Inject into memory manager (which handles all sessions)
