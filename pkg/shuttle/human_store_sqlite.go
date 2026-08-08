@@ -155,6 +155,14 @@ func (s *SQLiteHumanRequestStore) Store(ctx context.Context, req *HumanRequest) 
 	span.SetAttribute("request_type", req.RequestType)
 	span.SetAttribute("priority", req.Priority)
 
+	// A pending request must carry an expiry: a zero ExpiresAt would make the
+	// row permanently approvable, and the resolve CAS's expiry guard is keyed
+	// on the stored value. Both in-repo producers always stamp one; this guards
+	// exported-API callers.
+	if req.Status == "pending" && req.ExpiresAt.IsZero() {
+		return fmt.Errorf("pending human request %s has no expiry", req.ID)
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -444,21 +452,19 @@ func (s *SQLiteHumanRequestStore) RespondToRequest(ctx context.Context, requestI
 
 	// Atomic conditional update: resolve only a pending, non-expired row. A
 	// decided or expired row matches zero rows and is left untouched, and under
-	// concurrency exactly one writer affects the row. Two carve-outs keep rows
-	// closable: a zero/unset expiry (stored as a non-positive instant) means "no
-	// expiry", and a terminal "timeout" write may close ANY pending row —
-	// closing is not resolving, and without it an expired hold would stay
-	// reported-pending forever.
+	// concurrency exactly one writer affects the row. The expiry guard is the
+	// store's own — nothing in the caller's payload can lift it; terminal
+	// closes past expiry go through ExpireRequest.
 	query := `
 		UPDATE human_requests
 		SET status = ?, response = ?, response_data_json = ?,
 		    responded_at = ?, responded_by = ?
-		WHERE id = ? AND status = 'pending' AND (expires_at > ? OR expires_at <= 0 OR ? = 'timeout')
+		WHERE id = ? AND status = 'pending' AND expires_at > ?
 	`
 
 	result, err := s.db.ExecContext(ctx, query,
 		status, response, string(responseDataJSON),
-		now, respondedBy, requestID, now, status,
+		now, respondedBy, requestID, now,
 	)
 	if err != nil {
 		span.RecordError(err)
@@ -491,6 +497,34 @@ func (s *SQLiteHumanRequestStore) RespondToRequest(ctx context.Context, requestI
 		return fmt.Errorf("failed to check request status: %w", err)
 	}
 
+	span.SetAttribute("success", true)
+	return nil
+}
+
+// ExpireRequest terminally closes a pending row as "timeout" regardless of its
+// expiry — the harness's close for abandoned or swept rows. A resolved row
+// matches zero rows and is left untouched (closing is not resolving); a
+// missing row is a no-op.
+func (s *SQLiteHumanRequestStore) ExpireRequest(ctx context.Context, requestID, respondedBy string) error {
+	ctx, span := s.tracer.StartSpan(ctx, "hitl_store.expire")
+	defer s.tracer.EndSpan(span)
+
+	span.SetAttribute("request_id", requestID)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	query := `
+		UPDATE human_requests
+		SET status = 'timeout', response = '', response_data_json = '',
+		    responded_at = ?, responded_by = ?
+		WHERE id = ? AND status = 'pending'
+	`
+	if _, err := s.db.ExecContext(ctx, query, time.Now().UnixMilli(), respondedBy, requestID); err != nil {
+		span.RecordError(err)
+		span.SetAttribute("success", false)
+		return fmt.Errorf("failed to expire request: %w", err)
+	}
 	span.SetAttribute("success", true)
 	return nil
 }

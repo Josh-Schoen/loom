@@ -121,8 +121,10 @@ func TestParams_ContactHuman_StoresNoParams(t *testing.T) {
 
 			assert.Empty(t, hr.Params, "a question carries no held-call params")
 			assert.False(t, hr.ParamsTruncated, "nothing was cut because nothing was carried")
-			assert.Equal(t, map[string]interface{}{"table": "users"}, hr.Context,
-				"the tool's own context payload is untouched by the params addition")
+			// The model's context payload survives, and the harness stamps the
+			// origin discriminator over it: "kind" is the one key chosen to be
+			// free of model control (round 3, finding 10).
+			assert.Equal(t, map[string]interface{}{"table": "users", "kind": "question"}, hr.Context)
 		})
 	}
 }
@@ -255,6 +257,7 @@ func TestParams_InMemoryStore_RoundTrip(t *testing.T) {
 		ID:              "mem-truncated",
 		SessionID:       "sess-1",
 		Status:          "pending",
+		ExpiresAt:       time.Now().Add(time.Hour),
 		Kind:            "approval",
 		Summary:         "delete_table DELETE FROM users WHERE id=42",
 		Params:          populated,
@@ -264,6 +267,7 @@ func TestParams_InMemoryStore_RoundTrip(t *testing.T) {
 		ID:              "mem-whole",
 		SessionID:       "sess-1",
 		Status:          "pending",
+		ExpiresAt:       time.Now().Add(time.Hour),
 		Kind:            "approval",
 		Summary:         "delete_table DELETE FROM users WHERE id=42",
 		Params:          populated,
@@ -273,6 +277,7 @@ func TestParams_InMemoryStore_RoundTrip(t *testing.T) {
 		ID:        "mem-no-params",
 		SessionID: "sess-1",
 		Status:    "pending",
+		ExpiresAt: time.Now().Add(time.Hour),
 	}))
 
 	t.Run("get round-trips params and flag", func(t *testing.T) {

@@ -17,14 +17,19 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"strings"
 )
 
 // HooksConfig is the `tools.hooks` block Viper unmarshals: an ordered list of
 // library-policy bindings. It lives in package shuttle (not cmd/looms) so a
 // library builder can construct an admission chain without importing main.
 // The json tags define the wire shape an out-of-process host (e.g. an agent
-// profile's hooks_config) transports; encoding/json matches them
-// case-insensitively, so the historical Go-field-name casing keeps decoding.
+// profile's hooks_config) transports. The documented JSON key set is the
+// snake_case one on the tags; the historical Go-field-name casing keeps
+// decoding through the normalizing UnmarshalJSON below, which folds any
+// case/underscore variant of a known key onto its canonical spelling before a
+// strict decode — so "StateKey" and "state_key" both land, and a key that is
+// no spelling of any field still fails loudly.
 type HooksConfig struct {
 	Bindings []HookBinding `mapstructure:"hooks" json:"bindings"`
 }
@@ -46,6 +51,138 @@ func ParseHooksConfig(raw []byte) (HooksConfig, error) {
 		return HooksConfig{}, fmt.Errorf("hooks config: %w", err)
 	}
 	return cfg, nil
+}
+
+// normalizeJSONKeys rewrites the keys of one JSON object onto their canonical
+// spellings. canon maps a folded key (lowercased, underscores stripped) to the
+// canonical json tag, so every historical spelling of a known field — Go field
+// name, any casing, with or without underscores — decodes identically, while a
+// key that folds onto no known field is refused (the strict-decode contract),
+// and two spellings of the same field in one document are refused rather than
+// silently letting one win.
+func normalizeJSONKeys(data []byte, canon map[string]string) (map[string]json.RawMessage, error) {
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(data, &obj); err != nil {
+		return nil, err
+	}
+	out := make(map[string]json.RawMessage, len(obj))
+	for k, v := range obj {
+		folded := strings.ReplaceAll(strings.ToLower(k), "_", "")
+		canonical, known := canon[folded]
+		if !known {
+			return nil, fmt.Errorf("json: unknown field %q", k)
+		}
+		if _, dup := out[canonical]; dup {
+			return nil, fmt.Errorf("json: duplicate field %q", canonical)
+		}
+		out[canonical] = v
+	}
+	return out, nil
+}
+
+// configKeyCanon folds every accepted spelling of the HooksConfig list key
+// onto "bindings": the canonical JSON key, its historical Go-name casing, and
+// "hooks" — the key the YAML surface (`tools.hooks`) uses — as an accepted
+// alias, so a config written from either document shape decodes identically
+// instead of one shape silently decoding to nothing.
+var configKeyCanon = map[string]string{
+	"bindings": "bindings",
+	"hooks":    "bindings",
+}
+
+// UnmarshalJSON decodes the config with key normalization at every level, so
+// even a decode NOT routed through ParseHooksConfig is strict: a top-level key
+// that is no spelling of the list key fails loudly instead of yielding a
+// zero-binding config that validates clean and governs nothing.
+func (c *HooksConfig) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	obj, err := normalizeJSONKeys(trimmed, configKeyCanon)
+	if err != nil {
+		return err
+	}
+	canonical, err := json.Marshal(obj)
+	if err != nil {
+		return err
+	}
+	type configAlias HooksConfig // no methods: breaks the UnmarshalJSON recursion
+	var alias configAlias
+	dec := json.NewDecoder(bytes.NewReader(canonical))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&alias); err != nil {
+		return err
+	}
+	*c = HooksConfig(alias)
+	return nil
+}
+
+// bindingKeyCanon folds every accepted spelling of a HookBinding field onto
+// its canonical json tag.
+var bindingKeyCanon = map[string]string{
+	"kind":        "kind",
+	"scope":       "scope",
+	"matcher":     "matcher",
+	"statekey":    "state_key",
+	"readpattern": "read_pattern",
+	"stmtparam":   "stmt_param",
+	"pattern":     "pattern",
+	"sourcetool":  "source_tool",
+	"resultpath":  "result_path",
+	"name":        "name",
+}
+
+// matcherKeyCanon folds every accepted spelling of a MatcherSpec field onto
+// its canonical json tag.
+var matcherKeyCanon = map[string]string{
+	"parampath": "param_path",
+	"op":        "op",
+	"value":     "value",
+}
+
+// UnmarshalJSON decodes a binding with key normalization: any case/underscore
+// variant of a known field lands on its canonical field, unknown keys fail.
+func (b *HookBinding) UnmarshalJSON(data []byte) error {
+	obj, err := normalizeJSONKeys(data, bindingKeyCanon)
+	if err != nil {
+		return err
+	}
+	canonical, err := json.Marshal(obj)
+	if err != nil {
+		return err
+	}
+	type bindingAlias HookBinding // no methods: breaks the UnmarshalJSON recursion
+	var alias bindingAlias
+	dec := json.NewDecoder(bytes.NewReader(canonical))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&alias); err != nil {
+		return err
+	}
+	*b = HookBinding(alias)
+	return nil
+}
+
+// UnmarshalJSON decodes a matcher spec with the same key normalization as
+// HookBinding.
+func (m *MatcherSpec) UnmarshalJSON(data []byte) error {
+	obj, err := normalizeJSONKeys(data, matcherKeyCanon)
+	if err != nil {
+		return err
+	}
+	canonical, err := json.Marshal(obj)
+	if err != nil {
+		return err
+	}
+	type matcherAlias MatcherSpec
+	var alias matcherAlias
+	dec := json.NewDecoder(bytes.NewReader(canonical))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&alias); err != nil {
+		return err
+	}
+	*m = MatcherSpec(alias)
+	return nil
 }
 
 // HookBinding declares one library policy purely from config: which policy

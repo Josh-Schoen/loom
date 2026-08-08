@@ -16,6 +16,7 @@ package shuttle
 import (
 	"context"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -116,6 +117,10 @@ func respondOncePending(store *InMemoryHumanRequestStore, status string) {
 type failingHumanStore struct{}
 
 func (failingHumanStore) Store(context.Context, *HumanRequest) error {
+	return fmt.Errorf("hitl store unavailable")
+}
+
+func (failingHumanStore) ExpireRequest(context.Context, string, string) error {
 	return fmt.Errorf("hitl store unavailable")
 }
 func (failingHumanStore) Get(context.Context, string) (*HumanRequest, error) {
@@ -267,4 +272,218 @@ func TestAskHITL_StoreFailure_DeniesFailClosed(t *testing.T) {
 	require.NotNil(t, res.Error)
 	require.Equal(t, "permission_denied", res.Error.Code)
 	require.Equal(t, 0, tool.ExecuteCount, "a store that cannot raise the request never runs the tool")
+}
+
+// an absent row (the postgres (nil, nil) contract) denies after a
+// bounded number of reads instead of nil-panicking or spinning.
+func TestAskResolver_AbsentRow_FailsClosed(t *testing.T) {
+	store := &absentRowStore{}
+	r := NewHITLAskResolver(store, 5*time.Second, 5*time.Millisecond, nil)
+	d := r.Resolve(AdmissionRequest{Ctx: context.Background(), ToolName: "x"}, Decision{Kind: Ask})
+	require.Equal(t, Deny, d.Kind)
+	require.Contains(t, d.Reason, "no longer exists")
+}
+
+// absentRowStore stores successfully, then reports the row absent as (nil, nil)
+// — the postgres store's documented contract for a vanished row.
+type absentRowStore struct{ InMemoryHumanRequestStore }
+
+func (s *absentRowStore) Store(ctx context.Context, req *HumanRequest) error { return nil }
+func (s *absentRowStore) Get(ctx context.Context, id string) (*HumanRequest, error) {
+	return nil, nil
+}
+
+// a resolution landing in the final poll interval is honored: the
+// give-up path re-reads before denying.
+func TestAskResolver_LastIntervalApproval_Honored(t *testing.T) {
+	store := NewInMemoryHumanRequestStore()
+	notifier := &approveOnNotify{store: store, after: 40 * time.Millisecond}
+	r := NewHITLAskResolver(store, 50*time.Millisecond, 30*time.Millisecond, notifier)
+	d := r.Resolve(AdmissionRequest{Ctx: context.Background(), ToolName: "x", SessionID: "s"},
+		Decision{Kind: Ask})
+	require.Equal(t, Allow, d.Kind, "an approval that lands before the stored expiry must admit")
+}
+
+// approveOnNotify approves the request from a background goroutine shortly
+// after it is raised — inside the final poll interval for the test's timings.
+type approveOnNotify struct {
+	store HumanRequestStore
+	after time.Duration
+}
+
+func (n *approveOnNotify) Notify(ctx context.Context, req *HumanRequest) error {
+	id := req.ID
+	go func() {
+		time.Sleep(n.after)
+		_ = n.store.RespondToRequest(context.Background(), id, "approved", "", "human", nil)
+	}()
+	return nil
+}
+
+func TestAskResolver_CancelExit_ClosesAbandonedRow(t *testing.T) {
+	store := NewInMemoryHumanRequestStore()
+	r := NewHITLAskResolver(store, time.Hour, 10*time.Millisecond, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan Decision, 1)
+	go func() {
+		done <- r.Resolve(AdmissionRequest{
+			Ctx: ctx, ToolName: "execute_sql", SessionID: "s1",
+			Params: map[string]interface{}{"stmt": "DROP TABLE t"},
+		}, Decision{Kind: Ask, Reason: "gated"})
+	}()
+
+	// Wait until the row is raised, then cancel the turn.
+	var id string
+	require.Eventually(t, func() bool {
+		pending, err := store.ListPending(context.Background())
+		if err != nil || len(pending) == 0 {
+			return false
+		}
+		id = pending[0].ID
+		return true
+	}, 5*time.Second, 5*time.Millisecond)
+	cancel()
+
+	d := <-done
+	require.Equal(t, Deny, d.Kind)
+
+	// The abandoned row is terminally closed — not pending, not approvable.
+	require.Eventually(t, func() bool {
+		hr, err := store.Get(context.Background(), id)
+		return err == nil && hr.Status == "timeout"
+	}, 5*time.Second, 5*time.Millisecond,
+		"the cancel exit must close the row it abandons with a terminal write")
+	hr, err := store.Get(context.Background(), id)
+	require.NoError(t, err)
+	require.Equal(t, "system:cancel", hr.RespondedBy)
+
+	// A later approve is refused by the resolve CAS.
+	require.NoError(t, store.RespondToRequest(context.Background(), id, "approved", "late", "human", nil))
+	hr, err = store.Get(context.Background(), id)
+	require.NoError(t, err)
+	require.Equal(t, "timeout", hr.Status, "a closed row cannot be flipped to approved")
+}
+
+// raceApproveStore approves the row the moment expire()'s ExpireRequest is
+// attempted, simulating an approve transaction landing between the final read
+// and the CAS.
+type raceApproveStore struct {
+	*InMemoryHumanRequestStore
+	mu      sync.Mutex
+	approve func(id string)
+	fired   bool
+}
+
+func (s *raceApproveStore) ExpireRequest(ctx context.Context, id, by string) error {
+	s.mu.Lock()
+	if !s.fired {
+		s.fired = true
+		s.mu.Unlock()
+		s.approve(id) // the human's approve wins the race
+	} else {
+		s.mu.Unlock()
+	}
+	return s.InMemoryHumanRequestStore.ExpireRequest(ctx, id, by)
+}
+
+func TestAskResolver_ExpireHonorsRaceWinningApprove(t *testing.T) {
+	inner := NewInMemoryHumanRequestStore()
+	store := &raceApproveStore{InMemoryHumanRequestStore: inner}
+	store.approve = func(id string) {
+		// Lands the approve the way postgres can: an approve transaction that
+		// OPENED before the expiry passes the CAS on transaction-start time
+		// even when its write lands after expire()'s final read. The in-memory
+		// CAS reads its clock under the mutex, so the postgres ordering is
+		// simulated with a direct state write.
+		hr, err := inner.Get(context.Background(), id)
+		if err != nil || hr == nil {
+			return
+		}
+		hr.Status = "approved"
+		hr.Response = "yes"
+		hr.RespondedBy = "anuj"
+		_ = inner.Update(context.Background(), hr)
+	}
+	r := &hitlAskResolver{store: store, timeout: 150 * time.Millisecond, poll: 10 * time.Millisecond}
+
+	d := r.Resolve(AdmissionRequest{
+		Ctx: context.Background(), ToolName: "execute_sql", SessionID: "s1",
+		Params: map[string]interface{}{"stmt": "DELETE FROM t"},
+	}, Decision{Kind: Ask, Reason: "gated"})
+
+	require.Equal(t, Allow, d.Kind,
+		"an approve that lands before the terminal write must be honored — the persisted state and the returned decision cannot disagree")
+	pending, err := inner.ListBySession(context.Background(), "s1")
+	require.NoError(t, err)
+	require.Len(t, pending, 1)
+	require.Equal(t, "approved", pending[0].Status)
+}
+
+// flappingStore alternates (nil, nil) and a transient error on Get.
+type flappingStore struct {
+	*InMemoryHumanRequestStore
+	mu    sync.Mutex
+	reads int
+}
+
+func (s *flappingStore) Get(ctx context.Context, id string) (*HumanRequest, error) {
+	s.mu.Lock()
+	s.reads++
+	n := s.reads
+	s.mu.Unlock()
+	if n%2 == 1 {
+		return nil, nil // absent
+	}
+	return nil, fmt.Errorf("transient store error")
+}
+
+func (s *flappingStore) readCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.reads
+}
+
+func TestAskResolver_TransientErrorResetsAbsentCounter(t *testing.T) {
+	store := &flappingStore{InMemoryHumanRequestStore: NewInMemoryHumanRequestStore()}
+	r := &hitlAskResolver{store: store, timeout: time.Hour, poll: 5 * time.Millisecond}
+
+	d := r.wait(context.Background(), "req-1", time.Now().Add(400*time.Millisecond))
+	require.Equal(t, Deny, d.Kind)
+	require.Equal(t, "approval timed out", d.Reason,
+		"an alternating absent/error store must ride out the full hold — never 'no longer exists' after non-consecutive absences")
+	require.GreaterOrEqual(t, store.readCount(), 6,
+		"the waiter kept polling well past three total absences")
+}
+
+func TestAskResolver_ExpiryClampedToTurnDeadline(t *testing.T) {
+	store := NewInMemoryHumanRequestStore()
+	r := NewHITLAskResolver(store, time.Hour, 5*time.Millisecond, nil)
+
+	deadline := time.Now().Add(30 * time.Second)
+	ctx, cancel := context.WithDeadline(context.Background(), deadline)
+	defer cancel()
+
+	go func() {
+		_ = r.Resolve(AdmissionRequest{
+			Ctx: ctx, ToolName: "execute_sql", SessionID: "s1",
+			Params: map[string]interface{}{"stmt": "DROP TABLE t"},
+		}, Decision{Kind: Ask, Reason: "gated"})
+	}()
+
+	var hr *HumanRequest
+	require.Eventually(t, func() bool {
+		pending, err := store.ListPending(context.Background())
+		if err != nil || len(pending) == 0 {
+			return false
+		}
+		hr = pending[0]
+		return true
+	}, 5*time.Second, 5*time.Millisecond)
+	cancel()
+
+	require.False(t, hr.ExpiresAt.After(deadline),
+		"the stored expiry must not outlive the turn deadline (window derived at hold time, not at build)")
+	require.True(t, hr.ExpiresAt.After(time.Now().Add(-time.Second)),
+		"the clamped window is still a real window")
 }

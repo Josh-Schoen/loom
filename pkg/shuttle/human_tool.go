@@ -92,9 +92,18 @@ type HumanRequestStore interface {
 	ListBySession(ctx context.Context, sessionID string) ([]*HumanRequest, error)
 
 	// RespondToRequest resolves a pending, non-expired request exactly once.
-	// On an already-decided or expired request it is a no-op returning nil (the
+	// The expiry guard is the store's own — no caller payload can lift it. On
+	// an already-decided or expired request it is a no-op returning nil (the
 	// caller reads current state via Get). Errors only on a missing row / store failure.
 	RespondToRequest(ctx context.Context, requestID, status, response, respondedBy string, responseData map[string]interface{}) error
+
+	// ExpireRequest terminally closes a pending request as "timeout" on behalf
+	// of the harness — the waiter's give-up path, a canceled turn's abandon
+	// write, an expiry sweep. It is the ONLY path that may close a row past its
+	// expiry; a row already resolved is left untouched (closing is not
+	// resolving). A missing row is a no-op. respondedBy records the closing
+	// actor (e.g. "system:expiry", "system:cancel").
+	ExpireRequest(ctx context.Context, requestID, respondedBy string) error
 
 	// Close releases any resources held by the store.
 	Close() error
@@ -226,15 +235,25 @@ func (t *ContactHumanTool) Execute(ctx context.Context, params map[string]interf
 	span.SetAttribute("hitl.priority", priority)
 	span.SetAttribute("hitl.question", question)
 
-	// Extract context (if provided)
+	// Extract context (if provided). The model's map is copied, and the origin
+	// discriminator is stamped by the harness OVER whatever the model supplied:
+	// "kind" is the one field chosen to be free of model control, and store
+	// backstops read it out of this map when the kind column is absent — so it
+	// must be harness-written in both origins.
 	contextData := make(map[string]interface{})
 	if c, ok := params["context"].(map[string]interface{}); ok {
-		contextData = c
+		for k, v := range c {
+			contextData[k] = v
+		}
 	}
+	contextData["kind"] = "question"
 
-	// Extract timeout. The model-supplied value is clamped to a positive floor:
-	// a zero or negative timeout would store an already-expired pending request
-	// that no response can ever resolve.
+	// Extract timeout. The model-supplied value is clamped both ways: a
+	// positive floor (a zero or negative timeout would store an already-expired
+	// pending request no response can resolve) and a ceiling at the turn's own
+	// deadline — the model chooses how long it is willing to wait, never a
+	// window outliving the turn, which would leave a row answerable for a call
+	// that already returned.
 	timeoutSeconds := float64(t.timeout.Seconds())
 	if ts, ok := params["timeout_seconds"].(float64); ok {
 		timeoutSeconds = ts
@@ -244,6 +263,14 @@ func (t *ContactHumanTool) Execute(ctx context.Context, params map[string]interf
 		timeoutSeconds = minTimeoutSeconds
 	}
 	timeout := time.Duration(timeoutSeconds) * time.Second
+	if dl, ok := ctx.Deadline(); ok {
+		if remaining := time.Until(dl); remaining < timeout {
+			timeout = remaining
+			if timeout < minTimeoutSeconds*time.Second {
+				timeout = minTimeoutSeconds * time.Second
+			}
+		}
+	}
 	span.SetAttribute("hitl.timeout_seconds", int32(timeout.Seconds()))
 
 	// Extract session ID and agent ID from context (if available)
@@ -408,10 +435,13 @@ func (t *ContactHumanTool) waitForResponse(ctx context.Context, requestID string
 				return nil, true // Timed out
 			}
 
-			// Poll for response
+			// Poll for response. The postgres store reports an absent row as
+			// (nil, nil) — its documented contract — so a nil row must be
+			// tolerated exactly like a transient error, never dereferenced: a
+			// sweep may legitimately retire the row under a live waiter.
 			req, err := t.store.Get(ctx, requestID)
-			if err != nil {
-				continue // Retry on error
+			if err != nil || req == nil {
+				continue // Retry on error or absent row until the deadline
 			}
 
 			// Check if human has responded
@@ -470,6 +500,13 @@ func cloneStringMap(m map[string]interface{}) map[string]interface{} {
 }
 
 func (s *InMemoryHumanRequestStore) Store(ctx context.Context, req *HumanRequest) error {
+	// A pending request must carry an expiry: a zero ExpiresAt would make the
+	// row permanently approvable, and the resolve CAS's expiry guard is keyed
+	// on the stored value. Both in-repo producers always stamp one; this guards
+	// exported-API callers.
+	if req.Status == "pending" && req.ExpiresAt.IsZero() {
+		return fmt.Errorf("pending human request %s has no expiry", req.ID)
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -529,7 +566,9 @@ func (s *InMemoryHumanRequestStore) ListBySession(ctx context.Context, sessionID
 
 // RespondToRequest resolves a pending, non-expired request exactly once.
 // On an already-decided or expired request it is a no-op returning nil, so the
-// caller reads current state via Get. Errors only on a missing request.
+// caller reads current state via Get. Errors only on a missing request. The
+// expiry guard is the store's own: no status value in the caller's payload can
+// lift it — terminal closes past expiry go through ExpireRequest.
 func (s *InMemoryHumanRequestStore) RespondToRequest(ctx context.Context, requestID, status, response, respondedBy string, responseData map[string]interface{}) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -540,15 +579,7 @@ func (s *InMemoryHumanRequestStore) RespondToRequest(ctx context.Context, reques
 	}
 
 	now := time.Now()
-	// Resolve only a pending, non-expired request; a decided or expired row is
-	// left untouched so the caller reads its current state via Get. An unset
-	// (zero) expiry means "no expiry", and a terminal "timeout" write may close
-	// any pending request — closing is not resolving.
-	if req.Status != "pending" {
-		return nil
-	}
-	expired := !req.ExpiresAt.IsZero() && now.After(req.ExpiresAt)
-	if expired && status != "timeout" {
+	if req.Status != "pending" || now.After(req.ExpiresAt) {
 		return nil
 	}
 
@@ -558,6 +589,27 @@ func (s *InMemoryHumanRequestStore) RespondToRequest(ctx context.Context, reques
 	req.RespondedAt = &now
 	req.RespondedBy = respondedBy
 
+	return nil
+}
+
+// ExpireRequest terminally closes a pending request as "timeout" regardless of
+// its expiry — the harness's close for abandoned or swept rows. A resolved row
+// is left untouched (closing is not resolving); a missing row is a no-op.
+func (s *InMemoryHumanRequestStore) ExpireRequest(ctx context.Context, requestID, respondedBy string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	req, exists := s.requests[requestID]
+	if !exists || req.Status != "pending" {
+		return nil
+	}
+
+	now := time.Now()
+	req.Status = "timeout"
+	req.Response = ""
+	req.ResponseData = nil
+	req.RespondedAt = &now
+	req.RespondedBy = respondedBy
 	return nil
 }
 

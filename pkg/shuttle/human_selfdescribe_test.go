@@ -126,7 +126,7 @@ func TestSelfDescribe_InMemoryStore_AdditiveKindSummaryRoundTrip(t *testing.T) {
 	store := NewInMemoryHumanRequestStore()
 
 	t.Run("absent kind reads back empty", func(t *testing.T) {
-		require.NoError(t, store.Store(ctx, &HumanRequest{ID: "no-kind", Status: "pending"}))
+		require.NoError(t, store.Store(ctx, &HumanRequest{ID: "no-kind", Status: "pending", ExpiresAt: time.Now().Add(time.Hour)}))
 
 		got, err := store.Get(ctx, "no-kind")
 		require.NoError(t, err, "a request with no Kind reads back without error")
@@ -136,10 +136,11 @@ func TestSelfDescribe_InMemoryStore_AdditiveKindSummaryRoundTrip(t *testing.T) {
 
 	t.Run("kind and summary round-trip", func(t *testing.T) {
 		require.NoError(t, store.Store(ctx, &HumanRequest{
-			ID:      "with-kind",
-			Status:  "pending",
-			Kind:    "approval",
-			Summary: "delete_table DELETE FROM users",
+			ID:        "with-kind",
+			Status:    "pending",
+			ExpiresAt: time.Now().Add(time.Hour),
+			Kind:      "approval",
+			Summary:   "delete_table DELETE FROM users",
 		}))
 
 		got, err := store.Get(ctx, "with-kind")

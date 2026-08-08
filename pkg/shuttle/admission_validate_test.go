@@ -248,3 +248,13 @@ hooks:
 		require.Contains(t, err.Error(), "ask", "the build-time error lists ask among the valid kinds")
 	})
 }
+
+// with a registry supplied, an unknown custom-hook name fails at
+// validation (the save door), not at the next session build.
+func TestValidateWithRegistry_UnknownCustomName(t *testing.T) {
+	cfg := HooksConfig{Bindings: []HookBinding{{Kind: "custom", Scope: "x", Name: "no-such-hook"}}}
+	require.NoError(t, ValidateHooksConfig(cfg), "deps-free validation stays lenient")
+	err := ValidateHooksConfigWithRegistry(cfg, stubCustomRegistry{})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "not registered")
+}

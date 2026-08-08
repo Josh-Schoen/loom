@@ -56,6 +56,8 @@ func (f fakeApprovedSet) Record(ctx context.Context, stateKey string, ids []Call
 	return nil
 }
 
+func (f fakeApprovedSet) ForgetSession(sessionID string) {}
+
 func (f fakeApprovedSet) Contains(ctx context.Context, stateKey string, id CallIdentity) (bool, error) {
 	set, ok := f.allowed[stateKey]
 	if !ok {

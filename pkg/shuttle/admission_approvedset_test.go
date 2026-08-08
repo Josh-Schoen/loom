@@ -15,6 +15,7 @@ package shuttle
 
 import (
 	"context"
+	"github.com/stretchr/testify/assert"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -256,4 +257,45 @@ func TestGatedAllowlist_AC7_ApprovedSetIsPerSessionIsolated(t *testing.T) {
 	require.Equal(t, "permission_denied", resB.Error.Code)
 	require.Equal(t, "call not in approved set", resB.Error.Message)
 	require.Equal(t, 0, toolB.ExecuteCount, "another user's approved set opens no bypass")
+}
+
+// the approved set is session-partitioned, union-merging, and
+// never clobbered by a later render.
+func TestApprovedSet_SessionPartition_UnionMerge(t *testing.T) {
+	acc := NewApprovedSet()
+	ctxA := session.WithSessionID(context.Background(), "sess-A")
+	ctxB := session.WithSessionID(context.Background(), "sess-B")
+
+	require.NoError(t, acc.Record(ctxA, "k", []CallIdentity{"stmt-1"}))
+	require.NoError(t, acc.Record(ctxB, "k", []CallIdentity{"stmt-B"}))
+	require.NoError(t, acc.Record(ctxA, "k", []CallIdentity{"stmt-2"})) // second render
+
+	for id, want := range map[CallIdentity]bool{"stmt-1": true, "stmt-2": true, "stmt-B": false} {
+		ok, err := acc.Contains(ctxA, "k", id)
+		require.NoError(t, err)
+		assert.Equal(t, want, ok, "session A membership of %q", id)
+	}
+	okB, err := acc.Contains(ctxB, "k", "stmt-B")
+	require.NoError(t, err)
+	assert.True(t, okB)
+	okB1, err := acc.Contains(ctxB, "k", "stmt-1")
+	require.NoError(t, err)
+	assert.False(t, okB1, "cross-session membership is never visible")
+}
+
+func TestApprovedSet_ForgetSessionDropsBuckets(t *testing.T) {
+	as := NewApprovedSet()
+	ctx1 := session.WithSessionID(context.Background(), "s1")
+	ctx2 := session.WithSessionID(context.Background(), "s2")
+	require.NoError(t, as.Record(ctx1, "approved_stmts", []CallIdentity{"stmt-a"}))
+	require.NoError(t, as.Record(ctx2, "approved_stmts", []CallIdentity{"stmt-b"}))
+
+	as.ForgetSession("s1")
+
+	ok, err := as.Contains(ctx1, "approved_stmts", "stmt-a")
+	require.NoError(t, err)
+	require.False(t, ok, "a retired session's approvals are dropped")
+	ok, err = as.Contains(ctx2, "approved_stmts", "stmt-b")
+	require.NoError(t, err)
+	require.True(t, ok, "another session's approvals are untouched")
 }

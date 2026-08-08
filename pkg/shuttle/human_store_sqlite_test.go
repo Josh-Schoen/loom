@@ -7,7 +7,9 @@ package shuttle
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -571,4 +573,125 @@ func newTestSQLiteStore(t *testing.T) *SQLiteHumanRequestStore {
 	})
 	require.NoError(t, err)
 	return store
+}
+
+// Same law on the SQLite store.
+func TestRespondToRequest_StoreOwnedExpiryGuard_SQLite(t *testing.T) {
+	store, err := NewSQLiteHumanRequestStore(SQLiteConfig{Path: filepath.Join(t.TempDir(), "hitl.db")})
+	require.NoError(t, err)
+	defer func() { _ = store.Close() }()
+
+	require.Error(t, store.Store(context.Background(), &HumanRequest{
+		ID: "r1", AgentID: "a", SessionID: "s", Question: "q",
+		RequestType: "approval", Priority: "normal", Status: "pending",
+		CreatedAt: time.Now()}),
+		"a pending row with no expiry must be refused")
+
+	expired := &HumanRequest{ID: "r2", AgentID: "a", SessionID: "s", Question: "q",
+		RequestType: "approval", Priority: "normal", Status: "pending",
+		CreatedAt: time.Now().Add(-2 * time.Minute), ExpiresAt: time.Now().Add(-time.Minute)}
+	require.NoError(t, store.Store(context.Background(), expired))
+	require.NoError(t, store.RespondToRequest(context.Background(), "r2", "approved", "", "human", nil))
+	got, err := store.Get(context.Background(), "r2")
+	require.NoError(t, err)
+	require.Equal(t, "pending", got.Status)
+	require.NoError(t, store.RespondToRequest(context.Background(), "r2", "timeout", "", "attacker", nil))
+	got, err = store.Get(context.Background(), "r2")
+	require.NoError(t, err)
+	require.Equal(t, "pending", got.Status,
+		"the caller-supplied status must not decide whether the expiry guard applies")
+	require.NoError(t, store.ExpireRequest(context.Background(), "r2", "system:expiry"))
+	got, err = store.Get(context.Background(), "r2")
+	require.NoError(t, err)
+	require.Equal(t, "timeout", got.Status)
+
+	live := &HumanRequest{ID: "r3", AgentID: "a", SessionID: "s", Question: "q",
+		RequestType: "approval", Priority: "normal", Status: "pending",
+		CreatedAt: time.Now(), ExpiresAt: time.Now().Add(time.Hour)}
+	require.NoError(t, store.Store(context.Background(), live))
+	require.NoError(t, store.RespondToRequest(context.Background(), "r3", "rejected", "no", "human", nil))
+	require.NoError(t, store.ExpireRequest(context.Background(), "r3", "system:expiry"))
+	got, err = store.Get(context.Background(), "r3")
+	require.NoError(t, err)
+	require.Equal(t, "rejected", got.Status, "closing is not resolving")
+}
+
+// an existing hitl.db from before the four columns shipped is
+// upgraded in place by initSchema's column guard; Store/Get work immediately.
+func TestSQLiteHumanStore_UpgradesPreexistingSchema(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "hitl.db")
+	createLegacyHITLSchema(t, path)
+
+	// Open: the guard must add the four columns.
+	store, err := NewSQLiteHumanRequestStore(SQLiteConfig{Path: path})
+	require.NoError(t, err)
+	defer func() { _ = store.Close() }()
+
+	req := &HumanRequest{ID: "r1", AgentID: "a", SessionID: "s", Question: "q",
+		RequestType: "approval", Priority: "normal", Status: "pending",
+		Kind: "approval", Summary: "sql_execute GRANT",
+		Params:    map[string]interface{}{"stmt": "GRANT SELECT ON t TO alice"},
+		CreatedAt: time.Now(), ExpiresAt: time.Now().Add(time.Minute)}
+	require.NoError(t, store.Store(context.Background(), req))
+	got, err := store.Get(context.Background(), "r1")
+	require.NoError(t, err)
+	require.Equal(t, "approval", got.Kind)
+	require.Equal(t, "GRANT SELECT ON t TO alice", got.Params["stmt"])
+}
+
+// createLegacyHITLSchema fabricates the pre-TER-710 15-column human_requests
+// table, as an upgraded deployment's hitl.db carries it.
+func createLegacyHITLSchema(t *testing.T, path string) {
+	t.Helper()
+	db, err := sql.Open("sqlite3", path)
+	require.NoError(t, err)
+	_, err = db.Exec(`CREATE TABLE human_requests (
+		id TEXT PRIMARY KEY, agent_id TEXT NOT NULL, session_id TEXT NOT NULL,
+		question TEXT NOT NULL, context_json TEXT, request_type TEXT NOT NULL,
+		priority TEXT NOT NULL, timeout_ms INTEGER NOT NULL,
+		created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL,
+		status TEXT NOT NULL, response TEXT, response_data_json TEXT,
+		responded_at INTEGER, responded_by TEXT)`)
+	require.NoError(t, err)
+	require.NoError(t, db.Close())
+}
+
+// a legacy row with no kind column (pre-migration, or after a
+// rollback re-adds it as NULL) is still recognisably an approval via the
+// context_json origin discriminator.
+func TestKindSurvivesColumnRollback_SQLite(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "hitl.db")
+	createLegacyHITLSchema(t, path)
+
+	// A pre-rollback approval row: context_json carries the origin, the kind
+	// column does not exist yet.
+	db, err := sql.Open("sqlite3", path)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO human_requests
+		(id, agent_id, session_id, question, context_json, request_type, priority,
+		 timeout_ms, created_at, expires_at, status, response, response_data_json,
+		 responded_by)
+		VALUES ('r1','a','s','q','{"kind":"approval","tool":"sql_execute"}','approval','normal',
+		 60000, ?, ?, 'pending', '', '', '')`,
+		time.Now().UnixMilli(), time.Now().Add(time.Minute).UnixMilli())
+	require.NoError(t, err)
+	require.NoError(t, db.Close())
+
+	store, err := NewSQLiteHumanRequestStore(SQLiteConfig{Path: path})
+	require.NoError(t, err)
+	defer func() { _ = store.Close() }()
+
+	got, err := store.Get(context.Background(), "r1")
+	require.NoError(t, err)
+	require.Equal(t, "approval", got.Kind, "context_json backstops a missing kind column")
+}
+
+// TestMain helper guard: ensure the temp-dir cleanup does not interfere with
+// WAL sidecar files on close.
+func TestSQLiteHumanStore_CloseIsClean(t *testing.T) {
+	store, err := NewSQLiteHumanRequestStore(SQLiteConfig{Path: filepath.Join(t.TempDir(), "x.db")})
+	require.NoError(t, err)
+	require.NoError(t, store.Close())
+	_, statErr := os.Stat(filepath.Join(t.TempDir()))
+	require.NoError(t, statErr)
 }

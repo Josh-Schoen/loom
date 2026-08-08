@@ -74,10 +74,14 @@ type AskResolver interface {
 type CallIdentity string
 
 // ApprovedSetAccessor records and queries prior approvals keyed by a caller
-// state key.
+// state key. ForgetSession is the reclamation half of the contract: a host
+// that retires a session drops its approvals through it (the agent's
+// DeleteSession does), so the set's growth is bounded by LIVE sessions, not by
+// every session the process ever served.
 type ApprovedSetAccessor interface {
 	Record(ctx context.Context, stateKey string, ids []CallIdentity) error
 	Contains(ctx context.Context, stateKey string, id CallIdentity) (bool, error)
+	ForgetSession(sessionID string)
 }
 
 // AuditHook is a Hook that additionally reports how a final decision should be

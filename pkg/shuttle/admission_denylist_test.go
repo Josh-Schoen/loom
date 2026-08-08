@@ -107,3 +107,13 @@ func TestDenylist_AC2_MissingParamPathAdmitted(t *testing.T) {
 	require.True(t, res.Success, "a call missing the matched param is admitted")
 	require.Equal(t, 1, tool.ExecuteCount, "the admitted tool body runs exactly once")
 }
+
+// a denylist that sets the (unread) pattern field is refused at
+// validation instead of silently denying everything in scope.
+func TestDenylist_PatternField_RefusedLoudly(t *testing.T) {
+	err := ValidateHooksConfig(HooksConfig{Bindings: []HookBinding{{
+		Kind: "denylist", Scope: "sql_execute", Pattern: "(?i)GRANT|DROP",
+	}}})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "matcher")
+}

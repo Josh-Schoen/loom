@@ -1201,9 +1201,13 @@ func runServe(cmd *cobra.Command, args []string) {
 	// tenant-scoped (user_id RLS), replicated with the rest of the data, and
 	// inside the transactional/backup boundary. Only the SQLite backend keeps
 	// the standalone node-local hitl.db (shared with the CLI's hitl list/respond).
+	// hitlStoreDesc travels to every log line that names where holds live, so
+	// the operator's evidence always points at the store the server writes.
 	var hitlStore shuttle.HumanRequestStore
+	var hitlStoreDesc string
 	if config.Storage.Backend == "postgres" {
 		hitlStore = storageBackend.HumanRequestStore()
+		hitlStoreDesc = "postgres (storage backend)"
 		logger.Info("HITL request store initialized on the storage backend",
 			zap.String("backend", config.Storage.Backend))
 	} else {
@@ -1217,6 +1221,7 @@ func runServe(cmd *cobra.Command, args []string) {
 		}
 		defer func() { _ = sqliteHITL.Close() }()
 		hitlStore = sqliteHITL
+		hitlStoreDesc = hitlDBPath
 		logger.Info("HITL request store initialized", zap.String("path", hitlDBPath))
 	}
 
@@ -1947,7 +1952,7 @@ func runServe(cmd *cobra.Command, args []string) {
 				// paths cannot drift.
 				registerYAMLBuiltinTools(ag, cfg, registry, logger, "    ", "agent_management")
 
-				// Register contact_human tool with shared SQLite store (if listed in builtin tools)
+				// Register contact_human tool with the shared HITL store (if listed in builtin tools)
 				if cfg.Tools != nil {
 					for _, toolName := range cfg.Tools.Builtin {
 						if toolName == "contact_human" {
@@ -1957,8 +1962,8 @@ func runServe(cmd *cobra.Command, args []string) {
 								Logger: logger,
 							})
 							ag.RegisterTool(humanTool)
-							logger.Info("    Auto-registered contact_human tool (shared SQLite store)",
-								zap.String("db_path", hitlDBPath))
+							logger.Info("    Auto-registered contact_human tool (shared HITL store)",
+								zap.String("store", hitlStoreDesc))
 							break
 						}
 					}
@@ -3184,7 +3189,7 @@ func runServe(cmd *cobra.Command, args []string) {
 			// shell_execute on hot reload under tools.minimal/none.
 			registerYAMLBuiltinTools(newAgent, agentConfig, registry, logger, "  ", "agent_management (reload)")
 
-			// Register contact_human tool with shared SQLite store (if listed in builtin tools)
+			// Register contact_human tool with shared HITL store (if listed in builtin tools)
 			if agentConfig.Tools != nil {
 				for _, toolName := range agentConfig.Tools.Builtin {
 					if toolName == "contact_human" {
@@ -3194,8 +3199,8 @@ func runServe(cmd *cobra.Command, args []string) {
 							Logger: logger,
 						})
 						newAgent.RegisterTool(humanTool)
-						logger.Info("  Auto-registered contact_human tool (shared SQLite store)",
-							zap.String("db_path", hitlDBPath))
+						logger.Info("  Auto-registered contact_human tool (shared HITL store)",
+							zap.String("store", hitlStoreDesc))
 						break
 					}
 				}

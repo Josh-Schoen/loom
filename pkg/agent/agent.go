@@ -3442,6 +3442,12 @@ func (a *Agent) ListSessions() []*Session {
 // DeleteSession removes a session.
 func (a *Agent) DeleteSession(sessionID string) {
 	a.memory.DeleteSession(sessionID)
+	// Drop the session's recorded approvals alongside its other per-session
+	// state: the approved set is bounded by live sessions only because every
+	// retirement path frees its buckets.
+	if as := a.executor.ApprovedSet(); as != nil {
+		as.ForgetSession(sessionID)
+	}
 	// Drop the session's advertised-tool ledger too, or it grows unbounded on a
 	// long-running multi-session server. scopedToolNames is process-global (a
 	// name is scoped once any session scopes it) and is intentionally not pruned.
@@ -3451,6 +3457,23 @@ func (a *Agent) DeleteSession(sessionID string) {
 	// In-turn SQLite databases are normally dropped at the session's next turn
 	// start; a deleted session has no next turn, so drop them here.
 	a.dropInTurnSQLite(sessionID)
+}
+
+// ApprovedSet returns the executor's approved-set accessor; nil until one is
+// wired.
+func (a *Agent) ApprovedSet() shuttle.ApprovedSetAccessor {
+	return a.executor.ApprovedSet()
+}
+
+// AdoptApprovedSet hands this agent an existing approved-set accessor. The
+// hot-reload path carries the outgoing agent's set onto its replacement so
+// live sessions' recorded approvals survive the swap — an agent rebuild is an
+// operator action on the agent, not on its sessions, and must not falsify an
+// approval a human already gave. A nil accessor is ignored.
+func (a *Agent) AdoptApprovedSet(s shuttle.ApprovedSetAccessor) {
+	if s != nil {
+		a.executor.SetApprovedSet(s)
+	}
 }
 
 // ClearAllSessions removes all sessions from memory.
@@ -3701,8 +3724,12 @@ func (a *Agent) SetSharedMemory(sharedMemory *storage.SharedMemoryStore) {
 
 		// The approved-set accessor is a dedicated session-keyed membership
 		// store (not the shared-memory cache): authorization state must not be
-		// evictable and renders union rather than replace.
-		a.executor.SetApprovedSet(shuttle.NewApprovedSet())
+		// evictable and renders union rather than replace. Create it only when
+		// absent — replacing an existing set would silently discard live
+		// sessions' recorded approvals.
+		if a.executor.ApprovedSet() == nil {
+			a.executor.SetApprovedSet(shuttle.NewApprovedSet())
+		}
 	}
 
 	// Inject into memory manager (which handles all sessions)

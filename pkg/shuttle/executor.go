@@ -138,23 +138,24 @@ func (e *Executor) SetBuiltinToolProvider(provider BuiltinToolProvider) {
 	e.builtinToolProvider = provider
 }
 
-// admit runs the admission chain for a tool call. It returns the request handed
+// admit runs the admission gates for a tool call. It returns the request handed
 // to the hooks, the admission result, and — when the decision is Deny — a ready
-// permission_denied Result to return in place of running the tool. With no chain
-// attached, the name-level PermissionChecker still enforces (the pre-chain
-// behavior of this seam): a checker denial returns the same permission_denied
-// shape. With neither configured the call is a pure pass-through.
+// permission_denied Result to return in place of running the tool. The
+// name-level PermissionChecker enforces UNCONDITIONALLY when set — with or
+// without a chain attached — so SetPermissionChecker is never silently inert:
+// a host that sets both gets the checker first, then the chain. With neither
+// configured the call is a pure pass-through.
 func (e *Executor) admit(ctx context.Context, toolName string, params map[string]interface{}) (AdmissionRequest, AdmissionResult, *Result) {
-	if e.admissionChain == nil {
-		if e.permissionChecker != nil {
-			if err := e.permissionChecker.CheckPermission(ctx, toolName, params); err != nil {
-				denied := &Result{
-					Success: false,
-					Error:   &Error{Code: "permission_denied", Message: err.Error(), Retryable: false},
-				}
-				return AdmissionRequest{}, AdmissionResult{Decision: Decision{Kind: Deny, Reason: err.Error()}}, denied
+	if e.permissionChecker != nil {
+		if err := e.permissionChecker.CheckPermission(ctx, toolName, params); err != nil {
+			denied := &Result{
+				Success: false,
+				Error:   &Error{Code: "permission_denied", Message: err.Error(), Retryable: false},
 			}
+			return AdmissionRequest{}, AdmissionResult{Decision: Decision{Kind: Deny, Reason: err.Error()}}, denied
 		}
+	}
+	if e.admissionChain == nil {
 		return AdmissionRequest{}, AdmissionResult{Decision: Decision{Kind: NoDecision}}, nil
 	}
 

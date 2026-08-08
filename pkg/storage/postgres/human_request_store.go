@@ -49,6 +49,14 @@ func (s *HumanRequestStore) Store(ctx context.Context, req *shuttle.HumanRequest
 	defer s.tracer.EndSpan(span)
 	span.SetAttribute("request_id", req.ID)
 
+	// A pending request must carry an expiry: a zero ExpiresAt would make the
+	// row permanently approvable, and the resolve CAS's expiry guard is keyed
+	// on the stored value. Both in-repo producers always stamp one; this guards
+	// exported-API callers.
+	if req.Status == "pending" && req.ExpiresAt.IsZero() {
+		return fmt.Errorf("pending human request %s has no expiry", req.ID)
+	}
+
 	contextJSON, err := json.Marshal(req.Context)
 	if err != nil {
 		span.RecordError(err)
@@ -281,18 +289,16 @@ func (s *HumanRequestStore) RespondToRequest(ctx context.Context, requestID, sta
 	var resolved bool
 	err := execInTx(ctx, s.pool, func(ctx context.Context, tx pgx.Tx) error {
 		userID := UserIDFromContext(ctx)
-		// Resolve only a pending, non-expired row. Two carve-outs keep rows
-		// closable: an unset expiry (the zero time, far before the epoch) means
-		// "no expiry", and a terminal "timeout" write may close ANY pending row
-		// — closing is not resolving, and without it an expired hold would stay
-		// reported-pending forever.
+		// Resolve only a pending, non-expired row. The expiry guard is the
+		// store's own — nothing in the caller's payload can lift it; terminal
+		// closes past expiry go through ExpireRequest.
 		tag, err := tx.Exec(ctx, `
 			UPDATE human_requests
 			SET status = $1, response = $2, response_data_json = $3,
 				responded_at = now(), responded_by = $4
 			WHERE id = $5 AND user_id = $6
 				AND status = 'pending'
-				AND (expires_at > now() OR expires_at < TIMESTAMPTZ '1971-01-01' OR $1 = 'timeout')`,
+				AND expires_at > now()`,
 			status,
 			nullableString(response),
 			nullableBytes(responseDataJSON),
@@ -329,6 +335,38 @@ func (s *HumanRequestStore) RespondToRequest(ctx context.Context, requestID, sta
 		return fmt.Errorf("request not found: %s", requestID)
 	}
 	span.SetAttribute("resolved", false)
+	return nil
+}
+
+// ExpireRequest terminally closes a pending row as "timeout" regardless of its
+// expiry — the harness's close for abandoned or swept rows. A resolved row
+// matches zero rows and is left untouched (closing is not resolving); a
+// missing row is a no-op. Tenant-scoped like every other operation.
+func (s *HumanRequestStore) ExpireRequest(ctx context.Context, requestID, respondedBy string) error {
+	ctx, span := s.tracer.StartSpan(ctx, "pg_human_store.expire")
+	defer s.tracer.EndSpan(span)
+	span.SetAttribute("request_id", requestID)
+
+	err := execInTx(ctx, s.pool, func(ctx context.Context, tx pgx.Tx) error {
+		userID := UserIDFromContext(ctx)
+		_, err := tx.Exec(ctx, `
+			UPDATE human_requests
+			SET status = 'timeout', response = NULL, response_data_json = NULL,
+				responded_at = now(), responded_by = $1
+			WHERE id = $2 AND user_id = $3 AND status = 'pending'`,
+			nullableString(respondedBy),
+			requestID,
+			userID,
+		)
+		if err != nil {
+			return fmt.Errorf("failed to expire human request: %w", err)
+		}
+		return nil
+	})
+	if err != nil {
+		span.RecordError(err)
+		return err
+	}
 	return nil
 }
 
