@@ -238,10 +238,10 @@ func NewAgent(backend fabric.ExecutionBackend, llmProvider LLMProvider, opts ...
 		}
 		a.executor.SetSharedMemory(a.sharedMemory, threshold)
 
-		// Back the approved-set accessor with the same store so a gated-allowlist
-		// reads it as AdmissionRequest.State; membership inherits the store's
-		// per-session isolation.
-		a.executor.SetApprovedSet(shuttle.NewApprovedSet(a.sharedMemory))
+		// The approved-set accessor is a dedicated session-keyed membership
+		// store (not the shared-memory cache): authorization state must not be
+		// evictable and renders union rather than replace.
+		a.executor.SetApprovedSet(shuttle.NewApprovedSet())
 	}
 
 	// The findings channel is retired: neither the record_finding tool nor automatic
@@ -3699,10 +3699,10 @@ func (a *Agent) SetSharedMemory(sharedMemory *storage.SharedMemoryStore) {
 		}
 		a.executor.SetSharedMemory(sharedMemory, threshold)
 
-		// Back the approved-set accessor with the same store so a gated-allowlist
-		// reads it as AdmissionRequest.State; membership inherits the store's
-		// per-session isolation.
-		a.executor.SetApprovedSet(shuttle.NewApprovedSet(sharedMemory))
+		// The approved-set accessor is a dedicated session-keyed membership
+		// store (not the shared-memory cache): authorization state must not be
+		// evictable and renders union rather than replace.
+		a.executor.SetApprovedSet(shuttle.NewApprovedSet())
 	}
 
 	// Inject into memory manager (which handles all sessions)

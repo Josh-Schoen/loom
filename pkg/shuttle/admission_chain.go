@@ -24,6 +24,21 @@ type AdmissionResult struct {
 	AuditDecision string
 }
 
+// PersistedDecision is the value the executor stamps into the tool-execution
+// record: a matched audit hook's decision when one fired, and otherwise "deny"
+// for a denied call — a denial is intrinsically classifiable and the analytics
+// view keys policy_denied_count on this column, so it must ride every deny,
+// audited or not. A non-denied, non-audited call stamps nothing.
+func (r AdmissionResult) PersistedDecision() string {
+	if r.AuditDecision != "" {
+		return r.AuditDecision
+	}
+	if r.Decision.Kind == Deny {
+		return "deny"
+	}
+	return ""
+}
+
 // Chain evaluates admission hooks for every tool call and combines their
 // verdicts into a single decision. It also fans out post-tool observation to
 // its PostToolHooks after a tool body runs.
@@ -72,7 +87,7 @@ func (c *Chain) Admit(req AdmissionRequest) AdmissionResult {
 
 	if final.Kind == Ask {
 		if c.askResolver != nil {
-			final = c.askResolver.Resolve(req, final)
+			final = resolveAsk(c.askResolver, req, final)
 		} else {
 			final = Decision{Kind: Deny, Reason: "tool call requires approval but no approval resolver is configured"}
 		}
@@ -126,6 +141,19 @@ func observeOne(h PostToolHook, req AdmissionRequest, result *Result) {
 	h.Observe(req, result)
 }
 
+// resolveAsk runs the Ask resolver with the same fail-closed panic containment
+// evalHook gives hooks: the resolver blocks across store polls and runs outside
+// evalHook's recover, and a panic there must become a Deny for this call — never
+// an unwound serving process.
+func resolveAsk(r AskResolver, req AdmissionRequest, d Decision) (out Decision) {
+	defer func() {
+		if p := recover(); p != nil {
+			out = Decision{Kind: Deny, Reason: fmt.Sprintf("approval resolver panicked: %v", p)}
+		}
+	}()
+	return r.Resolve(req, d)
+}
+
 // moreRestrictive returns whichever decision is more restrictive under
 // Deny > Ask > Allow; ties keep the incumbent so an earlier hook's reason wins.
 func moreRestrictive(a, b Decision) Decision {
@@ -136,12 +164,16 @@ func moreRestrictive(a, b Decision) Decision {
 }
 
 // restrictiveness ranks decision kinds so combination is independent of the
-// DecisionKind iota values. NoDecision and Allow rank lowest (least restrictive).
+// DecisionKind iota values. Allow ranks ABOVE NoDecision: a matched hook's
+// explicit Allow must displace the NoDecision seed, or an audited allowed call
+// would report no decision at all and its audit record would never be written.
 func restrictiveness(k DecisionKind) int {
 	switch k {
 	case Deny:
-		return 2
+		return 3
 	case Ask:
+		return 2
+	case Allow:
 		return 1
 	default:
 		return 0

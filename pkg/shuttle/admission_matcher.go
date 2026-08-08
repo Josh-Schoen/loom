@@ -24,9 +24,9 @@ import (
 // (a dispatch tool's carried op) using dot-separated segments. Op is the
 // comparison against Value: "equals", "regex", or "contains".
 type MatcherSpec struct {
-	ParamPath string `mapstructure:"param_path"`
-	Op        string `mapstructure:"op"`
-	Value     string `mapstructure:"value"`
+	ParamPath string `mapstructure:"param_path" json:"param_path"`
+	Op        string `mapstructure:"op" json:"op"`
+	Value     string `mapstructure:"value" json:"value"`
 }
 
 // Matcher is a compiled param selector: a resolved param path plus a comparison

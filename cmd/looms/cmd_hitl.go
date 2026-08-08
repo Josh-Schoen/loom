@@ -395,7 +395,9 @@ func runHitlRespond(cmd *cobra.Command, args []string) {
 
 	span.SetAttribute("responded_by", respondedBy)
 
-	// Respond to request
+	// Respond to request. The store's conditional write is a deliberate no-op
+	// for an already-decided or expired request, so success is judged by
+	// reading the row back — never by the write returning nil.
 	err = store.RespondToRequest(ctx, requestID, hitlStatus, hitlMessage, respondedBy, responseData)
 	if err != nil {
 		span.RecordError(err)
@@ -404,11 +406,32 @@ func runHitlRespond(cmd *cobra.Command, args []string) {
 		os.Exit(1)
 	}
 
+	after, err := store.Get(ctx, requestID)
+	if err != nil || after == nil {
+		span.SetAttribute("success", false)
+		fmt.Fprintf(os.Stderr, "Response submitted but the request could not be read back: %v\n", err)
+		os.Exit(1)
+	}
+	if after.Status != hitlStatus {
+		// The write did not land: the request was already decided, or it
+		// expired unanswered (an expired hold is closable only as "timeout").
+		span.SetAttribute("success", false)
+		fmt.Fprintf(os.Stderr, "✗ Response NOT recorded — request is %q", after.Status)
+		if after.RespondedBy != "" {
+			fmt.Fprintf(os.Stderr, " (responded by %s)", after.RespondedBy)
+		}
+		if after.Status == "pending" && !after.ExpiresAt.IsZero() && time.Now().After(after.ExpiresAt) {
+			fmt.Fprintf(os.Stderr, " — expired at %s", after.ExpiresAt.Format(time.RFC3339))
+		}
+		fmt.Fprintln(os.Stderr)
+		os.Exit(1)
+	}
+
 	span.SetAttribute("success", true)
 
 	fmt.Printf("✓ Response recorded\n")
 	fmt.Printf("  Request ID: %s\n", requestID)
-	fmt.Printf("  Status:     %s\n", hitlStatus)
+	fmt.Printf("  Status:     %s\n", after.Status)
 	fmt.Printf("  Message:    %s\n", hitlMessage)
 	fmt.Printf("  By:         %s\n", respondedBy)
 }

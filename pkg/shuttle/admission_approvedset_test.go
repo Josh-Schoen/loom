@@ -20,7 +20,6 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/teradata-labs/loom/pkg/session"
-	"github.com/teradata-labs/loom/pkg/storage"
 )
 
 // D-3 acceptance tests for the gated-allowlist READ side: a §5.4 approved-set
@@ -67,7 +66,7 @@ func gatedExec(t *testing.T, acc ApprovedSetAccessor, tools ...*MockTool) *Execu
 // SharedMemoryStore — the store whose session partitioning supplies the
 // cross-tenant isolation.
 func storeAccessor() ApprovedSetAccessor {
-	return NewApprovedSet(storage.NewSharedMemoryStore(&storage.Config{}))
+	return NewApprovedSet()
 }
 
 // grantIdentity is the approved-set key for a sql_execute statement, derived

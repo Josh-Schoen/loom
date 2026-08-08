@@ -47,6 +47,7 @@ hooks:
       value: "^GRANT"
     state_key: approved_grants
     source_tool: sql_render
+    stmt_param: sql
     read_pattern: "^SELECT"
   - kind: denylist
     scope: shell

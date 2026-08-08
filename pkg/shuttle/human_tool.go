@@ -75,7 +75,11 @@ type HumanRequestStore interface {
 	// Store saves a new human request
 	Store(ctx context.Context, req *HumanRequest) error
 
-	// Get retrieves a human request by ID
+	// Get retrieves a human request by ID. Absence contract: the postgres
+	// store returns (nil, nil) for a missing row so callers can distinguish
+	// absence from a store failure; the sqlite and in-memory stores return an
+	// error. Callers must treat BOTH a nil request and an error as
+	// possibly-absent (the ask waiter does), never dereference unchecked.
 	Get(ctx context.Context, id string) (*HumanRequest, error)
 
 	// Update updates an existing human request
@@ -228,10 +232,16 @@ func (t *ContactHumanTool) Execute(ctx context.Context, params map[string]interf
 		contextData = c
 	}
 
-	// Extract timeout
+	// Extract timeout. The model-supplied value is clamped to a positive floor:
+	// a zero or negative timeout would store an already-expired pending request
+	// that no response can ever resolve.
 	timeoutSeconds := float64(t.timeout.Seconds())
 	if ts, ok := params["timeout_seconds"].(float64); ok {
 		timeoutSeconds = ts
+	}
+	const minTimeoutSeconds = 5
+	if timeoutSeconds < minTimeoutSeconds {
+		timeoutSeconds = minTimeoutSeconds
 	}
 	timeout := time.Duration(timeoutSeconds) * time.Second
 	span.SetAttribute("hitl.timeout_seconds", int32(timeout.Seconds()))
@@ -531,18 +541,37 @@ func (s *InMemoryHumanRequestStore) RespondToRequest(ctx context.Context, reques
 
 	now := time.Now()
 	// Resolve only a pending, non-expired request; a decided or expired row is
-	// left untouched so the caller reads its current state via Get.
-	if req.Status != "pending" || now.After(req.ExpiresAt) {
+	// left untouched so the caller reads its current state via Get. An unset
+	// (zero) expiry means "no expiry", and a terminal "timeout" write may close
+	// any pending request — closing is not resolving.
+	if req.Status != "pending" {
+		return nil
+	}
+	expired := !req.ExpiresAt.IsZero() && now.After(req.ExpiresAt)
+	if expired && status != "timeout" {
 		return nil
 	}
 
 	req.Status = status
 	req.Response = response
-	req.ResponseData = responseData
+	req.ResponseData = cloneResponseData(responseData)
 	req.RespondedAt = &now
 	req.RespondedBy = respondedBy
 
 	return nil
+}
+
+// cloneResponseData copies the caller's map so later caller mutation cannot
+// corrupt stored state (every other method in this store clones likewise).
+func cloneResponseData(data map[string]interface{}) map[string]interface{} {
+	if data == nil {
+		return nil
+	}
+	out := make(map[string]interface{}, len(data))
+	for k, v := range data {
+		out[k] = v
+	}
+	return out
 }
 
 // Close is a no-op; in-memory store has no resources to release.

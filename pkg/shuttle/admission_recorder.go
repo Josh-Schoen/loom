@@ -56,9 +56,18 @@ func (r *recorder) Observe(req AdmissionRequest, result *Result) {
 		return
 	}
 
+	// An empty canonical identity is never recorded: it would otherwise become
+	// a wildcard key that admits any call whose statement is absent, non-string
+	// or whitespace-only (the read side refuses to look "" up for the same
+	// reason — both sides must hold or either alone is bypassable).
 	ids := make([]CallIdentity, 0, len(stmts))
 	for _, stmt := range stmts {
-		ids = append(ids, Canonicalize(r.sourceTool, map[string]interface{}{r.stmtParam: stmt}, r.stmtParam))
+		if id := Canonicalize(r.sourceTool, map[string]interface{}{r.stmtParam: stmt}, r.stmtParam); id != "" {
+			ids = append(ids, id)
+		}
+	}
+	if len(ids) == 0 {
+		return
 	}
 
 	_ = state.Record(req.Ctx, r.stateKey, ids)

@@ -116,6 +116,32 @@ func (s *SQLiteHumanRequestStore) initSchema() error {
 		return err
 	}
 
+	// Columns added after the initial shape shipped: CREATE TABLE IF NOT EXISTS
+	// is a no-op against an existing hitl.db, so each is applied with a
+	// pragma_table_info guard (this store is opened standalone — no migration
+	// runner ever reaches it).
+	added := map[string]string{
+		"kind":             "ALTER TABLE human_requests ADD COLUMN kind TEXT",
+		"summary":          "ALTER TABLE human_requests ADD COLUMN summary TEXT",
+		"params_json":      "ALTER TABLE human_requests ADD COLUMN params_json TEXT",
+		"params_truncated": "ALTER TABLE human_requests ADD COLUMN params_truncated BOOLEAN DEFAULT 0",
+	}
+	for col, ddl := range added {
+		var n int
+		row := s.db.QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM pragma_table_info('human_requests') WHERE name = ?`, col)
+		if err := row.Scan(&n); err != nil {
+			span.RecordError(err)
+			return err
+		}
+		if n == 0 {
+			if _, err := s.db.ExecContext(ctx, ddl); err != nil {
+				span.RecordError(err)
+				return fmt.Errorf("add column %s: %w", col, err)
+			}
+		}
+	}
+
 	span.SetAttribute("success", true)
 	return nil
 }
@@ -418,17 +444,21 @@ func (s *SQLiteHumanRequestStore) RespondToRequest(ctx context.Context, requestI
 
 	// Atomic conditional update: resolve only a pending, non-expired row. A
 	// decided or expired row matches zero rows and is left untouched, and under
-	// concurrency exactly one writer affects the row.
+	// concurrency exactly one writer affects the row. Two carve-outs keep rows
+	// closable: a zero/unset expiry (stored as a non-positive instant) means "no
+	// expiry", and a terminal "timeout" write may close ANY pending row —
+	// closing is not resolving, and without it an expired hold would stay
+	// reported-pending forever.
 	query := `
 		UPDATE human_requests
 		SET status = ?, response = ?, response_data_json = ?,
 		    responded_at = ?, responded_by = ?
-		WHERE id = ? AND status = 'pending' AND expires_at > ?
+		WHERE id = ? AND status = 'pending' AND (expires_at > ? OR expires_at <= 0 OR ? = 'timeout')
 	`
 
 	result, err := s.db.ExecContext(ctx, query,
 		status, response, string(responseDataJSON),
-		now, respondedBy, requestID, now,
+		now, respondedBy, requestID, now, status,
 	)
 	if err != nil {
 		span.RecordError(err)
@@ -518,9 +548,16 @@ func (s *SQLiteHumanRequestStore) scanRequest(row interface {
 		req.RespondedAt = &t
 	}
 
-	// NULL kind/summary leaves the zero value ""; consumers treat "" as "question".
+	// NULL kind/summary leaves the zero value ""; consumers treat "" as
+	// "question". The context_json origin discriminator backstops a dropped
+	// kind column so an approval row never re-reads as a question.
 	if kind.Valid {
 		req.Kind = kind.String
+	}
+	if req.Kind == "" {
+		if k, ok := req.Context["kind"].(string); ok {
+			req.Kind = k
+		}
 	}
 	if summary.Valid {
 		req.Summary = summary.String

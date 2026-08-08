@@ -30,13 +30,13 @@ type CustomHookRegistry interface {
 // ChainDeps carries the collaborators BuildChainFromConfig needs to turn
 // bindings into live hooks: the name-level permission checker (folded in as the
 // first hook), the approved-set accessor a gated-allowlist reads, the resolver
-// an Ask verdict defers to, the pending-emit collaborator the composition layer
-// hands the ask resolver, and the registry a custom binding resolves against.
+// an Ask verdict defers to, and the registry a custom binding resolves against.
+// The pending-emit collaborator is NOT injected here — it is a constructor
+// argument of NewHITLAskResolver, the one way in.
 type ChainDeps struct {
 	Perm        *PermissionChecker
 	ApprovedSet ApprovedSetAccessor
 	Ask         AskResolver
-	Notifier    Notifier
 	Custom      CustomHookRegistry
 }
 
@@ -84,9 +84,24 @@ func BuildChainFromConfig(cfg HooksConfig, deps ChainDeps) (*Chain, error) {
 // binding's name-registry membership is left to build (an unregistered name
 // fails closed there).
 func ValidateHooksConfig(cfg HooksConfig) error {
+	return ValidateHooksConfigWithRegistry(cfg, nil)
+}
+
+// ValidateHooksConfigWithRegistry is ValidateHooksConfig plus custom-name
+// resolution: when a registry is supplied, a custom binding whose Name has no
+// registered constructor is a validation error — so a host's save door can
+// reject an unknown custom hook at save time (C-010) instead of the operator
+// discovering a deny-all agent at the next session build. Pass
+// ProcessCustomHookRegistry() to validate against the process registry.
+func ValidateHooksConfigWithRegistry(cfg HooksConfig, reg CustomHookRegistry) error {
 	for i, b := range cfg.Bindings {
 		if err := validateBinding(b); err != nil {
 			return fmt.Errorf("tools.hooks[%d] (kind %q): %w", i, b.Kind, err)
+		}
+		if b.Kind == "custom" && reg != nil {
+			if _, ok := reg.lookup(b.Name); !ok {
+				return fmt.Errorf("tools.hooks[%d] (kind %q): custom hook %q is not registered", i, b.Kind, b.Name)
+			}
 		}
 	}
 	return nil
@@ -108,7 +123,12 @@ func validateBinding(b HookBinding) error {
 		return err
 	}
 	switch b.Kind {
-	case "denylist", "audit", "ask":
+	case "audit", "ask":
+		return nil
+	case "denylist":
+		if b.Pattern != "" {
+			return fmt.Errorf("denylist does not take pattern — select calls with matcher (param_path/op/value); an unmatched field would silently widen the rule")
+		}
 		return nil
 	case "gated-allowlist":
 		if strings.TrimSpace(b.StateKey) == "" {
@@ -117,8 +137,11 @@ func validateBinding(b HookBinding) error {
 		if strings.TrimSpace(b.SourceTool) == "" {
 			return fmt.Errorf("gated-allowlist requires source_tool")
 		}
+		if strings.TrimSpace(b.StmtParam) == "" {
+			return fmt.Errorf("gated-allowlist requires stmt_param — without it every call canonicalizes to the empty identity and the gate degrades to a wildcard after any render")
+		}
 		if b.ReadPattern != "" {
-			if _, err := regexp.Compile(b.ReadPattern); err != nil {
+			if _, err := compileReadPattern(b.ReadPattern); err != nil {
 				return fmt.Errorf("invalid read_pattern %q: %w", b.ReadPattern, err)
 			}
 		}
@@ -182,16 +205,20 @@ func (h libraryHook) Evaluate(req AdmissionRequest) Decision {
 	return h.eval(req)
 }
 
-// gatedAllowlistHook admits a governed write only when its call identity is in
-// the approved set at the binding's state_key; a read-pattern match is admitted
-// with no entry. A missing entry, an accessor error, or no accessor wired is a
-// hard deny (fail-closed) — never an ask. The binding's field rules (state_key,
-// source_tool, read_pattern compilability) are enforced by validateBinding
-// before this constructs; read_pattern is compiled again here for the closure.
+// gatedAllowlistHook admits a governed call only when its canonical identity is
+// in the approved set at the binding's state_key, or — failing that — when the
+// WHOLE payload classifies as read-only under read_pattern: the payload is split
+// into statements and every statement must match the anchored pattern, so a
+// write smuggled behind a read (`SELECT 1; DROP TABLE …`) never rides the read
+// allowance. The set check runs FIRST, the read classification second. An empty
+// canonical identity is never a membership key — it hard-denies. A missing
+// entry, an accessor error, or no accessor wired is a hard deny (fail-closed) —
+// never an ask. Field rules (state_key, source_tool, stmt_param, read_pattern
+// compilability) are enforced by validateBinding before this constructs.
 func gatedAllowlistHook(b HookBinding, scope ToolScope, matcher Matcher, deps ChainDeps) (Hook, error) {
 	var readRe *regexp.Regexp
 	if b.ReadPattern != "" {
-		re, err := regexp.Compile(b.ReadPattern)
+		re, err := compileReadPattern(b.ReadPattern)
 		if err != nil {
 			return nil, fmt.Errorf("invalid read_pattern %q: %w", b.ReadPattern, err)
 		}
@@ -202,10 +229,6 @@ func gatedAllowlistHook(b HookBinding, scope ToolScope, matcher Matcher, deps Ch
 	accessor := deps.ApprovedSet
 
 	eval := func(req AdmissionRequest) Decision {
-		stmt := stmtValue(req.Params, stmtParam)
-		if readRe != nil && readRe.MatchString(stmt) {
-			return Decision{Kind: Allow}
-		}
 		state := req.State
 		if state == nil {
 			state = accessor
@@ -213,17 +236,64 @@ func gatedAllowlistHook(b HookBinding, scope ToolScope, matcher Matcher, deps Ch
 		if state == nil {
 			return Decision{Kind: Deny, Reason: "gated-allowlist has no approved-set store"}
 		}
-		ok, err := state.Contains(req.Ctx, stateKey, Canonicalize(req.ToolName, req.Params, stmtParam))
-		if err != nil {
-			return Decision{Kind: Deny, Reason: fmt.Sprintf("approved-set lookup failed: %v", err)}
+		id := Canonicalize(req.ToolName, req.Params, stmtParam)
+		if id != "" {
+			ok, err := state.Contains(req.Ctx, stateKey, id)
+			if err != nil {
+				return Decision{Kind: Deny, Reason: fmt.Sprintf("approved-set lookup failed: %v", err)}
+			}
+			if ok {
+				return Decision{Kind: Allow}
+			}
 		}
-		if ok {
+		if readRe != nil && readOnlyPayload(stmtValue(req.Params, stmtParam), readRe) {
 			return Decision{Kind: Allow}
+		}
+		if id == "" {
+			return Decision{Kind: Deny, Reason: "call carries no statement to judge (empty or non-string stmt_param)"}
 		}
 		return Decision{Kind: Deny, Reason: "call not in approved set"}
 	}
 
 	return libraryHook{scope: scope, matcher: matcher, eval: eval}, nil
+}
+
+// compileReadPattern anchors the operator's read_pattern to the start of each
+// statement: the pattern classifies what KIND of statement this is, so it must
+// match at the head, not anywhere inside (a bare `SELECT` must not bless
+// `DELETE … WHERE id IN (SELECT …)`).
+func compileReadPattern(pattern string) (*regexp.Regexp, error) {
+	return regexp.Compile("^(?:" + pattern + ")")
+}
+
+// readOnlyPayload reports whether the WHOLE payload is read-only under the
+// anchored pattern: it splits on ';' into statements and requires every
+// non-empty statement to match. An empty payload is not read-only. Splitting is
+// syntactic — a ';' inside a string literal splits too, which can only deny a
+// legitimate read, never admit a write (fail-closed).
+func readOnlyPayload(payload string, readRe *regexp.Regexp) bool {
+	stmts := splitStatements(payload)
+	if len(stmts) == 0 {
+		return false
+	}
+	for _, s := range stmts {
+		if !readRe.MatchString(s) {
+			return false
+		}
+	}
+	return true
+}
+
+// splitStatements cuts a payload on ';' into trimmed, non-empty statements.
+func splitStatements(payload string) []string {
+	parts := strings.Split(payload, ";")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if t := strings.TrimSpace(p); t != "" {
+			out = append(out, t)
+		}
+	}
+	return out
 }
 
 // customHook resolves a custom binding's Name to its constructor and builds the

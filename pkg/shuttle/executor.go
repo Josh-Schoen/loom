@@ -106,6 +106,13 @@ func (e *Executor) SetApprovedSet(accessor ApprovedSetAccessor) {
 	e.approvedSet = accessor
 }
 
+// ApprovedSet returns the wired approved-set accessor (nil when none). The set
+// is per-accessor state, so introspection must go through the same instance the
+// executor threads to hooks.
+func (e *Executor) ApprovedSet() ApprovedSetAccessor {
+	return e.approvedSet
+}
+
 // SetIdentityResolver configures how AdmissionRequest.UserID is read from the
 // call context. pkg/shuttle cannot import the storage layer that owns the
 // user-id context key without an import cycle, so the composition layer injects
@@ -133,11 +140,21 @@ func (e *Executor) SetBuiltinToolProvider(provider BuiltinToolProvider) {
 
 // admit runs the admission chain for a tool call. It returns the request handed
 // to the hooks, the admission result, and — when the decision is Deny — a ready
-// permission_denied Result to return in place of running the tool. A nil chain
-// is a pure pass-through: no request is built, no decision is reached, and the
-// tool runs exactly as if no chain were attached.
+// permission_denied Result to return in place of running the tool. With no chain
+// attached, the name-level PermissionChecker still enforces (the pre-chain
+// behavior of this seam): a checker denial returns the same permission_denied
+// shape. With neither configured the call is a pure pass-through.
 func (e *Executor) admit(ctx context.Context, toolName string, params map[string]interface{}) (AdmissionRequest, AdmissionResult, *Result) {
 	if e.admissionChain == nil {
+		if e.permissionChecker != nil {
+			if err := e.permissionChecker.CheckPermission(ctx, toolName, params); err != nil {
+				denied := &Result{
+					Success: false,
+					Error:   &Error{Code: "permission_denied", Message: err.Error(), Retryable: false},
+				}
+				return AdmissionRequest{}, AdmissionResult{Decision: Decision{Kind: Deny, Reason: err.Error()}}, denied
+			}
+		}
 		return AdmissionRequest{}, AdmissionResult{Decision: Decision{Kind: NoDecision}}, nil
 	}
 
@@ -161,17 +178,24 @@ func (e *Executor) admit(ctx context.Context, toolName string, params map[string
 			Success: false,
 			Error:   &Error{Code: "permission_denied", Message: res.Decision.Reason, Retryable: false},
 		}
-		stampAdmissionDecision(denied, res.AuditDecision)
 		return req, res, denied
 	}
 
 	return req, res, nil
 }
 
-// stampAdmissionDecision records the audit decision on a Result's metadata when
-// a matched AuditHook produced one. It is a no-op for an empty decision.
+// stampAdmissionDecision makes "admission.decision" a RESERVED metadata key
+// sourced solely from the chain: a matched AuditHook's decision is written, and
+// with no audit decision any value a tool body put under the key is deleted, so
+// the persisted trail can never carry a tool-forged verdict. Both executor entry
+// points stamp exactly once, via a deferred call over the named return, so every
+// exit — success, deny, and each error path — carries the correct value.
 func stampAdmissionDecision(result *Result, auditDecision string) {
-	if result == nil || auditDecision == "" {
+	if result == nil {
+		return
+	}
+	if auditDecision == "" {
+		delete(result.Metadata, "admission.decision")
 		return
 	}
 	if result.Metadata == nil {
@@ -181,7 +205,7 @@ func stampAdmissionDecision(result *Result, auditDecision string) {
 }
 
 // Execute executes a tool by name with the given parameters.
-func (e *Executor) Execute(ctx context.Context, toolName string, params map[string]interface{}) (*Result, error) {
+func (e *Executor) Execute(ctx context.Context, toolName string, params map[string]interface{}) (result *Result, err error) {
 	tool, ok := e.registry.Get(toolName)
 	if !ok {
 		// Tool not found locally, try dynamic registration
@@ -195,18 +219,26 @@ func (e *Executor) Execute(ctx context.Context, toolName string, params map[stri
 		tool = dynamicTool
 	}
 
+	// Normalize parameters BEFORE admission so the chain and the tool body see
+	// one map: the matcher must judge the exact params the tool would receive,
+	// or the caller's key spelling would decide whether a binding matches.
+	normalizedParams := normalizeParametersToSchema(tool, params)
+
+	// Stamp the audit verdict at every exit — success, deny, and each error
+	// return — through the one deferred call (the key is reserved: with no
+	// audit decision a tool-written value is removed).
+	var adm AdmissionResult
+	defer func() { stampAdmissionDecision(result, adm.PersistedDecision()) }()
+
 	// Admit before execution. The tool is already acquired (locally or via
 	// dynamic registration) so an externally-resolved tool is governed at the
 	// same seam as a local one. A Deny returns the permission_denied Result
 	// without running the tool body.
-	req, adm, denied := e.admit(ctx, toolName, params)
+	req, admRes, denied := e.admit(ctx, toolName, normalizedParams)
+	adm = admRes
 	if denied != nil {
 		return denied, nil
 	}
-
-	// Normalize parameters to match schema expectations
-	// LLMs naturally use snake_case, but some tools expect camelCase
-	normalizedParams := normalizeParametersToSchema(tool, params)
 
 	// Handle large parameters: store in shared memory to prevent context bloat
 	referencedParams, err := e.handleLargeParameters(ctx, normalizedParams)
@@ -235,7 +267,7 @@ func (e *Executor) Execute(ctx context.Context, toolName string, params map[stri
 	}
 
 	start := time.Now()
-	result, err := tool.Execute(ctx, finalParams)
+	result, err = tool.Execute(ctx, finalParams)
 	duration := time.Since(start)
 
 	if err != nil {
@@ -260,23 +292,31 @@ func (e *Executor) Execute(ctx context.Context, toolName string, params map[stri
 		}
 	}
 
-	stampAdmissionDecision(result, adm.AuditDecision)
 	e.admissionChain.Observe(req, result)
 
 	return result, nil
 }
 
 // ExecuteWithTool executes a specific tool instance (not from registry).
-func (e *Executor) ExecuteWithTool(ctx context.Context, tool Tool, params map[string]interface{}) (*Result, error) {
+func (e *Executor) ExecuteWithTool(ctx context.Context, tool Tool, params map[string]interface{}) (result *Result, err error) {
+	// Normalize parameters BEFORE admission so the chain and the tool body see
+	// one map (same invariant as Execute).
+	normalizedParams := normalizeParametersToSchema(tool, params)
+
+	// Stamp the audit verdict at every exit through the one deferred call.
+	var adm AdmissionResult
+	defer func() { stampAdmissionDecision(result, adm.PersistedDecision()) }()
+
 	// Admit before execution. A Deny returns the permission_denied Result
 	// without running the tool body.
-	req, adm, denied := e.admit(ctx, tool.Name(), params)
+	req, admRes, denied := e.admit(ctx, tool.Name(), normalizedParams)
+	adm = admRes
 	if denied != nil {
 		return denied, nil
 	}
 
 	// Handle large parameters: store in shared memory to prevent context bloat
-	referencedParams, err := e.handleLargeParameters(ctx, params)
+	referencedParams, err := e.handleLargeParameters(ctx, normalizedParams)
 	if err != nil {
 		return &Result{
 			Success: false,
@@ -302,7 +342,7 @@ func (e *Executor) ExecuteWithTool(ctx context.Context, tool Tool, params map[st
 	}
 
 	start := time.Now()
-	result, err := tool.Execute(ctx, finalParams)
+	result, err = tool.Execute(ctx, finalParams)
 	duration := time.Since(start)
 
 	if err != nil {
@@ -326,7 +366,6 @@ func (e *Executor) ExecuteWithTool(ctx context.Context, tool Tool, params map[st
 		}
 	}
 
-	stampAdmissionDecision(result, adm.AuditDecision)
 	e.admissionChain.Observe(req, result)
 
 	return result, nil

@@ -1195,18 +1195,30 @@ func runServe(cmd *cobra.Command, args []string) {
 	}
 	logger.Info("Scratchpad directory initialized", zap.String("path", scratchpadDir))
 
-	// Initialize shared HITL (Human-in-the-Loop) request store
-	// This SQLite store is shared between the server (contact_human tool) and the CLI (hitl list/respond)
-	hitlDBPath := filepath.Join(loomDataDir, "hitl.db")
-	hitlStore, err := shuttle.NewSQLiteHumanRequestStore(shuttle.SQLiteConfig{
-		Path:   hitlDBPath,
-		Tracer: tracer,
-	})
-	if err != nil {
-		logger.Fatal("Failed to create HITL request store", zap.Error(err))
+	// Initialize the HITL (Human-in-the-Loop) request store. This row is
+	// AUTHORIZATION state — it decides whether a held tool call executes — so it
+	// must live in the configured storage backend: under Postgres that store is
+	// tenant-scoped (user_id RLS), replicated with the rest of the data, and
+	// inside the transactional/backup boundary. Only the SQLite backend keeps
+	// the standalone node-local hitl.db (shared with the CLI's hitl list/respond).
+	var hitlStore shuttle.HumanRequestStore
+	if config.Storage.Backend == "postgres" {
+		hitlStore = storageBackend.HumanRequestStore()
+		logger.Info("HITL request store initialized on the storage backend",
+			zap.String("backend", config.Storage.Backend))
+	} else {
+		hitlDBPath := filepath.Join(loomDataDir, "hitl.db")
+		sqliteHITL, err := shuttle.NewSQLiteHumanRequestStore(shuttle.SQLiteConfig{
+			Path:   hitlDBPath,
+			Tracer: tracer,
+		})
+		if err != nil {
+			logger.Fatal("Failed to create HITL request store", zap.Error(err))
+		}
+		defer func() { _ = sqliteHITL.Close() }()
+		hitlStore = sqliteHITL
+		logger.Info("HITL request store initialized", zap.String("path", hitlDBPath))
 	}
-	defer func() { _ = hitlStore.Close() }()
-	logger.Info("HITL request store initialized", zap.String("path", hitlDBPath))
 
 	// Copy documentation from docs to loom data directory
 	docsDestDir := filepath.Join(loomDataDir, "documentation")
@@ -1542,9 +1554,13 @@ func runServe(cmd *cobra.Command, args []string) {
 	// An `ask` decision defers to the HITL store — the same SQLite store
 	// contact_human uses — so a human resolves the approval out of band. Timeout
 	// mirrors tools.permissions; the poll interval matches ContactHumanConfig (1s).
+	// The ask hold window falls back to the resolver's default (300s) when no
+	// tools.permissions block sets a timeout — a zero here would otherwise make
+	// every ask binding deny instantly with "approval timed out".
+	askTimeout := time.Duration(config.Tools.Permissions.TimeoutSeconds) * time.Second
 	askResolver := shuttle.NewHITLAskResolver(
 		hitlStore,
-		time.Duration(config.Tools.Permissions.TimeoutSeconds)*time.Second,
+		askTimeout,
 		time.Second,
 		nil,
 	)
@@ -1581,6 +1597,12 @@ func runServe(cmd *cobra.Command, args []string) {
 		Tracer:       tracer,
 		ToolRegistry: toolRegistry,
 		SessionStore: store,
+		// Governance travels to EVERY agent build path: the registry builds
+		// agents at runtime-create and hot-reload, and an agent rebuilt without
+		// the chain would silently become ungoverned (C-007).
+		PermissionChecker: permissionChecker,
+		AdmissionChain:    admissionChain,
+		IdentityResolver:  postgres.UserIDFromContext,
 	})
 	if err != nil {
 		logger.Warn("Failed to create agent registry", zap.Error(err))

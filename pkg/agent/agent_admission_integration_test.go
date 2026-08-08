@@ -31,7 +31,6 @@ import (
 	llmtypes "github.com/teradata-labs/loom/pkg/llm/types"
 	"github.com/teradata-labs/loom/pkg/session"
 	"github.com/teradata-labs/loom/pkg/shuttle"
-	"github.com/teradata-labs/loom/pkg/storage"
 )
 
 // Tool names and the statement param the gated-allowlist and its recorder key on.
@@ -166,16 +165,16 @@ func startAdmissionAgent(t *testing.T, llm LLMProvider, chain *shuttle.Chain) (*
 	return ag, exec
 }
 
-// grantSetContains reads the §5.4 approved set the executor wired over the global
-// shared-memory store, from the same session the loop ran under, and reports
-// whether sql's call identity is a member.
-func grantSetContains(t *testing.T, sessionID, stateKey, sql string) bool {
+// grantSetContains reads the §5.4 approved set through the accessor the agent's
+// executor actually wired — the set is per-accessor state, so membership must be
+// asked of the same instance the recorder wrote — from the same session the loop
+// ran under, and reports whether sql's call identity is a member.
+func grantSetContains(t *testing.T, ag *Agent, sessionID, stateKey, sql string) bool {
 	t.Helper()
-	acc := shuttle.NewApprovedSet(storage.GetGlobalSharedMemory(&storage.Config{
-		MaxMemoryBytes:       500 * 1024 * 1024,
-		CompressionThreshold: 1024 * 1024,
-		TTLSeconds:           3600,
-	}))
+	acc := ag.executor.ApprovedSet()
+	if acc == nil {
+		t.Fatal("agent's executor has no approved-set accessor wired")
+	}
 	ctx := session.WithSessionID(context.Background(), sessionID)
 	ok, err := acc.Contains(ctx, stateKey, shuttle.Canonicalize(admExecTool, map[string]interface{}{admStmtParam: sql}, admStmtParam))
 	if err != nil {
@@ -232,10 +231,10 @@ func TestAgent_AdmissionLoop_RenderThenGrantRead_Admitted(t *testing.T) {
 
 	// The render output is in the approved set — recorded before either execute
 	// was admitted, which their admission proves.
-	if !grantSetContains(t, sessionID, stateKey, admViewSQL) {
+	if !grantSetContains(t, ag, sessionID, stateKey, admViewSQL) {
 		t.Error("expected the rendered CREATE VIEW in the approved set")
 	}
-	if !grantSetContains(t, sessionID, stateKey, admGrantReadSQL) {
+	if !grantSetContains(t, ag, sessionID, stateKey, admGrantReadSQL) {
 		t.Error("expected the rendered read GRANT in the approved set")
 	}
 
@@ -286,7 +285,7 @@ func TestAgent_AdmissionLoop_UnrenderedSelfGrant_HardDenied(t *testing.T) {
 
 	// The unrendered self-GRANT is a hard deny: permission_denied, not a
 	// pending/ask, and it never entered the approved set.
-	if grantSetContains(t, sessionID, stateKey, admSelfGrantSQL) {
+	if grantSetContains(t, ag, sessionID, stateKey, admSelfGrantSQL) {
 		t.Fatal("the self-GRANT must never be in the approved set")
 	}
 	te := execExecutionFor(resp, admSelfGrantSQL)
@@ -325,10 +324,10 @@ func TestAgent_AdmissionLoop_ModelSkipsRender_SelfGrantDenied(t *testing.T) {
 	}
 
 	// No render ran, so the set is empty for every statement.
-	if grantSetContains(t, sessionID, stateKey, admSelfGrantSQL) {
+	if grantSetContains(t, ag, sessionID, stateKey, admSelfGrantSQL) {
 		t.Fatal("the self-GRANT must never be in the approved set")
 	}
-	if grantSetContains(t, sessionID, stateKey, admGrantReadSQL) {
+	if grantSetContains(t, ag, sessionID, stateKey, admGrantReadSQL) {
 		t.Fatal("the approved set must be empty when render is skipped")
 	}
 

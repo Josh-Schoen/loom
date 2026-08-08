@@ -208,10 +208,16 @@ func TestAskHITL_Timeout_DeniesFailClosed(t *testing.T) {
 	require.Equal(t, "permission_denied", res.Error.Code)
 	require.Equal(t, 0, f.tool.ExecuteCount, "an unanswered request denies without running the tool")
 
-	// The unanswered request is still pending in the store after the deny.
+	// The waiter closes the hold it abandons: the row's terminal state agrees
+	// with the decision the model received — never a forever-pending ghost.
 	pending, err := f.store.ListPending(context.Background())
 	require.NoError(t, err)
-	require.Len(t, pending, 1)
+	require.Empty(t, pending, "an expired hold is closed, not left pending")
+	reqs, err := f.store.ListBySession(context.Background(), "sess-1")
+	require.NoError(t, err)
+	require.Len(t, reqs, 1)
+	require.Equal(t, "timeout", reqs[0].Status)
+	require.Equal(t, "system:expiry", reqs[0].RespondedBy)
 }
 
 // AC4 (sibling fail-closed): a context canceled before a response denies and the

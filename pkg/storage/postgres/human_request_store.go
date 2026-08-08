@@ -281,12 +281,18 @@ func (s *HumanRequestStore) RespondToRequest(ctx context.Context, requestID, sta
 	var resolved bool
 	err := execInTx(ctx, s.pool, func(ctx context.Context, tx pgx.Tx) error {
 		userID := UserIDFromContext(ctx)
+		// Resolve only a pending, non-expired row. Two carve-outs keep rows
+		// closable: an unset expiry (the zero time, far before the epoch) means
+		// "no expiry", and a terminal "timeout" write may close ANY pending row
+		// — closing is not resolving, and without it an expired hold would stay
+		// reported-pending forever.
 		tag, err := tx.Exec(ctx, `
 			UPDATE human_requests
 			SET status = $1, response = $2, response_data_json = $3,
 				responded_at = now(), responded_by = $4
 			WHERE id = $5 AND user_id = $6
-				AND status = 'pending' AND expires_at > now()`,
+				AND status = 'pending'
+				AND (expires_at > now() OR expires_at < TIMESTAMPTZ '1971-01-01' OR $1 = 'timeout')`,
 			status,
 			nullableString(response),
 			nullableBytes(responseDataJSON),
@@ -396,7 +402,9 @@ func scanHumanRequestRow(row pgx.Row) (*shuttle.HumanRequest, error) {
 		req.RespondedBy = *respondedBy
 	}
 	// NULL kind/summary (pre-migration rows) leave the zero value ""; consumers
-	// treat an empty kind as "question".
+	// treat an empty kind as "question". The context_json origin discriminator
+	// backstops a rolled-back kind column: an approval row is recognisable even
+	// after the column is gone, instead of confidently re-reading as a question.
 	if kind != nil {
 		req.Kind = *kind
 	}
@@ -420,6 +428,9 @@ func scanHumanRequestRow(row pgx.Row) (*shuttle.HumanRequest, error) {
 			return nil, fmt.Errorf("failed to unmarshal human request context: %w", err)
 		}
 	}
+	if req.Kind == "" {
+		req.Kind = kindFromContext(req.Context)
+	}
 	if len(responseDataJSON) > 0 {
 		if err := json.Unmarshal(responseDataJSON, &req.ResponseData); err != nil {
 			return nil, fmt.Errorf("failed to unmarshal human request response data: %w", err)
@@ -432,6 +443,16 @@ func scanHumanRequestRow(row pgx.Row) (*shuttle.HumanRequest, error) {
 // durationFromMs converts milliseconds to time.Duration.
 func durationFromMs(ms int64) time.Duration {
 	return time.Duration(ms) * time.Millisecond
+}
+
+// kindFromContext recovers the origin discriminator the creator duplicated into
+// context_json, so a row whose kind column was dropped by a migration rollback
+// is still recognisably an approval rather than defaulting to a question.
+func kindFromContext(ctx map[string]interface{}) string {
+	if k, ok := ctx["kind"].(string); ok {
+		return k
+	}
+	return ""
 }
 
 // Compile-time check: HumanRequestStore implements shuttle.HumanRequestStore.

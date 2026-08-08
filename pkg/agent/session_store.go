@@ -279,15 +279,22 @@ func (s *SessionStore) initSchema() error {
 		"evicted": "ALTER TABLE messages ADD COLUMN evicted INTEGER NOT NULL DEFAULT 0",
 		"folded":  "ALTER TABLE messages ADD COLUMN folded INTEGER NOT NULL DEFAULT 0",
 		"turn":    "ALTER TABLE messages ADD COLUMN turn INTEGER NOT NULL DEFAULT 0",
+		// Admission audit decision (TER-710): stamped on every persisted tool
+		// execution; without this guard an upgraded DB fails every
+		// tool_executions INSERT (the error is swallowed) and persistence
+		// silently stops.
+		"admission_decision": "ALTER TABLE tool_executions ADD COLUMN admission_decision TEXT",
 	}
 
 	for columnName, migration := range agentMemoryMigrations {
 		// Check if column exists
 		var table string
-		if columnName == "session_context" || columnName == "message_agent_id" ||
-			columnName == "evicted" || columnName == "folded" || columnName == "turn" {
+		switch columnName {
+		case "session_context", "message_agent_id", "evicted", "folded", "turn":
 			table = "messages"
-		} else {
+		case "admission_decision":
+			table = "tool_executions"
+		default:
 			table = "sessions"
 		}
 

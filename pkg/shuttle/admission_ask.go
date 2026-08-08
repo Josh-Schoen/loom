@@ -161,6 +161,11 @@ func (r *hitlAskResolver) Resolve(req AdmissionRequest, d Decision) Decision {
 			"tool":    req.ToolName,
 			"user_id": req.UserID,
 			"reason":  d.Reason,
+			// Origin discriminator, duplicated from Kind: the kind/summary
+			// columns are droppable by a migration rollback, context_json is
+			// not — so a restored row remains recognisably an approval instead
+			// of silently re-reading as a question.
+			"kind": "approval",
 		},
 		RequestType: "approval",
 		Priority:    "normal",
@@ -186,41 +191,89 @@ func (r *hitlAskResolver) Resolve(req AdmissionRequest, d Decision) Decision {
 		_ = r.notifier.Notify(ctx, hr)
 	}
 
-	return r.wait(ctx, hr.ID)
+	return r.wait(ctx, hr.ID, hr.ExpiresAt)
 }
 
-// wait polls the store until the request is resolved, the deadline passes, or
-// the context is canceled. Only an explicit "approved" status admits; every
-// other terminal condition denies (fail-closed). An explicit reject carries the
-// human's note verbatim as the deny reason; timeout and cancel keep their
-// generic fail-closed reasons.
-func (r *hitlAskResolver) wait(ctx context.Context, requestID string) Decision {
-	deadline := time.Now().Add(r.timeout)
+// missingRowDenyAfter bounds how many consecutive absent-row reads the waiter
+// tolerates before failing closed: a pending row that vanished (session purge,
+// cascade delete) must become a Deny, not an unbounded spin.
+const missingRowDenyAfter = 3
+
+// wait polls the store until the request is resolved, the stored expiry passes,
+// or the context is canceled. ONE clock judges the hold: the row's ExpiresAt —
+// the same instant the store's resolve CAS enforces — so a resolution landing in
+// the final poll interval is honored (the deadline check re-reads the row once
+// before giving up). On timeout the waiter closes the row it abandons with a
+// terminal "timeout" write, so the persisted state and the decision the model
+// received cannot disagree. A store that reports the row absent (nil, nil — the
+// postgres contract) is retried briefly, then denied (fail-closed). Only an
+// explicit "approved" admits; an explicit reject carries the human's note
+// verbatim as the deny reason.
+func (r *hitlAskResolver) wait(ctx context.Context, requestID string, expiresAt time.Time) Decision {
+	deadline := expiresAt
+	if deadline.IsZero() {
+		deadline = time.Now().Add(r.timeout)
+	}
 	ticker := time.NewTicker(r.poll)
 	defer ticker.Stop()
 
+	missing := 0
 	for {
 		select {
 		case <-ctx.Done():
 			return Decision{Kind: Deny, Reason: "approval canceled before a response"}
 		case <-ticker.C:
-			if time.Now().After(deadline) {
-				return Decision{Kind: Deny, Reason: "approval timed out"}
-			}
 			hr, err := r.store.Get(ctx, requestID)
-			if err != nil {
-				continue // transient read; retry until the deadline
-			}
-			if hr.Status == "pending" {
+			if err == nil && hr == nil {
+				// Absent row (the postgres store's documented (nil, nil)):
+				// tolerate a brief race, then fail closed.
+				missing++
+				if missing >= missingRowDenyAfter {
+					return Decision{Kind: Deny, Reason: "approval request no longer exists"}
+				}
 				continue
 			}
-			if hr.Status == "approved" {
-				return Decision{Kind: Allow}
+			if err == nil {
+				missing = 0
+				if d, resolved := decisionFor(hr); resolved {
+					return d
+				}
 			}
-			if hr.Response != "" {
-				return Decision{Kind: Deny, Reason: hr.Response}
+			// err != nil is a transient read: fall through to the deadline
+			// check and otherwise retry.
+			if time.Now().After(deadline) {
+				return r.expire(ctx, requestID)
 			}
-			return Decision{Kind: Deny, Reason: fmt.Sprintf("approval %s", hr.Status)}
 		}
+	}
+}
+
+// expire is the waiter's give-up path: one final read (a resolution that landed
+// in the last poll interval still wins), then a terminal CAS "timeout" write on
+// the row it abandons, then the fail-closed Deny.
+func (r *hitlAskResolver) expire(ctx context.Context, requestID string) Decision {
+	if hr, err := r.store.Get(ctx, requestID); err == nil && hr != nil {
+		if d, resolved := decisionFor(hr); resolved {
+			return d
+		}
+	}
+	// Best-effort close; the CAS refuses if a response won the race, in which
+	// case the read above (or the next reader) sees the resolution.
+	_ = r.store.RespondToRequest(ctx, requestID, "timeout", "", "system:expiry", nil)
+	return Decision{Kind: Deny, Reason: "approval timed out"}
+}
+
+// decisionFor maps a read-back row to a terminal decision; resolved is false
+// while the row is still pending.
+func decisionFor(hr *HumanRequest) (Decision, bool) {
+	switch {
+	case hr.Status == "pending":
+		return Decision{}, false
+	case hr.Status == "approved":
+		return Decision{Kind: Allow}, true
+	case hr.Response != "":
+		return Decision{Kind: Deny, Reason: hr.Response}, true
+	default:
+		return Decision{Kind: Deny, Reason: fmt.Sprintf("approval %s", hr.Status)}, true
 	}
 }

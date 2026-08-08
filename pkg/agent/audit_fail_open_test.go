@@ -87,20 +87,22 @@ func TestAudit_FailOpen_WriteFailureLeavesDecisionUnchanged(t *testing.T) {
 		},
 	}
 
-	// A governed call: the executor stamps the admission decision onto the result
-	// metadata; the agent reads it into ToolExecution.AdmissionDecision.
+	// A governed call: a real audit binding produces the decision and the
+	// executor stamps it onto the result metadata ("admission.decision" is a
+	// reserved key — a tool-forged value would be stripped); the agent reads it
+	// into ToolExecution.AdmissionDecision.
 	auditedTool := &shuttle.MockTool{
 		MockName:        "audited_tool",
 		MockDescription: "a governed, audited tool",
 		MockBackend:     "test",
 		MockExecute: func(ctx context.Context, params map[string]interface{}) (*shuttle.Result, error) {
-			return &shuttle.Result{
-				Success:  true,
-				Data:     "ok",
-				Metadata: map[string]interface{}{"admission.decision": "allow"},
-			}, nil
+			return &shuttle.Result{Success: true, Data: "ok"}, nil
 		},
 	}
+	auditChain, err := shuttle.BuildChainFromConfig(shuttle.HooksConfig{Bindings: []shuttle.HookBinding{
+		{Kind: "audit", Scope: "audited_tool"},
+	}}, shuttle.ChainDeps{})
+	require.NoError(t, err)
 
 	// Working base store so sessions/messages persist; SaveToolExecution fails.
 	base, err := agent.NewSessionStore(filepath.Join(t.TempDir(), "s.db"), observability.NewNoOpTracer())
@@ -115,6 +117,7 @@ func TestAudit_FailOpen_WriteFailureLeavesDecisionUnchanged(t *testing.T) {
 	ag := builder.NewInstrumentedAgent(backend, llmProvider, tracer,
 		agent.WithConfig(cfg),
 		agent.WithMemory(agent.NewMemoryWithStore(sink)),
+		agent.WithAdmissionHooks(auditChain),
 	)
 	ag.RegisterTool(auditedTool)
 
