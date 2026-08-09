@@ -484,6 +484,88 @@ func TestAskResolver_ExpiryClampedToTurnDeadline(t *testing.T) {
 
 	require.False(t, hr.ExpiresAt.After(deadline),
 		"the stored expiry must not outlive the turn deadline (window derived at hold time, not at build)")
+	require.GreaterOrEqual(t, deadline.Sub(hr.ExpiresAt), askDeadlineMargin,
+		"the margin is load-bearing: the fail-closed deny must travel back BEFORE the turn dies, so the expiry sits at least the margin inside the deadline")
 	require.True(t, hr.ExpiresAt.After(time.Now().Add(-time.Second)),
 		"the clamped window is still a real window")
+}
+
+// A turn too short to hold a call stores an already-dead window and denies at
+// the first poll — the clamp has NO floor, because a floor pushing the expiry
+// past the deadline would re-open the row-outlives-its-waiter gap.
+func TestAskResolver_TooShortTurnDeniesInsteadOfOutliving(t *testing.T) {
+	store := NewInMemoryHumanRequestStore()
+	r := NewHITLAskResolver(store, time.Hour, 20*time.Millisecond, nil)
+
+	deadline := time.Now().Add(1 * time.Second)
+	ctx, cancel := context.WithDeadline(context.Background(), deadline)
+	defer cancel()
+
+	d := r.Resolve(AdmissionRequest{
+		Ctx: ctx, ToolName: "execute_sql", SessionID: "s1",
+		Params: map[string]interface{}{"stmt": "DROP TABLE t"},
+	}, Decision{Kind: Ask, Reason: "gated"})
+
+	require.Equal(t, Deny, d.Kind)
+	rows, err := store.ListBySession(context.Background(), "s1")
+	require.NoError(t, err)
+	require.Len(t, rows, 1)
+	require.False(t, rows[0].ExpiresAt.After(deadline),
+		"the floored branch must never store an expiry past the turn's own death")
+	require.Equal(t, "timeout", rows[0].Status, "the abandoned row is terminally closed")
+}
+
+// ctxRecordingStore captures the context each terminal close arrives on, so
+// the abandon write's two context properties are pinned: the caller's VALUES
+// travel with it (the postgres store's tenant identity lives there) and the
+// caller's CANCELLATION does not (the write must land after the turn died).
+type ctxRecordingStore struct {
+	*InMemoryHumanRequestStore
+	mu          sync.Mutex
+	expireValue any
+	expireLive  bool
+}
+
+type ctxPinKey struct{}
+
+func (s *ctxRecordingStore) ExpireRequest(ctx context.Context, id, by string) error {
+	s.mu.Lock()
+	s.expireValue = ctx.Value(ctxPinKey{})
+	s.expireLive = ctx.Err() == nil
+	s.mu.Unlock()
+	return s.InMemoryHumanRequestStore.ExpireRequest(ctx, id, by)
+}
+
+func TestAskResolver_AbandonContextKeepsValuesDropsCancellation(t *testing.T) {
+	store := &ctxRecordingStore{InMemoryHumanRequestStore: NewInMemoryHumanRequestStore()}
+	r := NewHITLAskResolver(store, time.Hour, 10*time.Millisecond, nil)
+
+	parent := context.WithValue(context.Background(), ctxPinKey{}, "tenant-42")
+	ctx, cancel := context.WithCancel(parent)
+
+	done := make(chan Decision, 1)
+	go func() {
+		done <- r.Resolve(AdmissionRequest{
+			Ctx: ctx, ToolName: "execute_sql", SessionID: "s1",
+			Params: map[string]interface{}{"stmt": "DROP TABLE t"},
+		}, Decision{Kind: Ask, Reason: "gated"})
+	}()
+	require.Eventually(t, func() bool {
+		pending, err := store.ListPending(context.Background())
+		return err == nil && len(pending) == 1
+	}, 5*time.Second, 5*time.Millisecond)
+	cancel()
+	<-done
+
+	require.Eventually(t, func() bool {
+		store.mu.Lock()
+		defer store.mu.Unlock()
+		return store.expireValue != nil
+	}, 5*time.Second, 5*time.Millisecond, "the abandon close must be attempted")
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	require.Equal(t, "tenant-42", store.expireValue,
+		"the caller's values must travel with the detached write — on postgres the tenant identity lives there, and losing it makes the close match zero rows silently")
+	require.True(t, store.expireLive,
+		"the detached write must not carry the caller's cancellation — a canceled context would refuse the write the close exists to make")
 }

@@ -3479,6 +3479,14 @@ func (a *Agent) AdoptApprovedSet(s shuttle.ApprovedSetAccessor) {
 // ClearAllSessions removes all sessions from memory.
 // Used by the benchmark server to free memory between scenarios.
 func (a *Agent) ClearAllSessions() {
+	// Every retirement path frees the sessions' approved-set buckets — the
+	// set's growth is bounded by live sessions only if this sibling of
+	// DeleteSession retires them too.
+	if as := a.executor.ApprovedSet(); as != nil {
+		for _, s := range a.memory.ListSessions() {
+			as.ForgetSession(s.ID)
+		}
+	}
 	a.memory.ClearAll()
 	a.mu.Lock()
 	a.sessionToolLedger = make(map[string]map[string]bool)

@@ -116,10 +116,14 @@ func TestContactHumanTool_Execute_Timeout(t *testing.T) {
 	assert.Contains(t, result.Error.Message, "did not respond")
 	assert.True(t, result.Error.Retryable)
 
-	// Verify request was stored
-	pending, err := store.ListPending(ctx)
+	// The request was stored, and the give-up exit closed it terminally: an
+	// unanswered question must never sit answerable for a call that already
+	// returned.
+	rows, err := store.ListBySession(ctx, "")
 	require.NoError(t, err)
-	assert.Len(t, pending, 1)
+	require.Len(t, rows, 1)
+	assert.Equal(t, "timeout", rows[0].Status)
+	assert.Equal(t, "system:expiry", rows[0].RespondedBy)
 }
 
 func TestContactHumanTool_Execute_WithResponse(t *testing.T) {
@@ -660,7 +664,7 @@ func TestContactHuman_TimeoutCeilingAtTurnDeadline(t *testing.T) {
 		PollInterval: 5 * time.Millisecond,
 	})
 
-	deadline := time.Now().Add(6 * time.Second)
+	deadline := time.Now().Add(30 * time.Second)
 	ctx, cancel := context.WithDeadline(context.Background(), deadline)
 	defer cancel()
 
@@ -682,8 +686,8 @@ func TestContactHuman_TimeoutCeilingAtTurnDeadline(t *testing.T) {
 	}, 5*time.Second, 5*time.Millisecond)
 	cancel()
 
-	require.False(t, hr.ExpiresAt.After(deadline.Add(time.Second)),
-		"a model-chosen window must be ceilinged at the turn deadline")
+	require.False(t, hr.ExpiresAt.After(deadline),
+		"a model-chosen window must be ceilinged AT the turn deadline — not near it")
 }
 
 // questionAbsentStore reports every row absent, postgres-style.
@@ -726,11 +730,15 @@ func TestContactHuman_KindStampOverridesModelValue(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	pending, err := store.ListPending(context.Background())
+	// The unanswered question is terminally closed on the give-up exit, so the
+	// row is read back by session, not from the pending set.
+	rows, err := store.ListBySession(context.Background(), "")
 	require.NoError(t, err)
-	require.Len(t, pending, 1)
-	assert.Equal(t, "question", pending[0].Context["kind"],
+	require.Len(t, rows, 1)
+	assert.Equal(t, "timeout", rows[0].Status,
+		"an unanswered question's give-up exit closes its row terminally")
+	assert.Equal(t, "question", rows[0].Context["kind"],
 		"the harness stamps the origin discriminator over any model-supplied value")
-	assert.Equal(t, "model-authored", pending[0].Context["note"],
+	assert.Equal(t, "model-authored", rows[0].Context["note"],
 		"the rest of the model's context payload survives")
 }

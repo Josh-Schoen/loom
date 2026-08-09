@@ -102,14 +102,14 @@ func TestSelfDescribe_ContactHuman_StampsQuestionKindAndSummary(t *testing.T) {
 				"request_type": requestType,
 			})
 			require.NoError(t, err)
-			require.NotNil(t, result.Error, "no responder → the wait times out and the request stays pending")
+			require.NotNil(t, result.Error, "no responder → the wait times out and the row is terminally closed")
 			assert.Equal(t, "TIMEOUT", result.Error.Code)
 
-			// The stored (still-pending) request self-describes as a question.
-			pending, err := store.ListPending(ctx)
+			// The stored (now terminally closed) request self-describes as a question.
+			rows, err := store.ListBySession(ctx, "")
 			require.NoError(t, err)
-			require.Len(t, pending, 1)
-			hr := pending[0]
+			require.Len(t, rows, 1)
+			hr := rows[0]
 			assert.Equal(t, "question", hr.Kind, "contact_human stamps Kind=question regardless of request_type")
 			assert.Equal(t, question, hr.Summary, "the question text is the summary")
 			assert.Equal(t, requestType, hr.RequestType, "request_type is carried through unchanged")

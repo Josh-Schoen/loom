@@ -157,14 +157,14 @@ func (r *hitlAskResolver) Resolve(req AdmissionRequest, d Decision) Decision {
 	// the only instant both clocks are known. A row whose expiry outlived its
 	// turn stayed flippable after the call it guarded was denied; deriving the
 	// window earlier (at agent build) re-creates that gap because the hold is
-	// raised arbitrarily later than the build.
+	// raised arbitrarily later than the build. There is deliberately NO floor:
+	// a floor pushing the expiry past the deadline would re-open the gap the
+	// clamp closes, and a turn too short to hold a call denies at the first
+	// poll instead of inventing a window nobody can use.
 	expiresAt := now.Add(r.timeout)
 	if dl, ok := ctx.Deadline(); ok {
 		if capped := dl.Add(-askDeadlineMargin); capped.Before(expiresAt) {
 			expiresAt = capped
-		}
-		if floor := now.Add(askMinWindow); expiresAt.Before(floor) {
-			expiresAt = floor
 		}
 	}
 	hr := &HumanRequest{
@@ -219,10 +219,6 @@ const missingRowDenyAfter = 3
 // hold's expiry, leaving room for the deny to travel back before the turn dies.
 const askDeadlineMargin = 2 * time.Second
 
-// askMinWindow floors a deadline-clamped hold window so a hold raised at the
-// very end of a turn still stores a resolvable row rather than one born expired.
-const askMinWindow = 5 * time.Second
-
 // abandonWriteTimeout bounds the detached terminal write issued for a row the
 // waiter abandons on context cancellation.
 const abandonWriteTimeout = 5 * time.Second
@@ -231,11 +227,12 @@ const abandonWriteTimeout = 5 * time.Second
 // or the context is canceled. ONE clock judges the hold: the row's ExpiresAt —
 // the same instant the store's resolve CAS enforces — so a resolution landing in
 // the final poll interval is honored (the deadline check re-reads the row once
-// before giving up). EVERY abandoning exit closes the row it leaves behind with
+// before giving up). Every abandoning exit closes the row it LEAVES BEHIND with
 // a terminal "timeout" write — the timeout path via expire, the cancellation
 // path via a short detached write — so a row can never stay approvable after
 // its waiter is gone and the persisted state and the decision the model
-// received cannot disagree. A store that reports the row absent (nil, nil — the
+// received cannot disagree. (The absent-row deny has nothing to close: a row
+// that reads back missing cannot be written either.) A store that reports the row absent (nil, nil — the
 // postgres contract) is retried briefly, then denied (fail-closed). Only an
 // explicit "approved" admits; an explicit reject carries the human's note
 // verbatim as the deny reason.
@@ -252,8 +249,13 @@ func (r *hitlAskResolver) wait(ctx context.Context, requestID string, expiresAt 
 		select {
 		case <-ctx.Done():
 			// A canceled turn abandons the row: close it so it cannot be
-			// approved later against a call that was already denied.
-			r.abandon(ctx, requestID)
+			// approved later against a call that was already denied. A
+			// resolution that landed before the close wins — the persisted
+			// state and the returned decision must agree (the same law
+			// expire follows).
+			if d, resolved := r.abandon(ctx, requestID); resolved {
+				return d
+			}
 			return Decision{Kind: Deny, Reason: "approval canceled before a response"}
 		case <-ticker.C:
 			hr, err := r.store.Get(ctx, requestID)
@@ -302,15 +304,21 @@ func (r *hitlAskResolver) expire(ctx context.Context, requestID string) Decision
 	return Decision{Kind: Deny, Reason: "approval timed out"}
 }
 
-// abandon closes the row a canceled turn leaves behind. The write cannot ride
-// the canceled context, so it runs on a short context detached from the
-// caller's cancellation while keeping its values — the tenant identity the
-// postgres store requires travels with it. Best-effort: if a resolution won
-// the race the CAS refuses and the resolved state stands.
-func (r *hitlAskResolver) abandon(ctx context.Context, requestID string) {
+// abandon closes the row a canceled turn leaves behind, then re-reads it and
+// reports any resolution that won the race — the close is a CAS that refuses
+// a decided row, and the caller must return the persisted decision, never an
+// assumed Deny over a recorded approval (the same verifying shape expire
+// has). The write cannot ride the canceled context, so it runs on a short
+// context detached from the caller's cancellation while keeping its values —
+// the tenant identity the postgres store requires travels with it.
+func (r *hitlAskResolver) abandon(ctx context.Context, requestID string) (Decision, bool) {
 	wctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), abandonWriteTimeout)
 	defer cancel()
 	_ = r.store.ExpireRequest(wctx, requestID, "system:cancel")
+	if hr, err := r.store.Get(wctx, requestID); err == nil && hr != nil && hr.Status != "timeout" {
+		return decisionFor(hr)
+	}
+	return Decision{}, false
 }
 
 // decisionFor maps a read-back row to a terminal decision; resolved is false

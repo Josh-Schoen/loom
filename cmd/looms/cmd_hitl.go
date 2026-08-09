@@ -89,6 +89,23 @@ Examples:
 	Run:  runHitlShow,
 }
 
+var hitlExpireCmd = &cobra.Command{
+	Use:   "expire [request-id]",
+	Short: "Terminally close a stranded pending request as timed out",
+	Long: `Close a pending request as "timeout" regardless of its expiry.
+
+This is the operator's retirement route for a stranded hold — one whose
+waiter died with its turn or process and that no response can ever reach.
+A request that is already decided is left untouched (closing is not
+resolving).
+
+Examples:
+  # Retire a stranded request
+  looms hitl expire req-abc123`,
+	Args: cobra.ExactArgs(1),
+	Run:  runHitlExpire,
+}
+
 var hitlRespondCmd = &cobra.Command{
 	Use:   "respond [request-id]",
 	Short: "Respond to a HITL request",
@@ -131,13 +148,14 @@ func init() {
 	hitlCmd.AddCommand(hitlListCmd)
 	hitlCmd.AddCommand(hitlShowCmd)
 	hitlCmd.AddCommand(hitlRespondCmd)
+	hitlCmd.AddCommand(hitlExpireCmd)
 
 	defaultHITLDB := filepath.Join(loomconfig.GetLoomDataDir(), "hitl.db")
 
 	// Every subcommand opens the SAME store the server writes: the configured
 	// storage backend on postgres, the node-local hitl.db on SQLite. --db is a
 	// SQLite-only override; --user selects the tenant on postgres.
-	for _, c := range []*cobra.Command{hitlListCmd, hitlShowCmd, hitlRespondCmd} {
+	for _, c := range []*cobra.Command{hitlListCmd, hitlShowCmd, hitlRespondCmd, hitlExpireCmd} {
 		c.Flags().StringVar(&hitlCLIDBPath, "db", defaultHITLDB, "Path to HITL SQLite database (SQLite backend only)")
 		c.Flags().StringVar(&hitlUser, "user", "", "Tenant user ID whose requests to operate on (required on the postgres backend)")
 	}
@@ -381,6 +399,63 @@ func runHitlShow(cmd *cobra.Command, args []string) {
 			}
 		}
 	}
+}
+
+func runHitlExpire(cmd *cobra.Command, args []string) {
+	requestID := args[0]
+	ctx := context.Background()
+
+	tracer := createTracerFromConfig()
+	ctx, span := tracer.StartSpan(ctx, "cli.hitl.expire")
+	defer tracer.EndSpan(span)
+	span.SetAttribute("request_id", requestID)
+
+	store, closeStore, ctx, err := openHITLStore(ctx, tracer)
+	if err != nil {
+		span.RecordError(err)
+		span.SetAttribute("success", false)
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+	defer closeStore()
+
+	operator := os.Getenv("USER")
+	if operator == "" {
+		operator = "operator"
+	}
+	if err := store.ExpireRequest(ctx, requestID, "operator:"+operator); err != nil {
+		span.RecordError(err)
+		span.SetAttribute("success", false)
+		fmt.Fprintf(os.Stderr, "Error expiring request: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Success is judged by the row's STATE, deliberately unlike respond's
+	// judged-by-whose-write: retirement is idempotent — a row already closed
+	// by the sweep or a previous invocation is the desired end state, and
+	// "Closed by" prints the row's true closing actor either way.
+	after, err := store.Get(ctx, requestID)
+	if err != nil || after == nil {
+		span.SetAttribute("success", false)
+		if err == nil {
+			err = fmt.Errorf("request not found: %s", requestID)
+		}
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+	if after.Status != "timeout" {
+		span.SetAttribute("success", false)
+		fmt.Fprintf(os.Stderr, "✗ Request NOT expired — it is %q", after.Status)
+		if after.RespondedBy != "" {
+			fmt.Fprintf(os.Stderr, " (responded by %s)", after.RespondedBy)
+		}
+		fmt.Fprintln(os.Stderr)
+		os.Exit(1)
+	}
+	span.SetAttribute("success", true)
+	fmt.Printf("✓ Request expired\n")
+	fmt.Printf("  Request ID: %s\n", after.ID)
+	fmt.Printf("  Closed by:  %s\n", after.RespondedBy)
 }
 
 func runHitlRespond(cmd *cobra.Command, args []string) {

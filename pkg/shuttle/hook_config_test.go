@@ -102,3 +102,16 @@ func TestHooksConfig_PlainUnmarshal_IsStrict(t *testing.T) {
 	err = json.Unmarshal([]byte(`{"bindings":[{"kind":"ask","scope":"x","bogus":"y"}]}`), &cfg)
 	require.Error(t, err)
 }
+
+// The duplicate-key refusal is what makes the hooks/bindings alias safe: two
+// spellings of one field in a document must be refused, never resolved by map
+// iteration order into a policy that governs half of what was written.
+func TestHooksConfig_DuplicateSpellings_Refused(t *testing.T) {
+	// Both list keys at the top level.
+	_, err := ParseHooksConfig([]byte(`{"bindings":[{"kind":"ask","scope":"a"}],"hooks":[]}`))
+	require.Error(t, err, "bindings and hooks are one field — a document carrying both must be refused")
+
+	// One binding field spelled two ways.
+	_, err = ParseHooksConfig([]byte(`{"bindings":[{"kind":"ask","scope":"a","state_key":"x","StateKey":"y"}]}`))
+	require.Error(t, err, "two spellings of one binding field must be refused, not last-wins resolved")
+}

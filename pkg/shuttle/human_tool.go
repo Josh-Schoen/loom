@@ -190,7 +190,7 @@ func (t *ContactHumanTool) InputSchema() *JSONSchema {
 				map[string]*JSONSchema{},
 				[]string{},
 			),
-			"timeout_seconds": NewNumberSchema("Maximum time to wait for human response in seconds (default: 300 = 5 minutes)").
+			"timeout_seconds": NewNumberSchema("How long to wait for a human response, in seconds (default: 300 = 5 minutes). Capped at the host's configured maximum and at the remaining turn time — a larger value is silently reduced.").
 				WithDefault(300),
 		},
 		[]string{"question"},
@@ -263,12 +263,18 @@ func (t *ContactHumanTool) Execute(ctx context.Context, params map[string]interf
 		timeoutSeconds = minTimeoutSeconds
 	}
 	timeout := time.Duration(timeoutSeconds) * time.Second
+	// Two ceilings, both the harness's, neither the model's: the CONFIGURED
+	// timeout is the maximum window the host allows (so a worker-driven turn
+	// with no deadline still cannot hold a row for a model-chosen day), and
+	// the turn deadline caps it further when one exists. No re-floor after
+	// the deadline ceiling — a floor pushing past the deadline would store a
+	// row outliving its waiter.
+	if timeout > t.timeout {
+		timeout = t.timeout
+	}
 	if dl, ok := ctx.Deadline(); ok {
 		if remaining := time.Until(dl); remaining < timeout {
 			timeout = remaining
-			if timeout < minTimeoutSeconds*time.Second {
-				timeout = minTimeoutSeconds * time.Second
-			}
 		}
 	}
 	span.SetAttribute("hitl.timeout_seconds", int32(timeout.Seconds()))
@@ -284,8 +290,15 @@ func (t *ContactHumanTool) Execute(ctx context.Context, params map[string]interf
 		span.SetAttribute("agent_id", agentID)
 	}
 
-	// Create human request
+	// Create human request. The stored expiry is clamped AT the deadline
+	// itself: the duration was ceilinged an instant earlier, and stamping
+	// now+duration from a later clock would overshoot the deadline by the gap
+	// — the exact row-outlives-its-turn sliver the ceiling exists to remove.
 	now := t.now()
+	expiresAt := now.Add(timeout)
+	if dl, ok := ctx.Deadline(); ok && expiresAt.After(dl) {
+		expiresAt = dl
+	}
 	req := &HumanRequest{
 		ID:          uuid.New().String(),
 		AgentID:     agentID,
@@ -298,7 +311,7 @@ func (t *ContactHumanTool) Execute(ctx context.Context, params map[string]interf
 		Summary:     question,
 		Timeout:     timeout,
 		CreatedAt:   now,
-		ExpiresAt:   now.Add(timeout),
+		ExpiresAt:   expiresAt,
 		Status:      "pending",
 	}
 
@@ -419,7 +432,12 @@ func (t *ContactHumanTool) Backend() string {
 	return "" // Backend-agnostic
 }
 
-// waitForResponse polls the store until a response is received or timeout occurs.
+// waitForResponse polls the store until a response is received or timeout
+// occurs. BOTH give-up exits terminally close the row they abandon — the same
+// law the ask waiter follows — so an unanswered or canceled question can
+// never sit answerable for a call that already returned; a response that won
+// the race against the close is returned as a response, never misreported as
+// a timeout the row contradicts.
 func (t *ContactHumanTool) waitForResponse(ctx context.Context, requestID string, timeout time.Duration) (*HumanRequest, bool) {
 	deadline := t.now().Add(timeout)
 	ticker := time.NewTicker(t.pollInterval)
@@ -428,10 +446,23 @@ func (t *ContactHumanTool) waitForResponse(ctx context.Context, requestID string
 	for {
 		select {
 		case <-ctx.Done():
+			// A deadline-clamped wait dies at the same instant as its context,
+			// and this arm usually wins that race — label the close by which
+			// clock actually ran out so the recorded actor is truthful.
+			by := "system:cancel"
+			if t.now().After(deadline) {
+				by = "system:expiry"
+			}
+			if won := t.closeAbandoned(ctx, requestID, by); won != nil {
+				return won, false
+			}
 			return nil, true // Context canceled
 		case <-ticker.C:
 			// Check if we've exceeded the deadline
 			if t.now().After(deadline) {
+				if won := t.closeAbandoned(ctx, requestID, "system:expiry"); won != nil {
+					return won, false
+				}
 				return nil, true // Timed out
 			}
 
@@ -450,6 +481,23 @@ func (t *ContactHumanTool) waitForResponse(ctx context.Context, requestID string
 			}
 		}
 	}
+}
+
+// closeAbandoned terminally closes a question row the waiter is giving up on,
+// then re-reads it: a resolution that won the race is returned so the caller
+// reports the response instead of a timeout the durable row contradicts. The
+// write runs detached from the (possibly canceled) caller context while
+// keeping its values, so the tenant identity the postgres store requires
+// travels with it.
+func (t *ContactHumanTool) closeAbandoned(ctx context.Context, requestID, by string) *HumanRequest {
+	wctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	_ = t.store.ExpireRequest(wctx, requestID, by)
+	if req, err := t.store.Get(wctx, requestID); err == nil && req != nil &&
+		req.Status != "pending" && req.Status != "timeout" {
+		return req
+	}
+	return nil
 }
 
 // extractFromContext extracts a value from the context (if it exists).

@@ -112,12 +112,12 @@ func TestParams_ContactHuman_StoresNoParams(t *testing.T) {
 				"context":      map[string]interface{}{"table": "users"},
 			})
 			require.NoError(t, err)
-			require.NotNil(t, result.Error, "no responder → the wait times out and the request stays pending")
+			require.NotNil(t, result.Error, "no responder → the wait times out and the row is terminally closed")
 
-			pending, err := store.ListPending(ctx)
+			rows, err := store.ListBySession(ctx, "")
 			require.NoError(t, err)
-			require.Len(t, pending, 1)
-			hr := pending[0]
+			require.Len(t, rows, 1)
+			hr := rows[0]
 
 			assert.Empty(t, hr.Params, "a question carries no held-call params")
 			assert.False(t, hr.ParamsTruncated, "nothing was cut because nothing was carried")
