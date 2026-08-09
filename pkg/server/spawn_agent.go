@@ -202,6 +202,7 @@ func (s *MultiAgentServer) SpawnSubAgent(ctx context.Context, req *builtin.Spawn
 		cancelFunc:         cancel,
 		loopCancelFunc:     loopCancel,
 		autoDespawnTimeout: autoDespawnTimeout,
+		runCtx:             loopCtx,
 	}
 
 	s.spawnedAgentsMu.Lock()

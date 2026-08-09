@@ -79,3 +79,33 @@ func TestOpenHITLStore_PostgresRequiresUser(t *testing.T) {
 		"postgres operations are tenant-scoped: the CLI must refuse to open the store with no --user rather than silently seeing nothing")
 	require.Contains(t, err.Error(), "--user")
 }
+
+// The expire command is the operator's retirement route: it closes a stranded
+// pending row terminally and never overwrites a decision. Driven through the
+// real command body over a real SQLite store.
+func TestRunHitlExpire_RetiresStrandedRow(t *testing.T) {
+	origConfig, origPath := config, hitlCLIDBPath
+	t.Cleanup(func() { config, hitlCLIDBPath = origConfig, origPath })
+	config = nil
+	hitlCLIDBPath = filepath.Join(t.TempDir(), "hitl.db")
+
+	// Seed a stranded row: pending, expired, waiter long gone.
+	store, err := shuttle.NewSQLiteHumanRequestStore(shuttle.SQLiteConfig{Path: hitlCLIDBPath})
+	require.NoError(t, err)
+	require.NoError(t, store.Store(context.Background(), &shuttle.HumanRequest{
+		ID: "stranded-1", AgentID: "a", SessionID: "s", Question: "q",
+		RequestType: "approval", Priority: "normal", Status: "pending",
+		Kind: "approval", CreatedAt: time.Now().Add(-time.Hour), ExpiresAt: time.Now().Add(-30 * time.Minute),
+	}))
+	require.NoError(t, store.Close())
+
+	runHitlExpire(hitlExpireCmd, []string{"stranded-1"})
+
+	after, err := shuttle.NewSQLiteHumanRequestStore(shuttle.SQLiteConfig{Path: hitlCLIDBPath})
+	require.NoError(t, err)
+	defer func() { _ = after.Close() }()
+	got, err := after.Get(context.Background(), "stranded-1")
+	require.NoError(t, err)
+	require.Equal(t, "timeout", got.Status, "the stranded row is terminally retired")
+	require.Contains(t, got.RespondedBy, "operator:", "the closing actor is the operator")
+}

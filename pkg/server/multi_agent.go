@@ -182,6 +182,11 @@ type spawnedAgentContext struct {
 	cancelFunc         context.CancelFunc // Cancel function for session cleanup
 	loopCancelFunc     context.CancelFunc // Cancel function for background loop
 	autoDespawnTimeout time.Duration      // Inactivity timeout before auto-despawn
+	// runCtx is the context the spawn's background work runs on: detached
+	// from the spawning request's cancellation, carrying its tenant identity
+	// — the property that lets a held tool call on a spawned agent reach the
+	// tenant-scoped postgres HITL store.
+	runCtx context.Context
 }
 
 // NewMultiAgentServer creates a new multi-agent LoomService server.
