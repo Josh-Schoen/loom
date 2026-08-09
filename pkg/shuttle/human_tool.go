@@ -190,7 +190,7 @@ func (t *ContactHumanTool) InputSchema() *JSONSchema {
 				map[string]*JSONSchema{},
 				[]string{},
 			),
-			"timeout_seconds": NewNumberSchema("How long to wait for a human response, in seconds (default: 300 = 5 minutes). Capped at the host's configured maximum and at the remaining turn time — a larger value is silently reduced.").
+			"timeout_seconds": NewNumberSchema("Maximum time to wait for human response in seconds (default: 300 = 5 minutes)").
 				WithDefault(300),
 		},
 		[]string{"question"},
