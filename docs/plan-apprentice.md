@@ -22,9 +22,14 @@ Two things are missing:
 2. **Suggestion from observation** — opt-in, passive: notice that a procedure recurs across
    sessions, agents, and people, and offer to take it over.
 
-The second is the more valuable half. Repetition is the evidence that a procedure is worth
-automating, and it is also the evidence that makes generalization tractable — one run tells
-you what happened, three runs tell you which parts were incidental.
+Repetition is the evidence that makes generalization tractable — one run tells you what
+happened, three runs tell you which parts were incidental. That argues for the second mode.
+
+**Measured yield argues the other way at small scale.** Spike finding 6 puts a real corpus at
+roughly six distinct deputizable procedures per 284 sessions, with 43% of those sessions making
+no tool calls at all. Observe mode has to pan all of that to find six; watch mode has a human
+pointing at one. So **build watch mode first and treat observe mode as the org-scale play** — it
+becomes the more valuable half only once the corpus is too large for a human to be the filter.
 
 ---
 
@@ -387,6 +392,42 @@ Five findings, all evidence-backed, several of which changed the plan above.
    nine-branch parallel workflow. That is wrong: they are nine independent queries one agent runs
    in a turn. Fan-out must mean *multiple agents or genuine orchestration need*, not merely
    independent steps.
+
+6. **Yield is low, and that reframes the whole feature.** Of 284 sessions: 121 (43%) made **zero**
+   tool calls, 76 more made 1–4, and only 35 (12%) made ≥15 — the plausible floor for holding a
+   procedure worth capturing. Hand-reviewing the 22 richest sessions produced roughly **six
+   distinct deputizable procedures**. Extrapolated, a corpus this size yields something like 5–10
+   candidates total. That is genuinely useful — each is a skill nobody had to author — but it is
+   a trickle, not a stream.
+
+7. **Therefore watch mode beats observe mode at single-user scale**, reversing an earlier claim in
+   this document. Observe mode has to pan 250 sessions of nothing to find six procedures. Watch
+   mode has a human pre-selecting a procedure worth capturing, which skips the 88% of traces that
+   contain nothing. Observe mode only pays off at **org scale**, which is a concrete argument —
+   with a number behind it — for the loom-knowledge tier in P5, and a reason to keep P4 after
+   P1.5 rather than racing to it.
+
+8. **The largest category in the corpus is meta-work that should not be deputized.** Eight of the
+   22 richest sessions are weaver-authoring runs ("create an agent that…", "create a revenue
+   analytics workflow"). Distilling those yields candidates duplicating what `weaver-from-scratch`
+   already does. The apprentice needs an explicit guard against proposing skills for using loom
+   itself, or its first suggestions will all be noise.
+
+9. **Recurrence detection is the crux, not a detail — and both naive approaches fail.** Two
+   apparent recurrence pairs in the corpus demonstrate opposite failure modes:
+
+   - *Same procedure, different sequences.* Two sessions diagnosed "my agent isn't showing up in
+     the agent list" (`sess_816fdb94`, `sess_4c5c7080`). Same intent, same tool vocabulary
+     (`agent_management`, `shell_execute`, `query_tool_result`), but materially different orders.
+     Sequence-alignment matching gives a **false negative** here.
+   - *Same intent text, unrelated procedures.* Two sessions targeted schema discovery on the same
+     database (`sess_ad16b72c`, `a4b4c677`). One issued nine catalog queries; the other was a
+     multi-agent coordination run of `send_message` and `workspace` writes. Intent-similarity
+     matching gives a **false positive** here.
+
+   So the procedure fingerprint (risk 8) needs tool multiset *and* object-level structure — which
+   tools acted on which objects with which parameters — not sequence alignment and not intent
+   text. This is where observe mode lives or dies.
 
 **From building P0:**
 
