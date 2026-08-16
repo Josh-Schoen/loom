@@ -239,7 +239,7 @@ recurrence scoring. That is phase 5 and it is blocked on Loom integration landin
 
 | Phase | Repo | Contents |
 |---|---|---|
-| **P0** | loom | Round-trip oracle. Offline distiller over a completed task board → `SkillTaskTemplate`. CLI only, no server. |
+| **P0** ✅ | loom | Round-trip oracle. Offline distiller over a completed task board → `SkillTaskTemplate`. `pkg/apprentice`, no proto/server/TUI, no LLM. |
 | **P1** | loom | `apprentice.proto` trace/candidate model + `ApprenticeService`, `apprentice` meta-agent, SKILL + WORKFLOW emission, validation gate, every candidate `PROPOSED` with low confidence. |
 | **P1.5** | loom | TUI: watch command, candidate review dialog, progress rendering, parameter clarification. Complete loop with no cloud dependency — this is where the UX is settled. |
 | **P2** | tera-backend | Multi-tenant wrapper over loom's `ApprenticeService`, `apprentice_candidates` (RLS), consent gate, redaction, `Deputize` wired to existing create paths. |
@@ -282,12 +282,39 @@ shipped skill with authored TaskTemplate
 
 Assertions are structural and need no LLM: step count, step order, dependency edges, parameter
 positions. Drive it table-driven over **every shipped skill that has an authored
-`TaskTemplate`**, so the corpus grows for free as skills land.
+`TaskTemplate`**, so the corpus grows for free as skills land. Today that is
+`weaver-presets`, `weaver-templates`, and `weaver-from-scratch` under `embedded/skills/`.
 
 This is not a one-off proof for P0 — it stays in CI permanently as the cheapest signal that a
 distiller change broke fidelity.
 
+A second property matters just as much for deputizing: **re-emission must be a fixpoint.**
+Emitting a recovered template has to reproduce the same board, so
+`distill(emit(distill(emit(T))))` stops changing. A template that drifted on every generation
+would corrupt the skill a little more each time it ran.
+
 Exit criteria for P0: clean round trip on ≥3 authored skills plus one hand-scored real session.
+
+### What P0 already surfaced (implemented — ✅ `pkg/apprentice`)
+
+Two findings came out of building it, both worth recording because they shape later phases:
+
+1. **Authored step order survives only where step indices do.** With the emitter's
+   `SkillIdempotencyKey` present, recovery is exact. Without it — the real-work case — order can
+   only be inferred from the dependency DAG, and that is genuinely ambiguous wherever the graph
+   fans out. Two of the three shipped templates fan out (`weaver-templates` steps 4 and 5 both
+   depend on 3; `weaver-from-scratch` steps 1 and 2 both depend on 0), so a board simply holds no
+   record of which branch ran first. The distiller therefore reports unconstrained ordering as a
+   warning rather than presenting a guess as evidence, and the oracle asserts *a valid*
+   topological order in that mode instead of the authored one. Anything downstream that needs
+   true ordering must get it from a richer trace source, not the board.
+
+2. **`SkillTaskTemplate.RootTitle` is documented but not implemented.** Its comment says it
+   "names the parent task created to group emitted children", but `emitTemplate` never creates
+   that parent and never sets `ParentID`. All three shipped templates set `root_title` and all
+   three lose it on a round trip. `TestRoundTrip_UnrecoverableTemplateFields` pins the gap so it
+   reads as known rather than as a distiller bug; if the emitter gains root-task support that
+   test will fail and the distiller should learn to recover it.
 
 ### Tier 3 — The LLM step
 
