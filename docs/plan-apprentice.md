@@ -103,33 +103,95 @@ therefore run before the PR is opened, not in the destination repo.**
 
 ---
 
+## Prior art
+
+This is not a new idea. It is a 50-year-old research field called **programming by
+demonstration** (PBD), and the canonical text is literally titled *Watch What I Do: Programming
+by Demonstration* (Cypher et al., MIT Press 1993). The lineage runs Pygmalion (1975) → macro
+recorders → Eager (1991) → CoScripter/Vegemite → RPA (UiPath, Blue Prism) → LLM agents. **None
+of it achieved broad adoption**, and Lau's retrospective is blunt that the barrier was usability
+rather than algorithmic capability.
+
+Every documented failure falls into two buckets:
+
+1. **Generalizing from one example.** Turning a demonstration into a program requires inferring
+   intent, and automatic generalization routinely gets it wrong. The literature's mitigations are
+   multi-shot demonstration or hand-configuration. Eager waited for **two complete iterations**
+   (three for trivial patterns) before offering to automate anything — it inferred from
+   *repetition*, not from a single demo.
+2. **Brittleness of the capture substrate.** GUI, DOM, and pixel-level capture breaks whenever
+   the interface changes. This killed CoScripter and Vegemite, is the standing critique of RPA,
+   and remains a stated limitation of ALLOY (2025), which is confined to web environments.
+
+**Where the apprentice differs, and it is the whole bet:** it captures at the *semantic* layer —
+tool calls with structured inputs, task objectives, dependency edges — not pixels or DOM. Tool
+schemas are versioned contracts; GUIs are not. That sidesteps bucket 2 entirely, which is the
+bucket that killed most of the lineage. On bucket 1, the plan already independently landed on
+Eager's answer: require recurrence (N≥2) before proposing in observe mode. Loom also holds a
+*persistent* trace corpus, so it can see "repetitions spread out over time" — something Eager
+explicitly could not, having only a session history.
+
+**Concurrent competition.** xAI shipped **Grok Bot** on 11 Aug 2026: demonstrate a task once via
+screen recording, it stores and replays the sequence, refines from user corrections, and each bot
+gets its own cloud computer. It is the same product idea sitting squarely in bucket 2 — GUI-level
+capture, cross-app. That is a fair validation that the problem is worth solving, and a reason to
+be explicit that our differentiator is substrate, not concept.
+
+**What we do not escape.** Three limitations recur from Eager (1991) through ALLOY (2025) and
+should be treated as boundaries rather than bugs:
+
+- **No conditionals, loops, or error recovery.** Both systems model a demonstration as a single
+  linear example. Anything richer needs authoring, not capture.
+- **Granularity is an open empirical question.** ALLOY reports task-level abstraction misses
+  procedural constraints users consider essential, while action-level overfits to the interface.
+  We sit on the task-level side, so we inherit the former risk.
+- **Capture records *how*, not *why*.** ALLOY names this explicitly. Loom is better placed here
+  than any predecessor — the first user message carries intent, and `Task.objective` /
+  `acceptance_criteria` carry rationale when boards are on — but it is not solved for free.
+
+Two design details worth borrowing outright:
+
+- **Split abstraction from instantiation** (ALLOY's Identifier and Filter agents), rather than
+  generalizing in one pass.
+- **Do not build a live step display.** Only 2 of ALLOY's 12 participants noticed the workflow
+  updating during their demonstration; nearly everyone reviewed afterwards. This independently
+  confirms deprioritizing the TUI live step list in favour of the review dialog.
+
+---
+
 ## Architecture
 
-### Trace: task board as the spine
+### Trace: tool calls and messages are the spine
 
-Do not reconstruct procedures from raw spans. The task board already carries ordering,
-dependencies, hierarchy, outcomes, and an `approach` field describing how each step was done.
-Use it as the spine and fill in detail from `tool_executions` and spans.
-
-The board only contains what an agent chose to track, so the fill-in pass is not optional:
-ad-hoc tool calls with no owning task must still appear as steps, marked as untracked.
+> **Revised after the P1a spike.** This section originally made the task board the spine. Real
+> data says otherwise: a local corpus of 284 sessions held 4,651 messages and 2,047 tool
+> executions and **zero** tasks or boards, because `TaskBoardConfig` defaults to
+> `Enabled: false` ([`pkg/agent/registry.go:785`](../pkg/agent/registry.go:785)). The board is
+> excellent structure when it exists, but it cannot be the spine of a feature that has to work
+> on the traces people actually produce.
 
 ```
-task board (spine: order, deps, objective, approach, outcome)
-  + tool_executions / spans (detail: actual tool, actual input, duration, error)
-  + messages (intent: what the user asked for, what they corrected)
+tool_executions + messages (spine: what was attempted, in what order, with what intent)
+  + task board, when enabled (enrichment: objective, acceptance criteria, dependency edges)
+  + spans (detail: timing, nesting, errors)
       │
       ▼
-  normalized Trace  ──►  segment  ──►  generalize  ──►  emit  ──►  validate  ──►  candidate
+  normalized Trace ─► segment ─► abstract ─► instantiate ─► emit ─► validate ─► candidate
 ```
 
-- **segment** — trace → one or more episodes with a clear goal, dropping retries, dead ends,
-  and clarification exchanges. Deterministic where possible; LLM only for boundary judgment.
-- **generalize** — the hard part. Turn concrete literals (this table, this date range, this
-  file path) into typed parameters. Quality of the whole feature lives here.
+- **segment** — trace → one or more episodes with a clear goal. Drop genuine noise: repeated
+  identical searches, status-file churn, environment probing. **Do not drop failed steps** — a
+  tool call's *input* is the evidence of intent, independent of its outcome. See finding 4.
+- **abstract** — replace task-specific literals (this database, this date range, this path) with
+  named placeholders, preserving structure.
+- **instantiate** — bind placeholders to typed parameters with defaults and descriptions.
 - **emit** — produce a candidate of the appropriate kind (below).
 - **validate** — hygiene audit, `ValidateSkill`, and for workflows a dry-run parse. Nothing
   reaches a user unvalidated.
+
+Abstraction is split from instantiation deliberately, mirroring ALLOY's Identifier/Filter
+separation. Generalization is the step that has sunk this idea repeatedly, and doing it in one
+shot from a single example is the documented failure mode — see [Prior art](#prior-art).
 
 ### Candidate kinds and the decision rule
 
@@ -240,7 +302,8 @@ recurrence scoring. That is phase 5 and it is blocked on Loom integration landin
 | Phase | Repo | Contents |
 |---|---|---|
 | **P0** ✅ | loom | Round-trip oracle. Offline distiller over a completed task board → `SkillTaskTemplate`. `pkg/apprentice`, no proto/server/TUI, no LLM. |
-| **P1** | loom | `apprentice.proto` trace/candidate model + `ApprenticeService`, `apprentice` meta-agent, SKILL + WORKFLOW emission, validation gate, every candidate `PROPOSED` with low confidence. |
+| **P1a** ✅ | loom | Prior-art review and a read-only spike over a real session corpus, before committing to P1. Produced findings 3–5 and reversed the trace-substrate decision. |
+| **P1** | loom | `apprentice.proto` trace/candidate model + `ApprenticeService`, `apprentice` meta-agent, trace assembly from `tool_executions` + `messages`, abstract/instantiate split, SKILL + WORKFLOW emission, sanitization pass, validation gate. Every candidate `PROPOSED` with low confidence. |
 | **P1.5** | loom | TUI: watch command, candidate review dialog, progress rendering, parameter clarification. Complete loop with no cloud dependency — this is where the UX is settled. |
 | **P2** | tera-backend | Multi-tenant wrapper over loom's `ApprenticeService`, `apprentice_candidates` (RLS), consent gate, redaction, `Deputize` wired to existing create paths. |
 | **P3** | up-tera | Web watch affordance, live step list, candidate review/edit, inheriting P1.5's interaction design. |
@@ -295,9 +358,37 @@ would corrupt the skill a little more each time it ran.
 
 Exit criteria for P0: clean round trip on ≥3 authored skills plus one hand-scored real session.
 
-### What P0 already surfaced (implemented — ✅ `pkg/apprentice`)
+### What P0 and the P1a spike found
 
-Two findings came out of building it, both worth recording because they shape later phases:
+Five findings, all evidence-backed, several of which changed the plan above.
+
+**From the P1a spike over a real 284-session corpus:**
+
+3. **The task board is not the trace spine, because in practice it is empty.** 284 sessions,
+   4,651 messages, 2,047 tool executions, and zero tasks or boards —
+   `TaskBoardConfig{Enabled: false}` is the default
+   ([`pkg/agent/registry.go:785`](../pkg/agent/registry.go:785)). Enabling boards is a config
+   change, but no deployment that hasn't made it produces board-based traces, so
+   `tool_executions` + `messages` must be the substrate and the board an enrichment.
+
+4. **The best procedure in the corpus is in a trace where every one of its steps failed** — and
+   the plan's original segmenter spec would have deleted it. One session asked for complete schema
+   metadata for a Teradata database and issued nine well-formed catalog queries (database
+   metadata, tables, row counts, columns, primary keys, foreign keys, indexes, table constraints,
+   column constraints). All nine failed for a purely environmental reason: the MCP client was
+   unavailable, then the circuit breaker opened. The remaining ~29 steps were genuine flailing —
+   repeated identical searches, status-file writes, probing for `bteq` / `isql` / `teradatasql`.
+   So the signal was 100% failed and the noise was mostly successful. **Intent lives in tool call
+   inputs, not outcomes.** Any "only distill successful sessions" filter — the obvious first
+   heuristic — throws away the single most valuable candidate available.
+
+5. **The kind-decision rule needs tightening.** Those nine catalog queries are mutually
+   independent, and the rule as written ("fan-out → workflow") therefore classifies them as a
+   nine-branch parallel workflow. That is wrong: they are nine independent queries one agent runs
+   in a turn. Fan-out must mean *multiple agents or genuine orchestration need*, not merely
+   independent steps.
+
+**From building P0:**
 
 1. **Authored step order survives only where step indices do.** With the emitter's
    `SkillIdempotencyKey` present, recovery is exact. Without it — the real-work case — order can
