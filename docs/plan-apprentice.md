@@ -1,6 +1,6 @@
 # Apprentice: Turning Observed Work into Reusable Automation
 
-**Status**: 📋 Planned — nothing in this document is implemented yet.
+**Status**: ⚠️ Partial — P0 (`pkg/apprentice`) and the P1a spike are implemented; P1 onward is planned.
 **Scope**: `loom` (engine) + `avmo-tera-cloud/tera-backend` (tenancy, consent, promotion) + `up-tera` (capture and review UI).
 **Working name**: apprentice. Prior working name "track task" is rejected — see [Naming](#naming).
 
@@ -55,7 +55,7 @@ artifact types through the same restricted write path
 
 | Name | Why not |
 |---|---|
-| **track task** | Collides with three existing things that are all different from this: `pkg/task`, cloud's `cloud_tasks`, and up-tera's `features/tasks`. The task board is this feature's *input*, not its subject — the collision would actively mislead. |
+| **track task** | Collides with three existing things that are all different from this: `pkg/task`, cloud's `cloud_tasks`, and up-tera's `features/tasks`. The task board is not even this feature's subject — it is something the apprentice *produces*. The collision would actively mislead. |
 | **draft** | Correct in the weaving sense (a draft is the written notation for reproducing a woven structure), but already taken in the same domain with a different meaning: `draft_skill_name` / `draft_skill_content` on sessions (`proto/loomcloud/v1/session.proto:197`) and `AdminDraftSkillCache` mean "an unsaved skill under test in an admin session." Also one character from `pkg/drift`. |
 | **shadow** | 15 existing hits across the two repos, and the wrong tone for a feature whose adoption depends on people consenting to be recorded. |
 | **duet** | Implies real-time collaboration. This is capture-then-reuse; the timing is wrong. Also a live product name elsewhere. |
@@ -79,7 +79,7 @@ recurrence scoring; everything the distiller consumes and everything it produces
 | **Skill → tasks**, the exact inverse of this feature | [`pkg/skills/tasks/emitter.go`](../pkg/skills/tasks/emitter.go) | Materializes `SkillTaskTemplate.Steps` onto the board; falls back to `task.Decomposer` |
 | Task model rich enough to hold a captured step | [`proto/loom/v1/task.proto:234`](../proto/loom/v1/task.proto:234) | `objective`, `approach`, `acceptance_criteria`, `notes`, `estimated_effort`, `parent_id`, typed `TaskDependency` DAG |
 | Task provenance back to the emitting skill | [`pkg/skills/tasks/emitter.go`](../pkg/skills/tasks/emitter.go) | `skill:<name>\|sess:<sessionID>\|step:<index>` |
-| Board-honesty enforcement | [`pkg/skills/hygiene/doc.go`](../pkg/skills/hygiene/doc.go) | Catches orphan `IN_PROGRESS` / unstarted tasks before a turn returns — a reason the board is trustworthy as a trace |
+| Board-honesty enforcement | [`pkg/skills/hygiene/doc.go`](../pkg/skills/hygiene/doc.go) | Catches orphan `IN_PROGRESS` / unstarted tasks before a turn returns. Its existence is evidence agents do not maintain boards unprompted — see [Tasks are an output](#tasks-are-an-output-not-an-input) |
 | Workflow YAML + executors | [`pkg/orchestration/workflow_config.go`](../pkg/orchestration/workflow_config.go), [`workflow_examples/patterns/`](../workflow_examples/patterns) | Pipeline, parallel, fork-join, hierarchical |
 | Skill auto-activation triggers | `SkillTrigger` in [`pkg/skills/types.go`](../pkg/skills/types.go) | `keywords`, `intent_categories`, `mode`, `min_confidence` — TRIGGER candidates need no new machinery here |
 | Workflow scheduling | [`proto/loom/v1/loom.proto:366`](../proto/loom/v1/loom.proto:366) | `ScheduleWorkflow`, `UpdateScheduledWorkflow`, `TriggerScheduledWorkflow` |
@@ -165,6 +165,55 @@ Two design details worth borrowing outright:
 ---
 
 ## Architecture
+
+### Capture channels: three sources, one trace
+
+The feature needs three kinds of evidence, and only one of them exists in usable form today.
+
+| Channel | What it records | Status |
+|---|---|---|
+| **Agent tool calls** (`tool_executions`) | What an agent did, with structured inputs | ✅ Exists, 2,047 rows in a real corpus. Recorded automatically as a side effect of acting. |
+| **Human UI actions** (first-party semantic events) | What a person did directly, without going through an agent | ⚠️ Pipe exists, unused. `trackEvent(name, metadata)` in up-tera's `src/lib/pendo.ts`; exactly one call site emits anything (`session.create`). |
+| **Step intent** (task `objective` / `acceptance_criteria`) | *Why* a step existed | ⚠️ Model exists, never populated. See below. |
+
+**The apprentice as originally scoped could only watch agents, not humans.** The founding ask was
+"watch what the user is doing", but a person clicking through Tera Cloud produces zero tool
+calls — which is also why 43% of the corpus has none. Those sessions are people talking, not
+people working through an agent. Closing that hole means emitting first-party UI events, and the
+distinction in *how* is the whole bet:
+
+- **First-party semantic events** — up-tera emitting "ran query", "opened notebook", "created
+  workspace" against a schema we own. As stable as tool calls, for the same reason: it is a
+  versioned contract, not a scrape. **This is the right channel**, and the pipe is already there.
+- **Generic DOM or pixel observation** of arbitrary third-party pages — bucket 2 brittleness,
+  where Grok Bot lives. Last, not first, and only for work outside our own surfaces.
+
+Consequence for sequencing: first-party UI events were originally parked in P5. They belong in
+**P1's trace model as a second event source**, even if up-tera only emits a handful at first.
+Retrofitting an event source into a normalized trace format later is exactly what forces a
+rewrite.
+
+### Tasks are an output, not an input
+
+> **Third revision of the substrate decision.** First the board was the spine; then it was
+> enrichment; it is now a *product* of distillation.
+
+The board is empty for a deeper reason than its default flag. **Maintaining it is extra work an
+agent must choose to do**, whereas tool calls are recorded automatically as a byproduct of
+acting. That asymmetry is why `pkg/skills/hygiene` exists at all — an auditor and enforcer whose
+entire job is compensating for agents that do not keep the board honest. Nothing in `pkg/task` or
+`pkg/skills` reads `tool_executions`, so there is no retrospective derivation anywhere;
+`auto_decompose` decomposes a *goal* up front, it does not reconstruct what happened.
+
+Compare Claude Code's background tasks, which do get created: a task appears because the agent
+noticed out-of-scope work *while doing something else*. Byproduct, not discipline. Same data
+model, opposite creation dynamics.
+
+So the apprentice must not depend on tasks existing. It **synthesizes** step structure from tool
+calls and UI events; where a board happens to exist, it is used to validate and enrich. This also
+inverts the argument for enabling boards by default: the reason is not that the apprentice needs
+them as input, it is that the apprentice can finally *fill* them — auto-populated from actions
+rather than hand-maintained, which is the first version of that feature anyone would keep using.
 
 ### Trace: tool calls and messages are the spine
 
@@ -311,9 +360,9 @@ recurrence scoring. That is phase 5 and it is blocked on Loom integration landin
 | **P1** | loom | `apprentice.proto` trace/candidate model + `ApprenticeService`, `apprentice` meta-agent, trace assembly from `tool_executions` + `messages`, abstract/instantiate split, SKILL + WORKFLOW emission, sanitization pass, validation gate. Every candidate `PROPOSED` with low confidence. |
 | **P1.5** | loom | TUI: watch command, candidate review dialog, progress rendering, parameter clarification. Complete loop with no cloud dependency — this is where the UX is settled. |
 | **P2** | tera-backend | Multi-tenant wrapper over loom's `ApprenticeService`, `apprentice_candidates` (RLS), consent gate, redaction, `Deputize` wired to existing create paths. |
-| **P3** | up-tera | Web watch affordance, live step list, candidate review/edit, inheriting P1.5's interaction design. |
+| **P3** | up-tera | Web watch affordance, candidate review/edit, inheriting P1.5's interaction design. Emit first-party `trackEvent` activity events so human-only work is capturable at all. |
 | **P4** | both | Observe mode: batch recurrence mining over stored traces; suggestion inbox; AGENT and TRIGGER candidates. |
-| **P5** | loom-knowledge, up-tera | Org-scale recurrence via `ContextService`; non-chat activity events as an additional trace source. |
+| **P5** | loom-knowledge | Org-scale recurrence via `ContextService`. |
 
 Watch mode ships before observe mode, but the trace model must be designed for both from P1 —
 observe mode is only a different event source and a recurrence pass over the same structures.
