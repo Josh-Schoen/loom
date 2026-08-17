@@ -1,605 +1,316 @@
 # Apprentice: Turning Observed Work into Reusable Automation
 
-**Status**: ⚠️ Partial — P0 (`pkg/apprentice`) and the P1a spike are implemented; P1 onward is planned.
-**Scope**: `loom` (engine) + `avmo-tera-cloud/tera-backend` (tenancy, consent, promotion) + `up-tera` (capture and review UI).
+**Status**: ⚠️ Partial — the P0 distiller (`pkg/apprentice`) and a research spike are implemented.
+v1 is specified below and not built.
+**Scope**: `loom` only. Everything touching `avmo-tera-cloud` or `up-tera` is deferred — see
+[Deferred](#deferred-with-reasons).
 **Working name**: apprentice. Prior working name "track task" is rejected — see [Naming](#naming).
 
 ---
 
 ## Problem
 
-A user (or an agent) works through a multi-step procedure — profile a table, fix the skew,
-re-run the load, check the row counts. It works. Nothing captures it. The next person
-re-derives it from scratch, and so does the same person next month.
+A user works through a multi-step procedure — profile a table, fix the skew, re-run the load,
+check the row counts. It works. Nothing captures it. The next person re-derives it from scratch,
+and so does the same person next month.
 
-Loom can already *author* automation from intent: the weaver turns "build me a research
-workflow" into `workflows/research.yaml`. What it cannot do is author from **evidence** —
-take work that actually happened and turn it into something reusable.
+Loom can already *author* automation from intent: the weaver turns "build me a research workflow"
+into `workflows/research.yaml`. What it cannot do is author from **evidence** — take work that
+actually happened and turn it into something reusable.
 
-Two things are missing:
+That division is why this belongs in loom: **the weaver authors from intent; the apprentice
+authors from evidence.** Both emit the same artifact types through the same restricted write path
+([`pkg/shuttle/builtin/agent_management.go:188`](../pkg/shuttle/builtin/agent_management.go:188)).
 
-1. **Capture on request** — "watch what I'm doing here and make it reusable."
-2. **Suggestion from observation** — opt-in, passive: notice that a procedure recurs across
-   sessions, agents, and people, and offer to take it over.
+---
 
-Repetition is the evidence that makes generalization tractable — one run tells you what
-happened, three runs tell you which parts were incidental. That argues for the second mode.
+## v1: one command
 
-**Measured yield argues the other way at small scale.** Spike finding 6 puts a real corpus at
-roughly six distinct deputizable procedures per 284 sessions, with 43% of those sessions making
-no tool calls at all. Observe mode has to pan all of that to find six; watch mode has a human
-pointing at one. So **build watch mode first and treat observe mode as the org-scale play** — it
-becomes the more valuable half only once the corpus is too large for a human to be the filter.
+```
+loom apprentice watch
+```
+
+At the end of a session: read that session's `tool_executions` and `messages`, abstract the
+concrete literals into named parameters, emit **one candidate skill YAML**, and show it in the TUI
+for review. The user edits it, names it, and deputizes it — or discards it.
+
+That is the whole of v1. Explicitly **not** in it: observe mode, recurrence detection, AGENT and
+TRIGGER candidates, workflow candidates, UI-event capture, multi-tenancy, derived task boards.
+Each is deferred with a reason below.
+
+The scope is this small on purpose. Fifty years of prior art says general demonstration systems
+fail and narrow ones ship — see [Prior art](#prior-art). An earlier draft of this document had
+three capture channels, four candidate kinds, two modes, and work in three repositories. That was
+scope accretion, not design.
+
+### v1 exit criterion
+
+Point it at ten real sessions and count how many candidates **someone other than the author**
+would deputize. Measured yield in the corpus surveyed was roughly six worthwhile procedures per
+284 sessions (constraint 6), so the bar is modest — but the judge has to be a human other than the
+tool's author, or the number means nothing.
 
 ---
 
 ## Naming
 
-The feature is **apprentice**; the thing it emits is a **candidate**; the act of accepting one
-is **deputizing** it.
+The feature is **apprentice**; the thing it emits is a **candidate**; the act of accepting one is
+**deputizing** it.
 
 | Term | Meaning |
 |---|---|
 | **apprentice** | The meta-agent that watches and proposes. Sits alongside `weaver` and `guide`. |
-| **candidate** | A proposed artifact — a skill, workflow, agent, or trigger — with provenance and a confidence score. Not yet active. |
-| **deputize** | Accepting a candidate: it is written through the existing create paths and becomes live. |
-| **watch mode** | Explicit, scoped capture the user starts and stops. |
-| **observe mode** | Opt-in passive mining of stored traces for recurring procedures. |
-
-The division against the weaver is the reason this belongs in loom:
-**the weaver authors from intent; the apprentice authors from evidence.** Both emit the same
-artifact types through the same restricted write path
-([`pkg/shuttle/builtin/agent_management.go:188`](../pkg/shuttle/builtin/agent_management.go:188)).
+| **candidate** | A proposed skill, with provenance and a confidence score. Not yet active. |
+| **deputize** | Accepting a candidate: it is written through the existing create path and becomes live. |
 
 ### Names rejected, with reasons
 
 | Name | Why not |
 |---|---|
-| **track task** | Collides with three existing things that are all different from this: `pkg/task`, cloud's `cloud_tasks`, and up-tera's `features/tasks`. The task board is not even this feature's subject — it is something the apprentice *produces*. The collision would actively mislead. |
-| **draft** | Correct in the weaving sense (a draft is the written notation for reproducing a woven structure), but already taken in the same domain with a different meaning: `draft_skill_name` / `draft_skill_content` on sessions (`proto/loomcloud/v1/session.proto:197`) and `AdminDraftSkillCache` mean "an unsaved skill under test in an admin session." Also one character from `pkg/drift`. |
+| **track task** | Collides with `pkg/task`, cloud's `cloud_tasks`, and up-tera's `features/tasks`, all of which are different from this. The task board is not even this feature's subject — see constraint 2. |
+| **draft** | Correct in the weaving sense, but already taken in the same domain: `draft_skill_name` / `draft_skill_content` (`proto/loomcloud/v1/session.proto:197`) and `AdminDraftSkillCache` mean "an unsaved skill under test in an admin session". Also one character from `pkg/drift`. |
 | **shadow** | 15 existing hits across the two repos, and the wrong tone for a feature whose adoption depends on people consenting to be recorded. |
 | **duet** | Implies real-time collaboration. This is capture-then-reuse; the timing is wrong. Also a live product name elsewhere. |
-| **deputy** | Names the end state rather than the mechanism, and reads oddly for the watching half. Retained as the *verb* for promotion, which is exactly what it describes. |
+| **deputy** | Names the end state rather than the mechanism. Retained as the *verb*, which is exactly what it describes. |
 
 `apprentice`, `candidate`, and `deputize` have zero hits across `loom` and `tera-backend`.
 
 ---
 
-## What already exists (verified — reuse, do not rebuild)
-
-This feature is mostly assembly. The novel code is segmentation, generalization, and
-recurrence scoring; everything the distiller consumes and everything it produces already exists.
-
-### loom
-
-| Capability | Where | Note |
-|---|---|---|
-| Skill type with machine-authorship fields | [`pkg/skills/types.go`](../pkg/skills/types.go) | `Confidence`, `Status`, `LastValidatedMs`, `RiskLevel` are already on `Skill` |
-| Skill/agent/workflow write path, restricted to meta-agents | [`pkg/shuttle/builtin/agent_management_skill.go`](../pkg/shuttle/builtin/agent_management_skill.go), [`agent_management.go:188`](../pkg/shuttle/builtin/agent_management.go:188) | Gate currently allows `weaver` and `guide`; `apprentice` must be added |
-| **Skill → tasks**, the exact inverse of this feature | [`pkg/skills/tasks/emitter.go`](../pkg/skills/tasks/emitter.go) | Materializes `SkillTaskTemplate.Steps` onto the board; falls back to `task.Decomposer` |
-| Task model rich enough to hold a captured step | [`proto/loom/v1/task.proto:234`](../proto/loom/v1/task.proto:234) | `objective`, `approach`, `acceptance_criteria`, `notes`, `estimated_effort`, `parent_id`, typed `TaskDependency` DAG |
-| Task provenance back to the emitting skill | [`pkg/skills/tasks/emitter.go`](../pkg/skills/tasks/emitter.go) | `skill:<name>\|sess:<sessionID>\|step:<index>` |
-| Board-honesty enforcement | [`pkg/skills/hygiene/doc.go`](../pkg/skills/hygiene/doc.go) | Catches orphan `IN_PROGRESS` / unstarted tasks before a turn returns. Its existence is evidence agents do not maintain boards unprompted — see [Tasks are an output](#tasks-are-an-output-not-an-input) |
-| Workflow YAML + executors | [`pkg/orchestration/workflow_config.go`](../pkg/orchestration/workflow_config.go), [`workflow_examples/patterns/`](../workflow_examples/patterns) | Pipeline, parallel, fork-join, hierarchical |
-| Skill auto-activation triggers | `SkillTrigger` in [`pkg/skills/types.go`](../pkg/skills/types.go) | `keywords`, `intent_categories`, `mode`, `min_confidence` — TRIGGER candidates need no new machinery here |
-| Workflow scheduling | [`proto/loom/v1/loom.proto:366`](../proto/loom/v1/loom.proto:366) | `ScheduleWorkflow`, `UpdateScheduledWorkflow`, `TriggerScheduledWorkflow` |
-| Validation | [`pkg/skills/hygiene/`](../pkg/skills/hygiene), `pkg/evals` | |
-| Raw step detail | `tool_executions` in [`pkg/storage/postgres/migrations/000001_initial_schema.up.sql`](../pkg/storage/postgres/migrations/000001_initial_schema.up.sql), spans in [`pkg/observability/types.go:74`](../pkg/observability/types.go:74) | |
-
-`pkg/skills/importer/` is **not** reusable as a distiller — it converts Anthropic-style
-`SKILL.md` directories into loom YAML and is explicitly non-LLM and purely transformational.
-Its `render` and `classify` stages are reusable for emitting the final YAML.
-
-### avmo-tera-cloud / tera-backend
-
-| Capability | Where |
-|---|---|
-| Git-backed marketplace: contribute → PR → sync → install | `proto/loomcloud/v1/skill.proto`, `pkg/gitskills/`, `docs/HLD_skill_marketplace.md` |
-| Per-tenant contributable org repos | `skill_org_repos`; config at `loom-cloud.example.yaml:245` |
-| Skill validation service | `pkg/skillvalidation/`, `ValidateSkill` RPC |
-| Workflow CRUD + scheduling | `proto/loomcloud/v1/workflow.proto` — `CreateWorkflow`, `SetWorkflowSchedule` |
-| Session export, message history | `ExportSession`, `session_messages` |
-| Cross-agent activity | `workflow_tool_activity`, `trace_spans` |
-
-The curated skills repo `Teradata-PE/aai-tera-agentic-skills` already runs
-`skill-validation.yml` plus single- and multi-turn skill evals in CI. Contributions, however,
-target *org* repos — arbitrary per-tenant GitHub slugs with no guaranteed CI. **Validation must
-therefore run before the PR is opened, not in the destination repo.**
-
----
-
 ## Prior art
 
-This is not a new idea. It is a 50-year-old research field called **programming by
-demonstration** (PBD), and the canonical text is literally titled *Watch What I Do: Programming
-by Demonstration* (Cypher et al., MIT Press 1993). The lineage runs Pygmalion (1975) → macro
-recorders → Eager (1991) → CoScripter/Vegemite → RPA (UiPath, Blue Prism) → LLM agents. **None
-of it achieved broad adoption**, and Lau's retrospective is blunt that the barrier was usability
-rather than algorithmic capability.
+This is a 50-year-old research field called **programming by demonstration**, and the canonical
+text is literally titled *Watch What I Do: Programming by Demonstration* (Cypher et al., MIT Press
+1993). The lineage runs Pygmalion (1975) → macro recorders → Eager (1991) → CoScripter/Vegemite →
+RPA (UiPath, Blue Prism) → LLM agents. **None of the general systems achieved broad adoption**, and
+Lau's retrospective is blunt that the barrier was usability rather than algorithmic capability. The
+things that did ship were narrow: the spreadsheet macro recorder, Selenium IDE, Playwright codegen.
 
 Every documented failure falls into two buckets:
 
 1. **Generalizing from one example.** Turning a demonstration into a program requires inferring
    intent, and automatic generalization routinely gets it wrong. The literature's mitigations are
    multi-shot demonstration or hand-configuration. Eager waited for **two complete iterations**
-   (three for trivial patterns) before offering to automate anything — it inferred from
-   *repetition*, not from a single demo.
-2. **Brittleness of the capture substrate.** GUI, DOM, and pixel-level capture breaks whenever
-   the interface changes. This killed CoScripter and Vegemite, is the standing critique of RPA,
-   and remains a stated limitation of ALLOY (2025), which is confined to web environments.
+   (three for trivial patterns) before offering anything — it inferred from *repetition*, not from a
+   single demo.
+2. **Brittleness of the capture substrate.** GUI, DOM, and pixel capture breaks whenever the
+   interface changes. This killed CoScripter and Vegemite, is the standing critique of RPA, and
+   remains a stated limitation of ALLOY (2025), which is confined to web environments.
 
 **Where the apprentice differs, and it is the whole bet:** it captures at the *semantic* layer —
-tool calls with structured inputs, task objectives, dependency edges — not pixels or DOM. Tool
-schemas are versioned contracts; GUIs are not. That sidesteps bucket 2 entirely, which is the
-bucket that killed most of the lineage. On bucket 1, the plan already independently landed on
-Eager's answer: require recurrence (N≥2) before proposing in observe mode. Loom also holds a
-*persistent* trace corpus, so it can see "repetitions spread out over time" — something Eager
-explicitly could not, having only a session history.
+tool calls with structured inputs — not pixels or DOM. Tool schemas are versioned contracts; GUIs
+are not. That sidesteps bucket 2, the bucket that killed most of the lineage.
+
+v1 does **not** escape bucket 1: it generalizes from a single session, which is the documented
+failure mode. That is a deliberate, stated risk. The mitigation is not an algorithm but a human —
+every candidate is reviewed and edited before it can be deputized, and nothing is ever
+auto-published. Repetition-based inference is the right long-term answer, and it is deferred.
 
 **Concurrent competition.** xAI shipped **Grok Bot** on 11 Aug 2026: demonstrate a task once via
-screen recording, it stores and replays the sequence, refines from user corrections, and each bot
-gets its own cloud computer. It is the same product idea sitting squarely in bucket 2 — GUI-level
-capture, cross-app. That is a fair validation that the problem is worth solving, and a reason to
-be explicit that our differentiator is substrate, not concept.
+screen recording, it stores and replays the sequence, refines from corrections, and each bot gets
+its own cloud computer. Same product idea, squarely in bucket 2. Fair validation that the problem
+is worth solving, and a reason to be explicit that our differentiator is substrate, not concept.
 
-**What we do not escape.** Three limitations recur from Eager (1991) through ALLOY (2025) and
-should be treated as boundaries rather than bugs:
+**What nobody escapes.** Three limitations recur from Eager (1991) through ALLOY (2025) and should
+be treated as boundaries rather than bugs: no conditionals, loops, or error recovery from a single
+linear demonstration; granularity is an open empirical question (task-level misses procedural
+constraints, action-level overfits to the interface); and capture records *how*, not *why*.
 
-- **No conditionals, loops, or error recovery.** Both systems model a demonstration as a single
-  linear example. Anything richer needs authoring, not capture.
-- **Granularity is an open empirical question.** ALLOY reports task-level abstraction misses
-  procedural constraints users consider essential, while action-level overfits to the interface.
-  We sit on the task-level side, so we inherit the former risk.
-- **Capture records *how*, not *why*.** ALLOY names this explicitly. Loom is better placed here
-  than any predecessor — the first user message carries intent, and `Task.objective` /
-  `acceptance_criteria` carry rationale when boards are on — but it is not solved for free.
+Two design details borrowed outright:
 
-Two design details worth borrowing outright:
-
-- **Split abstraction from instantiation** (ALLOY's Identifier and Filter agents), rather than
+- **Split abstraction from instantiation** (ALLOY's Identifier and Filter agents) rather than
   generalizing in one pass.
 - **Do not build a live step display.** Only 2 of ALLOY's 12 participants noticed the workflow
-  updating during their demonstration; nearly everyone reviewed afterwards. This independently
-  confirms deprioritizing the TUI live step list in favour of the review dialog.
+  updating during their demonstration; nearly everyone reviewed afterwards.
 
 ---
 
-## Architecture
+## Constraints from evidence
 
-### Capture channels: three sources, one trace
+These came out of building P0 and running a read-only spike over a real 284-session corpus. They
+are not features — they are guardrails, and each prevents a specific wrong turn. They cost days to
+learn and they outlive any particular scope.
 
-The feature needs three kinds of evidence, and only one of them exists in usable form today.
+1. **Authored step order survives only where step indices do.** With the emitter's
+   `SkillIdempotencyKey` present, recovery is exact. Without it, order can only be inferred from a
+   dependency graph, and that is genuinely ambiguous wherever the graph fans out — two of the three
+   shipped templates fan out. Anything needing true ordering must get it from a richer trace
+   source. `Distill` reports unconstrained ordering as a warning rather than presenting a guess as
+   evidence.
 
-| Channel | What it records | Status |
+2. **Tasks are an output, not an input.** The board is empty in practice for a deeper reason than
+   its default flag: maintaining it is extra work an agent must choose to do, while tool calls are
+   recorded automatically as a byproduct of acting. `pkg/skills/hygiene` exists precisely to
+   compensate for agents that do not keep it honest. Nothing in `pkg/task` or `pkg/skills` reads
+   `tool_executions`, and `auto_decompose` decomposes a *goal* up front rather than reconstructing
+   what happened. Compare Claude Code's background tasks, which do get created because they are a
+   byproduct of noticing out-of-scope work — same data model, opposite creation dynamics. So the
+   apprentice must never depend on tasks existing.
+
+3. **`tool_executions` + `messages` is the only substrate that reliably exists.** A local corpus of
+   284 sessions held 4,651 messages and 2,047 tool executions and **zero** tasks or boards, because
+   `TaskBoardConfig` defaults to `Enabled: false`
+   ([`pkg/agent/registry.go:785`](../pkg/agent/registry.go:785)).
+
+4. **Do not drop failed steps.** The best procedure in the corpus is in a trace where all nine of
+   its steps failed. One session asked for complete schema metadata on a Teradata database and
+   issued nine well-formed catalog queries — database metadata, tables, row counts, columns,
+   primary keys, foreign keys, indexes, table constraints, column constraints. All nine failed for
+   a purely environmental reason (MCP client unavailable, then the circuit breaker opened) while
+   the surrounding ~29 steps of genuine flailing mostly succeeded. **Intent lives in tool call
+   inputs, not outcomes.** Any "only distill successful sessions" filter throws away the single most
+   valuable candidate available.
+
+5. **Fan-out means multiple agents, not merely independent steps.** Those nine catalog queries are
+   mutually independent, so a naive "fan-out → workflow" rule classifies them as a nine-branch
+   parallel workflow. They are nine queries one agent runs in a turn.
+
+6. **Yield is a trickle, not a stream.** Of 284 sessions: 121 (43%) made zero tool calls, 76 more
+   made 1–4, and only 35 (12%) made ≥15 — the plausible floor for holding a procedure worth
+   capturing. Hand-reviewing the 22 richest produced roughly **six distinct deputizable
+   procedures**. Useful, since each is a skill nobody had to author, but small.
+
+7. **Watch mode beats observe mode at single-user scale.** Observe mode has to pan 250 near-empty
+   sessions to find six procedures; watch mode has a human pointing at one. Observe mode only pays
+   off at org scale.
+
+8. **The largest category in the corpus is meta-work that must not be deputized.** Eight of the 22
+   richest sessions are weaver-authoring runs ("create an agent that…"). Distilling those yields
+   candidates duplicating `weaver-from-scratch`. The apprentice needs an explicit guard against
+   proposing skills for using loom itself, or its first suggestions will all be noise.
+
+9. **Recurrence detection is the crux, and both naive approaches fail.** Two sessions diagnosing
+   the same "agent not showing up in the list" problem share intent and tool vocabulary but differ
+   in order — sequence alignment **false-negatives**. Two sessions naming the same database for
+   schema discovery ran completely unrelated procedures, one issuing catalog queries and the other
+   coordinating agents via `send_message` — intent-text similarity **false-positives**. A
+   fingerprint needs tool multiset *and* object-level structure. This is why observe mode is
+   deferred rather than merely descoped.
+
+10. **`SkillTaskTemplate.RootTitle` is documented but not implemented.** Its comment says it "names
+    the parent task created to group emitted children", but `emitTemplate` never creates that
+    parent or sets `ParentID`. All three shipped templates set `root_title` and all three lose it on
+    a round trip. `TestRoundTrip_UnrecoverableTemplateFields` pins the gap.
+
+---
+
+## What already exists (verified — reuse, do not rebuild)
+
+v1 is mostly assembly. The novel code is the trace reader and the abstract/instantiate pass.
+
+| Capability | Where | Note |
 |---|---|---|
-| **Agent tool calls** (`tool_executions`) | What an agent did, with structured inputs | ✅ Exists, 2,047 rows in a real corpus. Recorded automatically as a side effect of acting. |
-| **Human UI actions** (first-party semantic events) | What a person did directly, without going through an agent | ⚠️ Pipe exists, unused. `trackEvent(name, metadata)` in up-tera's `src/lib/pendo.ts`; exactly one call site emits anything (`session.create`). |
-| **Step intent** (task `objective` / `acceptance_criteria`) | *Why* a step existed | ⚠️ Model exists, never populated. See below. |
+| Skill type with machine-authorship fields | [`pkg/skills/types.go`](../pkg/skills/types.go) | `Confidence`, `Status`, `LastValidatedMs`, `RiskLevel` already on `Skill` |
+| Skill write path, restricted to meta-agents | [`agent_management_skill.go`](../pkg/shuttle/builtin/agent_management_skill.go), [`agent_management.go:188`](../pkg/shuttle/builtin/agent_management.go:188) | Gate allows `weaver` and `guide`; `apprentice` must be added |
+| Skill → tasks (the inverse direction) | [`pkg/skills/tasks/emitter.go`](../pkg/skills/tasks/emitter.go) | Materializes `SkillTaskTemplate.Steps`; P0 inverts it |
+| Target output type | `SkillTaskTemplate` in [`pkg/skills/types.go`](../pkg/skills/types.go) | Not free-form YAML — the structure the emitter already consumes |
+| Trace substrate | `tool_executions` in [`000001_initial_schema.up.sql`](../pkg/storage/postgres/migrations/000001_initial_schema.up.sql) | `session_id`, `tool_name`, `input_json`, `result_json`, `error`, `execution_time_ms`, `timestamp` |
+| Skill YAML rendering | [`pkg/skills/importer/`](../pkg/skills/importer) | `render` and `classify` are reusable; the importer itself is not a distiller |
+| Validation | [`pkg/skills/hygiene/`](../pkg/skills/hygiene), `pkg/evals` | |
+| TUI command registration | [`commands.go:308`](../internal/tui/components/dialogs/commands/commands.go:308) | Same shape as `new_session` / `toggle_yolo` / `browse_apps` |
+| TUI review dialog precedent | [`internal/tui/components/dialogs/`](../internal/tui/components/dialogs) | Existing `workflows`, `pattern`, `agents`, `sessions` browsers |
+| Parameter confirmation channel | `QuestionAskedMsg` / `QuestionAnsweredMsg` + the `clarification` dialog | The weaver already uses this; v1's hardest interaction is already plumbed |
+| Progress streaming | [`pkg/metaagent/tui_listener.go`](../pkg/metaagent/tui_listener.go) | `ProgressMultiplexer` with TUI and console listeners |
 
-**The apprentice as originally scoped could only watch agents, not humans.** The founding ask was
-"watch what the user is doing", but a person clicking through Tera Cloud produces zero tool
-calls — which is also why 43% of the corpus has none. Those sessions are people talking, not
-people working through an agent. Closing that hole means emitting first-party UI events, and the
-distinction in *how* is the whole bet:
+---
 
-- **First-party semantic events** — up-tera emitting "ran query", "opened notebook", "created
-  workspace" against a schema we own. As stable as tool calls, for the same reason: it is a
-  versioned contract, not a scrape. **This is the right channel**, and the pipe is already there.
-- **Generic DOM or pixel observation** of arbitrary third-party pages — bucket 2 brittleness,
-  where Grok Bot lives. Last, not first, and only for work outside our own surfaces.
-
-Consequence for sequencing: first-party UI events were originally parked in P5. They belong in
-**P1's trace model as a second event source**, even if up-tera only emits a handful at first.
-Retrofitting an event source into a normalized trace format later is exactly what forces a
-rewrite.
-
-### Tasks are an output, not an input
-
-> **Third revision of the substrate decision.** First the board was the spine; then it was
-> enrichment; it is now a *product* of distillation.
-
-The board is empty for a deeper reason than its default flag. **Maintaining it is extra work an
-agent must choose to do**, whereas tool calls are recorded automatically as a byproduct of
-acting. That asymmetry is why `pkg/skills/hygiene` exists at all — an auditor and enforcer whose
-entire job is compensating for agents that do not keep the board honest. Nothing in `pkg/task` or
-`pkg/skills` reads `tool_executions`, so there is no retrospective derivation anywhere;
-`auto_decompose` decomposes a *goal* up front, it does not reconstruct what happened.
-
-Compare Claude Code's background tasks, which do get created: a task appears because the agent
-noticed out-of-scope work *while doing something else*. Byproduct, not discipline. Same data
-model, opposite creation dynamics.
-
-So the apprentice must not depend on tasks existing. It **synthesizes** step structure from tool
-calls and UI events; where a board happens to exist, it is used to validate and enrich. This also
-inverts the argument for enabling boards by default: the reason is not that the apprentice needs
-them as input, it is that the apprentice can finally *fill* them — auto-populated from actions
-rather than hand-maintained, which is the first version of that feature anyone would keep using.
-
-### Trace: tool calls and messages are the spine
-
-> **Revised after the P1a spike.** This section originally made the task board the spine. Real
-> data says otherwise: a local corpus of 284 sessions held 4,651 messages and 2,047 tool
-> executions and **zero** tasks or boards, because `TaskBoardConfig` defaults to
-> `Enabled: false` ([`pkg/agent/registry.go:785`](../pkg/agent/registry.go:785)). The board is
-> excellent structure when it exists, but it cannot be the spine of a feature that has to work
-> on the traces people actually produce.
+## v1 design
 
 ```
-tool_executions + messages (spine: what was attempted, in what order, with what intent)
-  + task board, when enabled (enrichment: objective, acceptance criteria, dependency edges)
-  + spans (detail: timing, nesting, errors)
+tool_executions + messages for one session
       │
       ▼
-  normalized Trace ─► segment ─► abstract ─► instantiate ─► emit ─► validate ─► candidate
+  segment ─► abstract ─► instantiate ─► emit ─► validate ─► candidate ─► review ─► deputize
 ```
 
-- **segment** — trace → one or more episodes with a clear goal. Drop genuine noise: repeated
-  identical searches, status-file churn, environment probing. **Do not drop failed steps** — a
-  tool call's *input* is the evidence of intent, independent of its outcome. See finding 4.
-- **abstract** — replace task-specific literals (this database, this date range, this path) with
-  named placeholders, preserving structure.
+- **segment** — the session's calls → one episode, with the goal taken from the first user message.
+  Drop genuine noise (repeated identical searches, status-file churn, environment probing). **Keep
+  failed steps** (constraint 4). Reject the session outright if it is weaver meta-work
+  (constraint 8) or holds too few calls to contain a procedure (constraint 6).
+- **abstract** — replace task-specific literals with named placeholders, preserving structure.
 - **instantiate** — bind placeholders to typed parameters with defaults and descriptions.
-- **emit** — produce a candidate of the appropriate kind (below).
-- **validate** — hygiene audit, `ValidateSkill`, and for workflows a dry-run parse. Nothing
-  reaches a user unvalidated.
+- **emit** — a `SkillTaskTemplate` plus prompt instructions, rendered to skill YAML.
+- **validate** — hygiene audit and `ValidateSkill`. Nothing reaches a user unvalidated.
+- **review** — TUI dialog. Every candidate starts `PROPOSED` with low `Confidence`. No
+  auto-deputizing, ever.
 
-Abstraction is split from instantiation deliberately, mirroring ALLOY's Identifier/Filter
-separation. Generalization is the step that has sunk this idea repeatedly, and doing it in one
-shot from a single example is the documented failure mode — see [Prior art](#prior-art).
+Splitting abstraction from instantiation is deliberate; generalizing in one pass from one example
+is the documented failure mode.
 
-### Candidate kinds and the decision rule
+### Where P0 fits, honestly
 
-Ambiguity resolves toward the cheaper artifact — a skill is easier to discard than an agent.
+`pkg/apprentice.Distill` reads a *task board* and recovers a `SkillTaskTemplate`. Since v1 reads
+`tool_executions` instead, **P0 is not on v1's execution path.** It keeps three kinds of value:
 
-| Kind | Emit when | Lands as |
-|---|---|---|
-| **SKILL** | Repeatable procedure, single agent, judgment required at steps | `SkillTaskTemplate.Steps` + prompt instructions → skill YAML |
-| **WORKFLOW** | Fixed step order, fan-out/parallelism, or more than one agent | workflow YAML (`pipeline`, `parallel`, `fork_join`) |
-| **AGENT** | The same tool set and domain recur across many episodes with no existing agent fitting | agent YAML, via the weaver's existing path |
-| **TRIGGER** | An existing or candidate artifact recurs on a cadence, or after a detectable event | `SkillTrigger` keywords/intent + mode, or `ScheduleWorkflow` / `SetWorkflowSchedule` |
-
-TRIGGER is the cheapest and most under-served: the auto-activation and scheduling machinery
-already exists in both repos and nothing currently proposes values for it.
-
-### The output type is not free-form YAML
-
-For SKILL candidates the target is `SkillTaskTemplate.Steps` — the same structure the emitter
-consumes in the forward direction. This is what makes P0 self-checking.
-
----
-
-## P0: the round-trip oracle
-
-Before any cloud or UI work, prove the distiller offline in loom, CLI-only:
-
-1. Take a shipped skill with an authored `TaskTemplate` (e.g. [`skills/teradata-sql-analytics.yaml`](../skills/teradata-sql-analytics.yaml)).
-2. Run it. The emitter materializes its steps onto a task board.
-3. Distill the completed board back into a `SkillTaskTemplate`.
-4. Diff recovered against original.
-
-Structural fidelity — step count, order, dependency edges, parameter positions — is measurable
-without an LLM judge. If the round trip does not survive a skill we wrote ourselves, it will
-not survive real work, and the feature can be abandoned for the cost of one package.
-
-Exit criteria for P0: round-trip on ≥3 authored skills, plus one hand-scored real session.
-
----
-
-## Surfaces: the TUI is the first client, not an afterthought
-
-Loom's TUI is a gRPC client of `looms` ([`internal/app/app.go:46`](../internal/app/app.go:46) —
-`NewFromClient(c *client.Client)`), and the task manager is constructed server-side in
-[`cmd/looms/cmd_serve.go:1016`](../cmd/looms/cmd_serve.go:1016). The TUI and up-tera are
-therefore **peers over the same engine**, which has one design consequence:
-
-> The apprentice must be exposed as `ApprenticeService` in `proto/loom/v1/apprentice.proto`
-> and served from `pkg/server` — not as a Go package plus CLI only. Otherwise the TUI cannot
-> drive it, and tera-backend has to invent an API that loom should have defined.
-
-This shrinks the cloud work: tera-backend becomes a multi-tenant wrapper over loom's RPCs, the
-same pattern it already uses for everything else, rather than a new API surface.
-
-Most of what the TUI needs already exists:
-
-| Need | Existing mechanism |
-|---|---|
-| Command entry (`/apprentice watch`, browse candidates) | `uicmd.Command` + `Handler`, registered like `new_session` / `toggle_yolo` / `browse_apps` ([`commands.go:308`](../internal/tui/components/dialogs/commands/commands.go:308)); `arguments.go` supports scoped args |
-| Candidate browser | New dialog beside the existing `workflows`, `pattern`, `agents`, `artifactbrowser`, `sessions` dialogs in [`internal/tui/components/dialogs/`](../internal/tui/components/dialogs) |
-| Live progress while watching | `ProgressListener` + `ProgressMultiplexer` + [`TUIProgressListener`](../pkg/metaagent/tui_listener.go) already stream meta-agent progress as Bubbletea messages; `ConsoleListener` covers the CLI path |
-| **Parameter confirmation during generalization** | `QuestionAskedMsg` / `QuestionAnsweredMsg` + the `clarification` dialog — the channel the weaver already uses for clarifications |
-| Per-session watch on/off | `toggle_yolo` is the precedent for a persistent session-mode toggle |
-
-Genuinely missing: there is **no task board view** — [`internal/tui/page`](../internal/tui/page)
-contains only `chat`. A live step list is new UI; it belongs in the existing chat sidebar rather
-than a new page, and it is lower priority for P1 than the candidate review dialog.
-
-**Why this matters for sequencing**: the full loop — watch, distill, review, deputize — can run
-in loom alone, against a local `looms` server, with no cloud and no up-tera. The UX gets
-discovered in the TUI where iteration is cheap, and P2/P3 inherit settled interaction design
-instead of inventing it. P0 stays CLI-only on purpose, since it needs no server at all.
-
----
-
-## Ownership
-
-| Concern | Repo |
-|---|---|
-| Trace model (proto first), segmenter, generalizer, emitter, candidate scoring | **loom** — `pkg/apprentice`, `proto/loom/v1/apprentice.proto` |
-| `ApprenticeService` RPCs + `pkg/server` implementation | **loom** — consumed by both the TUI and tera-backend |
-| `apprentice` meta-agent + ROM; add to the `agent_management` allowlist | **loom** |
-| Recurrence detection over a local trace corpus | **loom** |
-| TUI: watch command, candidate browser dialog, progress rendering, parameter clarification | **loom** — `internal/tui` |
-| `loom apprentice watch / list / show / deputize` CLI | **loom** — server-free dogfood loop |
-| `ApprenticeService` RPCs, RLS tables, quotas, audit | **tera-backend** |
-| Consent, redaction, retention | **tera-backend** |
-| Deputize → existing create paths (`ContributeSkillToOrg`, `CreateWorkflow`, `SetWorkflowSchedule`) | **tera-backend** — **no second skill store** |
-| Cross-user recurrence at org scale | **tera-backend**, later **loom-knowledge** |
-| Watch affordance, live step list, candidate review/edit, suggestion inbox (web) | **up-tera** — after the TUI settles the interaction design |
-| Semantic non-chat activity events (notebook, SQL editor, file browser) | **up-tera**, phase 5 |
-
-### Why not loom-knowledge (yet)
-
-`loom-knowledge` is the wrong host today: its README lists Loom integration as not started, so
-hosting the distiller would invert the intended dependency direction; its ingest path is
-deliberately LLM-free with reproducible deterministic ranking, which the distiller is not; and
-its output type is entities and insights, not executable YAML.
-
-It becomes the right home for one specific part later: **org-scale recurrence and retrieval**.
-`ContextService.ResolveContext` with use-case-scoped profiles is a good fit for "how has this
-been done here before, by whom, with what confidence," and its deterministic ranking suits
-recurrence scoring. That is phase 5 and it is blocked on Loom integration landing there.
-
----
-
-## Phases
-
-| Phase | Repo | Contents |
-|---|---|---|
-| **P0** ✅ | loom | Round-trip oracle. Offline distiller over a completed task board → `SkillTaskTemplate`. `pkg/apprentice`, no proto/server/TUI, no LLM. |
-| **P1a** ✅ | loom | Prior-art review and a read-only spike over a real session corpus, before committing to P1. Produced findings 3–5 and reversed the trace-substrate decision. |
-| **P1** | loom | `apprentice.proto` trace/candidate model + `ApprenticeService`, `apprentice` meta-agent, trace assembly from `tool_executions` + `messages`, abstract/instantiate split, SKILL + WORKFLOW emission, sanitization pass, validation gate. Every candidate `PROPOSED` with low confidence. |
-| **P1.5** | loom | TUI: watch command, candidate review dialog, progress rendering, parameter clarification. Complete loop with no cloud dependency — this is where the UX is settled. |
-| **P2** | tera-backend | Multi-tenant wrapper over loom's `ApprenticeService`, `apprentice_candidates` (RLS), consent gate, redaction, `Deputize` wired to existing create paths. |
-| **P3** | up-tera | Web watch affordance, candidate review/edit, inheriting P1.5's interaction design. Emit first-party `trackEvent` activity events so human-only work is capturable at all. |
-| **P4** | both | Observe mode: batch recurrence mining over stored traces; suggestion inbox; AGENT and TRIGGER candidates. |
-| **P5** | loom-knowledge | Org-scale recurrence via `ContextService`. |
-
-Watch mode ships before observe mode, but the trace model must be designed for both from P1 —
-observe mode is only a different event source and a recurrence pass over the same structures.
+1. It established the output type, the `Reader` seam, and the warnings-not-errors discipline that
+   v1's trace reader should copy. v1 adds a second source producing the same `SkillTaskTemplate`.
+2. Its round-trip oracle stays in CI permanently as a regression suite for the emitter's template
+   contract, independent of the apprentice.
+3. It surfaced constraints 1 and 10, which is what a P0 is for.
 
 ---
 
 ## Testing
 
-The feature is LLM-driven at exactly one step (generalization) and deterministic everywhere
-else. The testing strategy follows that seam: everything deterministic gets ordinary Go tests
-with `-tags fts5 -race`, the LLM step gets recorded fixtures for correctness and an eval suite
-for quality. **Do not expect `just test` to catch a worse prompt** — that is what the eval tier
-is for, and conflating the two is how quality regressions ship unnoticed.
+The feature is LLM-driven at exactly one step (abstract/instantiate) and deterministic everywhere
+else. Testing follows that seam. **`just test` will not catch a worse prompt** — that is what the
+eval tier is for, and conflating the two is how quality regressions ship unnoticed.
 
-### Tier 1 — Deterministic units (the bulk of coverage)
-
-| Component | Test shape |
+| Tier | Contents |
 |---|---|
-| Trace normalization | Table-driven: fixture task board + `tool_executions` + `messages` → expected `Trace`. Golden files. |
-| Segmenter boundaries | Table-driven over fixture traces → expected episode splits. Retries, dead ends, and clarification exchanges must be dropped; assert they are. |
-| **Kind decision rule** | Pure function over trace features → `SKILL \| WORKFLOW \| AGENT \| TRIGGER`. Exhaustive table. Keeping this a pure function rather than an LLM judgment exists partly so it is testable — do not let it drift into the prompt. |
-| Candidate → YAML emission | Golden files, matching the existing convention for generated output. |
-| Procedure fingerprint | Same procedure → same fingerprint; reordered-but-equivalent → same; materially different → different. Gates the "a discarded candidate never gets re-proposed" requirement, which is otherwise a nag bug. |
-| Recurrence scoring | Fixture corpus of N traces → expected match groups at a given threshold. |
+| **Deterministic units** | Trace assembly from fixture `tool_executions` + `messages`; noise filters; the meta-work guard; the too-few-calls gate; YAML emission against golden files. Table-driven, `-tags fts5 -race`. |
+| **Round-trip oracle** ✅ | Real emitter → real sqlite board → `Distill` → structural diff, over every embedded skill authoring a `task_template`, plus re-emission as a fixpoint. In CI at 99.4% coverage. |
+| **LLM step** | Recorded fixtures for CI (tests the code path, not the model) and `pkg/evals` for quality on a schedule, against a hand-labeled corpus of (trace → expected candidate) pairs. |
+| **Adversarial** | **Highest-risk surface.** A captured trace is untrusted input whose text becomes a skill prompt. Cover prompt injection from captured tool output into `prompt.instructions` and `tools.required`, path traversal via candidate name, oversized candidates, candidates naming nonexistent tools, and any candidate whose `risk_level` would bypass the approval gate. Each must fail closed. |
+| **Privacy** | Redaction as assertions, not policy: fixtures seeded with known secrets and PII must not appear in the persisted candidate. |
+| **TUI** | Bubbletea message-flow tests following [`events_test.go`](../internal/tui/adapter/events_test.go) — watch started → progress → clarification asked → answered → candidate ready. Deterministic, no LLM. |
 
-### Tier 2 — The round-trip oracle (P0 exit criteria, then permanent regression suite)
+Coverage targets: `pkg/apprentice` ≥ 60%; validation and redaction paths ≥ 80%.
 
-```
-shipped skill with authored TaskTemplate
-  → emitter (pkg/skills/tasks) → task board
-  → distiller → recovered SkillTaskTemplate
-  → structural diff against the original
-```
+---
 
-Assertions are structural and need no LLM: step count, step order, dependency edges, parameter
-positions. Drive it table-driven over **every shipped skill that has an authored
-`TaskTemplate`**, so the corpus grows for free as skills land. Today that is
-`weaver-presets`, `weaver-templates`, and `weaver-from-scratch` under `embedded/skills/`.
+## Deferred, with reasons
 
-This is not a one-off proof for P0 — it stays in CI permanently as the cheapest signal that a
-distiller change broke fidelity.
+Nothing here is rejected. Each item is out of v1 because it costs more than it returns until v1
+proves candidates are worth reviewing.
 
-A second property matters just as much for deputizing: **re-emission must be a fixpoint.**
-Emitting a recovered template has to reproduce the same board, so
-`distill(emit(distill(emit(T))))` stops changing. A template that drifted on every generation
-would corrupt the skill a little more each time it ran.
-
-Exit criteria for P0: clean round trip on ≥3 authored skills plus one hand-scored real session.
-
-### What P0 and the P1a spike found
-
-Five findings, all evidence-backed, several of which changed the plan above.
-
-**From the P1a spike over a real 284-session corpus:**
-
-3. **The task board is not the trace spine, because in practice it is empty.** 284 sessions,
-   4,651 messages, 2,047 tool executions, and zero tasks or boards —
-   `TaskBoardConfig{Enabled: false}` is the default
-   ([`pkg/agent/registry.go:785`](../pkg/agent/registry.go:785)). Enabling boards is a config
-   change, but no deployment that hasn't made it produces board-based traces, so
-   `tool_executions` + `messages` must be the substrate and the board an enrichment.
-
-4. **The best procedure in the corpus is in a trace where every one of its steps failed** — and
-   the plan's original segmenter spec would have deleted it. One session asked for complete schema
-   metadata for a Teradata database and issued nine well-formed catalog queries (database
-   metadata, tables, row counts, columns, primary keys, foreign keys, indexes, table constraints,
-   column constraints). All nine failed for a purely environmental reason: the MCP client was
-   unavailable, then the circuit breaker opened. The remaining ~29 steps were genuine flailing —
-   repeated identical searches, status-file writes, probing for `bteq` / `isql` / `teradatasql`.
-   So the signal was 100% failed and the noise was mostly successful. **Intent lives in tool call
-   inputs, not outcomes.** Any "only distill successful sessions" filter — the obvious first
-   heuristic — throws away the single most valuable candidate available.
-
-5. **The kind-decision rule needs tightening.** Those nine catalog queries are mutually
-   independent, and the rule as written ("fan-out → workflow") therefore classifies them as a
-   nine-branch parallel workflow. That is wrong: they are nine independent queries one agent runs
-   in a turn. Fan-out must mean *multiple agents or genuine orchestration need*, not merely
-   independent steps.
-
-6. **Yield is low, and that reframes the whole feature.** Of 284 sessions: 121 (43%) made **zero**
-   tool calls, 76 more made 1–4, and only 35 (12%) made ≥15 — the plausible floor for holding a
-   procedure worth capturing. Hand-reviewing the 22 richest sessions produced roughly **six
-   distinct deputizable procedures**. Extrapolated, a corpus this size yields something like 5–10
-   candidates total. That is genuinely useful — each is a skill nobody had to author — but it is
-   a trickle, not a stream.
-
-7. **Therefore watch mode beats observe mode at single-user scale**, reversing an earlier claim in
-   this document. Observe mode has to pan 250 sessions of nothing to find six procedures. Watch
-   mode has a human pre-selecting a procedure worth capturing, which skips the 88% of traces that
-   contain nothing. Observe mode only pays off at **org scale**, which is a concrete argument —
-   with a number behind it — for the loom-knowledge tier in P5, and a reason to keep P4 after
-   P1.5 rather than racing to it.
-
-8. **The largest category in the corpus is meta-work that should not be deputized.** Eight of the
-   22 richest sessions are weaver-authoring runs ("create an agent that…", "create a revenue
-   analytics workflow"). Distilling those yields candidates duplicating what `weaver-from-scratch`
-   already does. The apprentice needs an explicit guard against proposing skills for using loom
-   itself, or its first suggestions will all be noise.
-
-9. **Recurrence detection is the crux, not a detail — and both naive approaches fail.** Two
-   apparent recurrence pairs in the corpus demonstrate opposite failure modes:
-
-   - *Same procedure, different sequences.* Two sessions diagnosed "my agent isn't showing up in
-     the agent list" (`sess_816fdb94`, `sess_4c5c7080`). Same intent, same tool vocabulary
-     (`agent_management`, `shell_execute`, `query_tool_result`), but materially different orders.
-     Sequence-alignment matching gives a **false negative** here.
-   - *Same intent text, unrelated procedures.* Two sessions targeted schema discovery on the same
-     database (`sess_ad16b72c`, `a4b4c677`). One issued nine catalog queries; the other was a
-     multi-agent coordination run of `send_message` and `workspace` writes. Intent-similarity
-     matching gives a **false positive** here.
-
-   So the procedure fingerprint (risk 8) needs tool multiset *and* object-level structure — which
-   tools acted on which objects with which parameters — not sequence alignment and not intent
-   text. This is where observe mode lives or dies.
-
-**From building P0:**
-
-1. **Authored step order survives only where step indices do.** With the emitter's
-   `SkillIdempotencyKey` present, recovery is exact. Without it — the real-work case — order can
-   only be inferred from the dependency DAG, and that is genuinely ambiguous wherever the graph
-   fans out. Two of the three shipped templates fan out (`weaver-templates` steps 4 and 5 both
-   depend on 3; `weaver-from-scratch` steps 1 and 2 both depend on 0), so a board simply holds no
-   record of which branch ran first. The distiller therefore reports unconstrained ordering as a
-   warning rather than presenting a guess as evidence, and the oracle asserts *a valid*
-   topological order in that mode instead of the authored one. Anything downstream that needs
-   true ordering must get it from a richer trace source, not the board.
-
-2. **`SkillTaskTemplate.RootTitle` is documented but not implemented.** Its comment says it
-   "names the parent task created to group emitted children", but `emitTemplate` never creates
-   that parent and never sets `ParentID`. All three shipped templates set `root_title` and all
-   three lose it on a round trip. `TestRoundTrip_UnrecoverableTemplateFields` pins the gap so it
-   reads as known rather than as a distiller bug; if the emitter gains root-task support that
-   test will fail and the distiller should learn to recover it.
-
-### Tier 3 — The LLM step
-
-Two separate mechanisms, deliberately not mixed:
-
-- **Recorded fixtures for CI.** Capture real LLM responses for the generalization step once and
-  replay them. Deterministic, fast, race-safe. This tests *the code path*, not the model — a
-  passing suite says the plumbing is intact, nothing more.
-- **Eval suite for quality.** [`pkg/evals`](../pkg/evals) already provides `runner.go`,
-  `golden.go`, `metrics.go`, and `judges/`. Build a hand-labeled corpus of
-  (trace → expected candidate) pairs and score: did it pick the right kind, did it parameterize
-  the right literals (precision/recall over parameters), did it drop the incidental steps.
-  Runs on a schedule and before prompt changes — not on every commit.
-
-For generated *skills* specifically, the curated repo `Teradata-PE/aai-tera-agentic-skills`
-already runs `skill-validation.yml` plus single- and multi-turn skill evals. Decide whether to
-call those pre-PR or port the checks into `pkg/skillvalidation` (see risk 5).
-
-### Tier 4 — Adversarial input (highest-risk untested surface)
-
-**A captured trace is untrusted input, and its text becomes a skill prompt.** Tool output, table
-comments, query results, and user messages all flow into the candidate that a later session
-loads with tool access. This is the most dangerous path in the feature and it must be tested as
-such, not reviewed as such:
-
-- Prompt injection carried in captured tool output attempting to write instructions into the
-  generated skill's `prompt.instructions` or add tools to `tools.required`.
-- Path traversal via candidate name into the skill write path. The importer already guards the
-  analogous case ([`pkg/skills/importer/parse.go`](../pkg/skills/importer/parse.go)) — reuse the
-  guard and test it here too.
-- Oversized candidates (token-budget exhaustion), cyclic dependencies in emitted workflow DAGs,
-  candidates naming nonexistent tools or agents.
-- A candidate whose `risk_level` would let it bypass the approval gate.
-
-Every one of these is a table-driven test with a hostile fixture, and each must fail closed.
-
-### Tier 5 — Concurrency
-
-Watch mode observes a live session while the agent is mutating the same task board, and shares
-the `ProgressMultiplexer` with other listeners. Per project convention this is zero-tolerance:
-
-```bash
-go test -tags fts5 -race -count=50 ./pkg/apprentice
-```
-
-Cover: concurrent watch + task mutation, watch started/stopped mid-turn, two watchers on one
-session, and multiplexer fan-out under load. `just race-check` for the extended run.
-
-### Tier 6 — Privacy as assertions, not policy
-
-Redaction and the cross-user boundary must be tests, not review checklist items:
-
-- Fixtures seeded with known secrets and PII → assert absent from the persisted candidate.
-- A candidate derived from user A's traces, surfaced to user B, contains **structure only** — no
-  table names, query text, or file contents from A. Assert on the payload, not the intent.
-
-### Tier 7 — Service, cloud, and TUI
-
-- `ApprenticeService` RPC-level tests in `pkg/server`, following existing service test patterns.
-- **RLS** (P2): a user cannot read another tenant's candidates. Uses tera-backend's existing
-  Postgres test utilities.
-- **Deputize wiring** (P2): candidate → `ContributeSkillToOrg` produces a valid PR payload
-  against a mocked GitHub client; candidate → `CreateWorkflow` / `SetWorkflowSchedule` likewise.
-- **TUI** (P1.5): Bubbletea message-flow tests following
-  [`internal/tui/adapter/events_test.go`](../internal/tui/adapter/events_test.go) — watch started
-  → progress messages → clarification asked → answered → candidate ready. Deterministic, no LLM.
-
-### Coverage targets
-
-Following the project's existing tiering: `pkg/apprentice` ≥ 60% (new code, mostly
-deterministic, no excuse for less), validation and redaction paths ≥ 80% (critical path),
-round-trip oracle at 100% of shipped skills carrying an authored `TaskTemplate`.
+| Deferred | Reason |
+|---|---|
+| **Observe mode + recurrence** | The hardest part of the design, and constraint 9 shows both naive fingerprinting approaches fail on real data. Constraint 7 says it only pays off at org scale. |
+| **WORKFLOW candidates** | Second, when a multi-agent trace shows up. 41 of 284 sessions used `send_message`, so the data exists — but constraint 5 says the decision rule needs tightening first. |
+| **AGENT and TRIGGER candidates** | TRIGGER is the cheapest future win: `SkillTrigger` (`keywords`, `intent_categories`, `mode`, `min_confidence`) and `ScheduleWorkflow` both exist, and nothing currently proposes values for them. |
+| **First-party UI event capture** | The real gap: v1 can only watch agents, and a person clicking through Tera Cloud produces zero tool calls — which is why 43% of the corpus has none. The pipe exists and is unused: `trackEvent(name, metadata)` in up-tera's `src/lib/pendo.ts` has exactly one call site (`session.create`). Deferred because it is a second repo and a frontend commitment nobody has made. Generic DOM or pixel observation stays last — that is bucket 2. |
+| **Derived task boards** | Synthesizing a board from tool calls would make boards useful for the first time and give the apprentice a *why* layer. Open question: whether it writes to the live `tasks` table (visible and useful, but the apprentice would then mutate state agents read) or stays in candidate storage. |
+| **Multi-tenancy, consent, org promotion** | `ApprenticeService` RPCs, RLS tables, redaction policy, and `Deputize` wired to `ContributeSkillToOrg` / `CreateWorkflow`. Entirely conditional on v1. The cloud layer is a wrapper over loom's RPCs, not a new surface — `proto/loomcloud/v1/skill.proto` already holds the promotion path. |
+| **loom-knowledge tier** | Exists only to serve observe mode. Its README lists Loom integration as not started, its ingest path is deliberately LLM-free, and its output type is entities rather than executable YAML. The right eventual home for org-scale recurrence via `ContextService`, not a host for the engine. |
+| **Live step display** | Explicitly not worth building — only 2 of ALLOY's 12 participants noticed one. |
 
 ---
 
 ## Risks and open questions
 
-1. **Generalization quality is the feature.** One trace generalizes badly. Watch mode should
-   require the user to confirm parameters; observe mode should require N≥2 similar episodes
-   before proposing. Never auto-deputize.
-2. **Passive cross-user mining is a different consent class** from "watch this session." Needs
-   org-level opt-in plus per-user opt-out, and a hard rule: a suggestion derived from other
-   people's sessions may carry the *structure* of a procedure but never its payload. No table
-   names, no query text, no file contents crossing a user boundary.
-3. **Redaction happens before persist, not before display.** Captured traces contain prompts,
-   SQL with real object names, and possibly PII.
-4. **A captured trace is untrusted input, and it becomes a prompt.** Tool output, table
-   comments, query results, and user messages flow from a trace into a candidate's
-   `prompt.instructions` and `tools.required`, which a later session then loads with tool
-   access — potentially for a different user. A hostile table comment or query result is an
-   injection vector into generated automation. This is the most severe risk in the feature.
-   Mitigation is a sanitization pass plus the adversarial tests in Tier 4, and it must be built
-   in P1, not deferred to P2 with the rest of the security work.
-5. **Cost.** An always-on observer LLM roughly doubles per-session tokens. Watch mode is
-   explicit; observe mode must be batch/offline over stored traces, never inline per turn.
-6. **Validation cannot live in the destination repo** — org repos are arbitrary GitHub slugs.
-   Decide whether to reuse the eval workflows from `aai-tera-agentic-skills` pre-PR or port the
-   checks into `pkg/skillvalidation`.
-7. **Untracked steps.** The board is the spine but is incomplete by construction. Confirm the
-   fill-in pass can attribute orphan tool calls to the right step, or mark the candidate
-   low-confidence when it cannot.
-8. **Candidate lifecycle** — proposed `PROPOSED | VALIDATED | DEPUTIZED | DISCARDED`. A
-   discarded candidate must suppress re-proposal of the same procedure, or observe mode becomes
-   a nag. Needs a stable procedure fingerprint (tested in Tier 1).
-9. **Open**: does deputizing a SKILL candidate go straight to an org PR, or land in the user's
-   private skill set first with promotion as a second, separate act? The marketplace supports
-   both; the safer default is private-first.
+1. **v1 generalizes from a single example**, which is bucket 1 of the prior art. Mitigated by
+   mandatory human review, not by an algorithm. If reviewers end up rewriting every candidate, the
+   feature is a novelty and repetition-based inference becomes mandatory rather than deferred.
+2. **A captured trace is untrusted input, and it becomes a prompt.** Tool output, table comments,
+   and query results flow into a candidate's `prompt.instructions` and `tools.required`, which a
+   later session loads with tool access. The most severe risk in the feature; sanitization plus the
+   adversarial tier is required in v1, not deferred.
+3. **Cost.** Watch mode is explicitly invoked and runs once per session, so LLM cost is bounded and
+   opt-in. Any always-on variant must be batch and offline.
+4. **Redaction happens before persist, not before display.** Captured traces contain prompts, SQL
+   with real object names, and possibly PII.
+5. **Validation cannot live in the destination repo.** Org repos are arbitrary GitHub slugs with no
+   guaranteed CI. `Teradata-PE/aai-tera-agentic-skills` does run `skill-validation.yml` plus single-
+   and multi-turn skill evals — decide whether to call those pre-PR or port the checks into
+   `pkg/skillvalidation`.
+6. **Candidate lifecycle** — `PROPOSED | VALIDATED | DEPUTIZED | DISCARDED`. A discarded candidate
+   must suppress re-proposal of the same procedure, which needs the fingerprint from constraint 9.
+   Not a v1 problem, since v1 only runs on request.
+7. **Open**: does deputizing go straight to an org PR, or land in the user's private skill set first
+   with promotion as a separate act? The marketplace supports both; private-first is safer.
+8. **Open**: should `TaskBoardConfig.Enabled` default to true? Cost is bounded — 500
+   `context_budget_tokens` — and the expensive behaviors are separately gated (`auto_decompose`
+   defaults false; hygiene `REQUIRE_FIX` is scoped to skill-emitted tasks only). But constraint 2
+   says flipping the flag does not make boards get *maintained*. Separable from this feature, and it
+   deserves its own PR.
