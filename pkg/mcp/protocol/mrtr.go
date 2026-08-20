@@ -52,6 +52,72 @@ type InputRequiredResult struct {
 	RequestState *string `json:"requestState,omitempty"`
 }
 
+// InputRequiredError is returned by a server-side handler that needs caller
+// input before completing. The server core converts it into an
+// InputRequiredResult (resultType "input_required") for stateless clients;
+// handler signatures stay unchanged. RequestState must survive a stateless
+// retry that may land on another replica — seal it (internal/mcpstate) when
+// it influences authorization or business logic.
+type InputRequiredError struct {
+	Requests     InputRequests
+	RequestState string
+}
+
+func (e *InputRequiredError) Error() string {
+	return fmt.Sprintf("caller input required (%d requests)", len(e.Requests))
+}
+
+// RequestStatePtr adapts the producer-side state to the wire field, which
+// tracks presence: a pausing handler that supplies no state emits no
+// requestState member at all (emitting a present-but-empty one would bind
+// the client to echo a value that means nothing to this server).
+func (e *InputRequiredError) RequestStatePtr() *string {
+	if e.RequestState == "" {
+		return nil
+	}
+	s := e.RequestState
+	return &s
+}
+
+// RetryInput is the MRTR payload a client attaches when retrying the
+// original request: its answers plus the echoed opaque state.
+type RetryInput struct {
+	Responses    InputResponses
+	RequestState string
+}
+
+// ParseRetryInput extracts inputResponses and requestState from a retried
+// request's params; both zero when this is not an MRTR retry. An absent
+// member is not a retry and parses clean, but a present-and-malformed member
+// is a client error the server must answer with InvalidParams — silently
+// zeroing it would make the retry indistinguishable from an initial call and
+// re-elicit the same input until MaxRounds.
+func ParseRetryInput(params json.RawMessage) (RetryInput, error) {
+	if len(params) == 0 {
+		return RetryInput{}, nil
+	}
+	var raw struct {
+		InputResponses json.RawMessage `json:"inputResponses"`
+		RequestState   json.RawMessage `json:"requestState"`
+	}
+	if err := json.Unmarshal(params, &raw); err != nil {
+		// Non-object params are the owning method's problem, not MRTR's.
+		return RetryInput{}, nil
+	}
+	var out RetryInput
+	if len(raw.InputResponses) > 0 && string(raw.InputResponses) != "null" {
+		if err := json.Unmarshal(raw.InputResponses, &out.Responses); err != nil {
+			return RetryInput{}, fmt.Errorf("malformed inputResponses: %w", err)
+		}
+	}
+	if len(raw.RequestState) > 0 && string(raw.RequestState) != "null" {
+		if err := json.Unmarshal(raw.RequestState, &out.RequestState); err != nil {
+			return RetryInput{}, fmt.Errorf("malformed requestState: %w", err)
+		}
+	}
+	return out, nil
+}
+
 // ParseInputRequired decodes an input_required interim result.
 func ParseInputRequired(result json.RawMessage) (*InputRequiredResult, error) {
 	var irr InputRequiredResult

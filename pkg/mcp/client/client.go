@@ -350,6 +350,24 @@ func (c *Client) IsInitialized() bool {
 	return c.initialized
 }
 
+// RawRequest sends an arbitrary JSON-RPC request through the client's full
+// request pipeline — _meta stamping, idempotency keys, stream-loss re-issue,
+// and MRTR driving — and returns the raw result. Intended for conformance
+// testing and protocol extensions; typed methods cover the core surface.
+func (c *Client) RawRequest(ctx context.Context, method string, params json.RawMessage) (json.RawMessage, error) {
+	req := &protocol.Request{
+		JSONRPC: protocol.JSONRPCVersion,
+		ID:      c.nextRequestID(),
+		Method:  method,
+		Params:  params,
+	}
+	resp, err := c.sendRequest(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	return resp.Result, nil
+}
+
 // NegotiatedVersion returns the protocol revision agreed with the server, or
 // the empty string before Connect/Initialize completes.
 func (c *Client) NegotiatedVersion() string {
@@ -384,6 +402,19 @@ func (c *Client) Close() error {
 
 	c.logger.Info("MCP client closed")
 	return nil
+}
+
+// reissueSafeMethods lists the stateless methods that are idempotent by
+// nature and therefore safe to re-issue after a lost response stream even
+// without an idempotency key.
+var reissueSafeMethods = map[string]bool{
+	"server/discover":          true,
+	"tools/list":               true,
+	"prompts/list":             true,
+	"prompts/get":              true,
+	"resources/list":           true,
+	"resources/read":           true,
+	"resources/templates/list": true,
 }
 
 // sendRequest sends a request and waits for its final response, driving the
@@ -423,6 +454,13 @@ func (c *Client) sendRequest(ctx context.Context, req *protocol.Request) (*proto
 		idemKey = uuid.NewString()
 	}
 
+	// A lost response stream is re-issued only when the retry cannot execute
+	// the operation twice: reads are idempotent by nature, and tools/call
+	// carries the idempotency key a dedupe-aware server joins on. Everything
+	// else — session/UI/artifact mutations through RawRequest included —
+	// surfaces CodeStreamLost to the caller, who owns the retry decision.
+	canReissue := idemKey != "" || reissueSafeMethods[req.Method]
+
 	baseParams := req.Params
 	curParams := baseParams // replaced by MRTR retries (original + latest round's input)
 	reissued := false
@@ -456,7 +494,7 @@ func (c *Client) sendRequest(ctx context.Context, req *protocol.Request) (*proto
 		resp, err := c.dispatchAndWait(ctx, attemptReq)
 		if err != nil {
 			var rpcErr *protocol.Error
-			if stateless && !reissued && errors.As(err, &rpcErr) && rpcErr.Code == transport.CodeStreamLost {
+			if stateless && canReissue && !reissued && errors.As(err, &rpcErr) && rpcErr.Code == transport.CodeStreamLost {
 				// Spec-mandated recovery: re-issue as a new request with a
 				// new ID. The unchanged idempotency key lets the server join
 				// the retry to the original run instead of executing twice.
