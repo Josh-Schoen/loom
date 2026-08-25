@@ -891,6 +891,16 @@ func (s *MultiAgentServer) Weave(ctx context.Context, req *loomv1.WeaveRequest) 
 	// turn-executing entry point, unary and streaming alike.
 	ctx = installTurnSlotInfo(ctx, sessionResumed)
 
+	// Door admission (see enterTurnDoor): batch turns queue at the front
+	// door when the active ceiling is reached; interactive turns bypass.
+	// Without this, unary callers (MCP bridge, TUI, grpc-gateway) would
+	// slip past max_active_conversations entirely.
+	releaseDoor, doorErr := enterTurnDoor(ctx, s.logger)
+	if doorErr != nil {
+		return nil, doorErr
+	}
+	defer releaseDoor()
+
 	// Add progress multiplexer to context if available for this agent
 	s.mu.RLock()
 	if pm, ok := s.progressMultiplexers[agentID]; ok {
@@ -1104,6 +1114,14 @@ func (s *MultiAgentServer) StreamWeave(req *loomv1.WeaveRequest, stream loomv1.L
 	// is per-request — edge-triggered, never a conversation-lifetime mark. A
 	// resumed session classifies IN_FLIGHT from its first call of the turn.
 	ctx = installTurnSlotInfo(ctx, sessionResumed)
+
+	// Door admission (see enterTurnDoor): batch turns queue at the front
+	// door when the active ceiling is reached; interactive turns bypass.
+	releaseDoor, doorErr := enterTurnDoor(ctx, s.logger)
+	if doorErr != nil {
+		return doorErr
+	}
+	defer releaseDoor()
 
 	// Register manage_ephemeral_agents tool if not already registered
 	// This allows agents to spawn and despawn sub-agents dynamically

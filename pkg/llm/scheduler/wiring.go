@@ -7,6 +7,7 @@ package scheduler
 
 import (
 	"context"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -162,4 +163,32 @@ func ObserveSuccessForScope(scope string) {
 		return
 	}
 	defaultRegistry.For(scope, Config{}).ObserveSuccess()
+}
+
+// defaultDoor is the process-wide conversation-turn gate. Disabled until
+// looms configures it (SetDoorLimits).
+var (
+	doorMu      sync.Mutex
+	defaultDoor = NewDoorGate(0, 0)
+)
+
+// Door returns the process-wide door gate.
+func Door() *DoorGate {
+	doorMu.Lock()
+	defer doorMu.Unlock()
+	return defaultDoor
+}
+
+// SetDoorLimits configures the process-wide door gate. maxActive <= 0
+// disables gating; maxQueue <= 0 means unbounded queueing.
+//
+// The gate is swapped wholesale, not resized: turns already admitted (or
+// parked) drain on the previous gate while the new gate admits from zero, so
+// reconfiguring under load transiently over-admits up to the sum of the old
+// and new ceilings. Call it once at boot — before the server starts
+// admitting turns — which is what cmd_serve.go does.
+func SetDoorLimits(maxActive, maxQueue int) {
+	doorMu.Lock()
+	defer doorMu.Unlock()
+	defaultDoor = NewDoorGate(maxActive, maxQueue)
 }
