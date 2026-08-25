@@ -619,6 +619,12 @@ func (s *Scheduler) executeWorkflow(ctx context.Context, schedule *loomv1.Schedu
 			zap.String("reason", cancelReason),
 			zap.Int64("duration_ms", duration.Milliseconds()))
 
+		// Move last_status off the previous run's outcome. Without this a
+		// stopped routine reports itself as having last succeeded.
+		if storeErr := s.store.RecordCancelled(ctx, schedule.Id, execution.Error); storeErr != nil {
+			s.logger.Error("Failed to record cancellation", zap.Error(storeErr))
+		}
+
 	case err != nil:
 		execution.Status = "failed"
 		execution.Error = err.Error()
