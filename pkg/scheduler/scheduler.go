@@ -565,14 +565,16 @@ func (s *Scheduler) executeWorkflow(ctx context.Context, schedule *loomv1.Schedu
 	}()
 
 	// Set workflow_id for session continuity in RESUME mode
-	if schedule.Schedule.SessionMode == loomv1.ScheduledSessionMode_SCHEDULED_SESSION_MODE_RESUME {
-		// Use schedule ID as stable workflow_id so agent sessions are deterministic
-		schedule.Pattern.WorkflowId = schedule.Id
-		s.logger.Info("RESUME mode: using stable workflow_id for session continuity",
-			zap.String("schedule_id", schedule.Id),
-			zap.String("workflow_id", schedule.Id))
-	}
-	// For NEW or UNSPECIFIED: leave WorkflowId empty → random UUID in executor
+	// Sessions-runs reconciliation, step 0 (docs/plan-sessions-runs.md):
+	// the workflow id names every stage session, so it must be an id the run
+	// record also carries. RESUME keeps the stable schedule id (continuity is
+	// its point); NEW uses the execution id instead of letting the executor
+	// mint a private uuid nothing else knows.
+	schedule.Pattern.WorkflowId = runWorkflowID(
+		schedule.Schedule.SessionMode, schedule.Id, executionID)
+	s.logger.Info("Workflow id for run",
+		zap.String("schedule_id", schedule.Id),
+		zap.String("workflow_id", schedule.Pattern.WorkflowId))
 
 	// Execute workflow via orchestrator. The execution identity rides the
 	// context so task tracking can stamp the run's board with it — that stamp
@@ -674,6 +676,17 @@ func (s *Scheduler) executeWorkflow(ctx context.Context, schedule *loomv1.Schedu
 	if err := s.store.UpdateNextExecution(ctx, schedule.Id, nextExec); err != nil {
 		s.logger.Error("Failed to update next execution", zap.Error(err))
 	}
+}
+
+// runWorkflowID picks the workflow id that names a run's stage sessions.
+// RESUME: the schedule id, so each run continues the same sessions. NEW (or
+// unspecified): the execution id, so the receipt, the board, and the session
+// names all speak the same key.
+func runWorkflowID(mode loomv1.ScheduledSessionMode, scheduleID, executionID string) string {
+	if mode == loomv1.ScheduledSessionMode_SCHEDULED_SESSION_MODE_RESUME {
+		return scheduleID
+	}
+	return executionID
 }
 
 // stagesFromResult compresses a workflow result into per-stage receipt rows —

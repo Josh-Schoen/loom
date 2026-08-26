@@ -150,3 +150,18 @@ func TestCapOutput(t *testing.T) {
 	assert.True(t, strings.HasSuffix(capped, "[output truncated]"))
 	assert.True(t, utf8.ValidString(capped))
 }
+
+// The workflow id names every stage session, so it must be a key the run
+// record also carries — the execution id for fresh runs, the schedule id for
+// RESUME continuity. A private executor uuid is exactly what this replaces.
+func TestRunWorkflowID(t *testing.T) {
+	if got := runWorkflowID(loomv1.ScheduledSessionMode_SCHEDULED_SESSION_MODE_NEW, "sched", "exec"); got != "exec" {
+		t.Errorf("NEW = %q, want the execution id", got)
+	}
+	if got := runWorkflowID(loomv1.ScheduledSessionMode_SCHEDULED_SESSION_MODE_UNSPECIFIED, "sched", "exec"); got != "exec" {
+		t.Errorf("UNSPECIFIED = %q, want the execution id", got)
+	}
+	if got := runWorkflowID(loomv1.ScheduledSessionMode_SCHEDULED_SESSION_MODE_RESUME, "sched", "exec"); got != "sched" {
+		t.Errorf("RESUME = %q, want the stable schedule id", got)
+	}
+}
