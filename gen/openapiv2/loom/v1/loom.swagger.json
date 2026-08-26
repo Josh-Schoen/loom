@@ -7776,6 +7776,14 @@
             "$ref": "#/definitions/v1StageExecution"
           },
           "title": "Per-stage results, in stage order (populated when the workflow ran far\nenough to produce them)"
+        },
+        "output": {
+          "type": "string",
+          "description": "The run's final merged output, capped at 32KB — what an outcome view\nshows. Full per-stage outputs live in the run's task board notes."
+        },
+        "boardId": {
+          "type": "string",
+          "description": "Task board created for this run, when task tracking is enabled — the\nboard's tasks are the run's live steps and per-stage outputs."
         }
       },
       "description": "ScheduleExecution represents a single execution of a scheduled workflow."

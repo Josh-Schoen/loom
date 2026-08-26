@@ -7,8 +7,10 @@ package scheduler
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -44,6 +46,8 @@ func TestStore_RecordExecutionWithStages(t *testing.T) {
 		Status:      "success",
 		DurationMs:  4200,
 		WorkflowId:  "wf-1",
+		Output:      "3 products moved >10%",
+		BoardId:     "board-1",
 		Stages: []*loomv1.StageExecution{
 			{Stage: 1, AgentId: "data-analyst", DurationMs: 2800, SessionId: "wf-1-stage1-data-analyst", TotalTokens: 1204, CostUsd: 0.021},
 			{Stage: 2, AgentId: "formatter", DurationMs: 1100, SessionId: "wf-1-stage2-formatter", TotalTokens: 512, CostUsd: 0.004},
@@ -63,6 +67,8 @@ func TestStore_RecordExecutionWithStages(t *testing.T) {
 	assert.Equal(t, int32(1204), got.Stages[0].TotalTokens)
 	assert.InDelta(t, 0.021, got.Stages[0].CostUsd, 1e-9)
 	assert.Equal(t, "formatter", got.Stages[1].AgentId)
+	assert.Equal(t, "3 products moved >10%", got.Output)
+	assert.Equal(t, "board-1", got.BoardId)
 }
 
 // A run recorded without stages (a failed run, or history written before the
@@ -133,4 +139,14 @@ func TestStagesFromResult(t *testing.T) {
 	assert.Equal(t, int32(2), stages[1].Stage)
 	assert.Equal(t, "formatter", stages[1].AgentId)
 	assert.Zero(t, stages[1].TotalTokens)
+}
+
+// capOutput must cut long output without producing invalid UTF-8.
+func TestCapOutput(t *testing.T) {
+	assert.Equal(t, "short", capOutput("short"))
+	long := strings.Repeat("é", maxOutputBytes) // 2 bytes per rune
+	capped := capOutput(long)
+	assert.LessOrEqual(t, len(capped), maxOutputBytes+len("\n… [output truncated]"))
+	assert.True(t, strings.HasSuffix(capped, "[output truncated]"))
+	assert.True(t, utf8.ValidString(capped))
 }

@@ -163,6 +163,26 @@ func (s *Store) migrate(ctx context.Context) error {
 		}
 	}
 
+	// Migration v3: the run's final output and its task board
+	if version < 3 {
+		s.logger.Info("Applying migration v3: execution output and board link")
+
+		for _, m := range []string{
+			"ALTER TABLE schedule_executions ADD COLUMN output TEXT",
+			"ALTER TABLE schedule_executions ADD COLUMN board_id TEXT",
+		} {
+			if _, err := s.db.ExecContext(ctx, m); err != nil {
+				if !isDuplicateColumnError(err) {
+					return fmt.Errorf("migration v3 failed: %w", err)
+				}
+			}
+		}
+
+		if _, err := s.db.ExecContext(ctx, "PRAGMA user_version = 3"); err != nil {
+			return fmt.Errorf("failed to update schema version: %w", err)
+		}
+	}
+
 	return nil
 }
 
@@ -705,8 +725,8 @@ func (s *Store) RecordExecution(ctx context.Context, exec *loomv1.ScheduleExecut
 	}
 
 	query := `
-		INSERT INTO schedule_executions (schedule_id, execution_id, started_at, completed_at, status, error, duration_ms, workflow_id, stages_json)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO schedule_executions (schedule_id, execution_id, started_at, completed_at, status, error, duration_ms, workflow_id, stages_json, output, board_id)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`
 
 	_, err = s.db.ExecContext(ctx, query,
@@ -719,6 +739,8 @@ func (s *Store) RecordExecution(ctx context.Context, exec *loomv1.ScheduleExecut
 		exec.DurationMs,
 		exec.WorkflowId,
 		stagesJSON,
+		exec.Output,
+		exec.BoardId,
 	)
 
 	if err != nil {
@@ -734,7 +756,7 @@ func (s *Store) GetExecutionHistory(ctx context.Context, scheduleID string, limi
 	defer s.mu.RUnlock()
 
 	query := `
-		SELECT execution_id, started_at, completed_at, status, error, duration_ms, workflow_id, stages_json
+		SELECT execution_id, started_at, completed_at, status, error, duration_ms, workflow_id, stages_json, output, board_id
 		FROM schedule_executions
 		WHERE schedule_id = ?
 		ORDER BY started_at DESC
@@ -756,6 +778,8 @@ func (s *Store) GetExecutionHistory(ctx context.Context, scheduleID string, limi
 			errorMsg   sql.NullString
 			workflowID sql.NullString
 			stagesJSON sql.NullString
+			output     sql.NullString
+			boardID    sql.NullString
 		)
 
 		err := rows.Scan(
@@ -767,6 +791,8 @@ func (s *Store) GetExecutionHistory(ctx context.Context, scheduleID string, limi
 			&exec.DurationMs,
 			&workflowID,
 			&stagesJSON,
+			&output,
+			&boardID,
 		)
 
 		if err != nil {
@@ -775,6 +801,12 @@ func (s *Store) GetExecutionHistory(ctx context.Context, scheduleID string, limi
 
 		if errorMsg.Valid {
 			exec.Error = errorMsg.String
+		}
+		if output.Valid {
+			exec.Output = output.String
+		}
+		if boardID.Valid {
+			exec.BoardId = boardID.String
 		}
 		if stagesJSON.Valid {
 			stages, stageErr := unmarshalStages(stagesJSON.String)

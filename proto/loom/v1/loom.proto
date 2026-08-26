@@ -2102,6 +2102,14 @@ message ScheduleExecution {
   // Per-stage results, in stage order (populated when the workflow ran far
   // enough to produce them)
   repeated StageExecution stages = 8;
+
+  // The run's final merged output, capped at 32KB — what an outcome view
+  // shows. Full per-stage outputs live in the run's task board notes.
+  string output = 9;
+
+  // Task board created for this run, when task tracking is enabled — the
+  // board's tasks are the run's live steps and per-stage outputs.
+  string board_id = 10;
 }
 
 // StageExecution summarizes one stage of a scheduled workflow execution:

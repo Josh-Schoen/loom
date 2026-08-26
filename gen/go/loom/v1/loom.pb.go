@@ -6913,7 +6913,13 @@ type ScheduleExecution struct {
 	WorkflowId string `protobuf:"bytes,7,opt,name=workflow_id,json=workflowId,proto3" json:"workflow_id,omitempty"`
 	// Per-stage results, in stage order (populated when the workflow ran far
 	// enough to produce them)
-	Stages        []*StageExecution `protobuf:"bytes,8,rep,name=stages,proto3" json:"stages,omitempty"`
+	Stages []*StageExecution `protobuf:"bytes,8,rep,name=stages,proto3" json:"stages,omitempty"`
+	// The run's final merged output, capped at 32KB — what an outcome view
+	// shows. Full per-stage outputs live in the run's task board notes.
+	Output string `protobuf:"bytes,9,opt,name=output,proto3" json:"output,omitempty"`
+	// Task board created for this run, when task tracking is enabled — the
+	// board's tasks are the run's live steps and per-stage outputs.
+	BoardId       string `protobuf:"bytes,10,opt,name=board_id,json=boardId,proto3" json:"board_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -7002,6 +7008,20 @@ func (x *ScheduleExecution) GetStages() []*StageExecution {
 		return x.Stages
 	}
 	return nil
+}
+
+func (x *ScheduleExecution) GetOutput() string {
+	if x != nil {
+		return x.Output
+	}
+	return ""
+}
+
+func (x *ScheduleExecution) GetBoardId() string {
+	if x != nil {
+		return x.BoardId
+	}
+	return ""
 }
 
 // StageExecution summarizes one stage of a scheduled workflow execution:
@@ -11440,7 +11460,7 @@ const file_loom_v1_loom_proto_rawDesc = "" +
 	"\x06reason\x18\x02 \x01(\tR\x06reason\"Y\n" +
 	"\x1fCancelWorkflowExecutionResponse\x12\x1c\n" +
 	"\tcancelled\x18\x01 \x01(\bR\tcancelled\x12\x18\n" +
-	"\amessage\x18\x02 \x01(\tR\amessage\"\x99\x02\n" +
+	"\amessage\x18\x02 \x01(\tR\amessage\"\xcc\x02\n" +
 	"\x11ScheduleExecution\x12!\n" +
 	"\fexecution_id\x18\x01 \x01(\tR\vexecutionId\x12\x1d\n" +
 	"\n" +
@@ -11452,7 +11472,10 @@ const file_loom_v1_loom_proto_rawDesc = "" +
 	"durationMs\x12\x1f\n" +
 	"\vworkflow_id\x18\a \x01(\tR\n" +
 	"workflowId\x12/\n" +
-	"\x06stages\x18\b \x03(\v2\x17.loom.v1.StageExecutionR\x06stages\"\xbf\x01\n" +
+	"\x06stages\x18\b \x03(\v2\x17.loom.v1.StageExecutionR\x06stages\x12\x16\n" +
+	"\x06output\x18\t \x01(\tR\x06output\x12\x19\n" +
+	"\bboard_id\x18\n" +
+	" \x01(\tR\aboardId\"\xbf\x01\n" +
 	"\x0eStageExecution\x12\x14\n" +
 	"\x05stage\x18\x01 \x01(\x05R\x05stage\x12\x19\n" +
 	"\bagent_id\x18\x02 \x01(\tR\aagentId\x12\x1f\n" +

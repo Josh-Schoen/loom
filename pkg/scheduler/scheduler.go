@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 	"github.com/robfig/cron/v3"
@@ -572,7 +573,13 @@ func (s *Scheduler) executeWorkflow(ctx context.Context, schedule *loomv1.Schedu
 	}
 	// For NEW or UNSPECIFIED: leave WorkflowId empty → random UUID in executor
 
-	// Execute workflow via orchestrator
+	// Execute workflow via orchestrator. The execution identity rides the
+	// context so task tracking can stamp the run's board with it — that stamp
+	// is how run history and the board find each other.
+	execCtx = orchestration.WithExecutionInfo(execCtx, orchestration.ExecutionInfo{
+		ScheduleID:  schedule.Id,
+		ExecutionID: executionID,
+	})
 	// TODO: Add variable interpolation support
 	result, err := s.orchestrator.ExecutePattern(execCtx, schedule.Pattern)
 
@@ -597,6 +604,8 @@ func (s *Scheduler) executeWorkflow(ctx context.Context, schedule *loomv1.Schedu
 		DurationMs:  duration.Milliseconds(),
 		WorkflowId:  workflowID,
 		Stages:      stagesFromResult(result),
+		Output:      capOutput(result.GetMergedOutput()),
+		BoardId:     result.GetMetadata()["board_id"],
 	}
 
 	// A cancelled run is not a failed run. Counting an operator's stop as a
@@ -694,6 +703,23 @@ func stagesFromResult(result *loomv1.WorkflowResult) []*loomv1.StageExecution {
 		stages = append(stages, st)
 	}
 	return stages
+}
+
+// maxOutputBytes caps the output stored per execution. History is read far
+// more often than any single run's full output; the cap keeps a chatty run
+// from bloating every history query. Full stage outputs live in task notes.
+const maxOutputBytes = 32 * 1024
+
+// capOutput truncates on a rune boundary so the stored text stays valid UTF-8.
+func capOutput(s string) string {
+	if len(s) <= maxOutputBytes {
+		return s
+	}
+	cut := s[:maxOutputBytes]
+	for len(cut) > 0 && !utf8.ValidString(cut) {
+		cut = cut[:len(cut)-1]
+	}
+	return cut + "\n… [output truncated]"
 }
 
 // calculateNextExecution calculates the next execution time for a schedule.
