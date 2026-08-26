@@ -17,6 +17,7 @@ package orchestration
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"go.uber.org/zap"
@@ -450,8 +451,9 @@ func (t *TaskTrackedOrchestrator) recordResults(
 			continue
 		}
 
-		// Update notes with the stage output.
-		output := agentResult.Output
+		// Update notes with the stage output. Sanitized: proto3 cannot marshal
+		// invalid UTF-8, and tool output is arbitrary bytes.
+		output := strings.ToValidUTF8(agentResult.Output, "\uFFFD")
 		if len(output) > 1000 {
 			output = output[:1000] + "\n[output truncated]"
 		}

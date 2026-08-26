@@ -17,6 +17,8 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"strings"
+	"unicode/utf8"
 
 	"go.uber.org/zap"
 	"google.golang.org/grpc/codes"
@@ -262,18 +264,31 @@ func busMessageToTaskUpdate(msg *loomv1.BusMessage) *loomv1.TaskUpdate {
 	return update
 }
 
+// utf8Clean replaces invalid UTF-8 with the replacement character so proto3
+// marshaling cannot fail on free-text fields.
+func utf8Clean(s string) string {
+	if utf8.ValidString(s) {
+		return s
+	}
+	return strings.ToValidUTF8(s, "\uFFFD")
+}
+
 func taskToProto(t *task.Task) *loomv1.Task {
 	if t == nil {
 		return nil
 	}
+	// proto3 refuses to marshal invalid UTF-8, and notes carry raw stage
+	// output — one tool returning binary (a compressed web page) made every
+	// ListTasks on the board fail with Internal. Sanitize all free text at
+	// the wire, which also heals rows written before the write-path guard.
 	p := &loomv1.Task{
 		Id:                 t.ID,
-		Title:              t.Title,
-		Description:        t.Description,
-		Objective:          t.Objective,
-		Approach:           t.Approach,
-		AcceptanceCriteria: t.AcceptanceCriteria,
-		Notes:              t.Notes,
+		Title:              utf8Clean(t.Title),
+		Description:        utf8Clean(t.Description),
+		Objective:          utf8Clean(t.Objective),
+		Approach:           utf8Clean(t.Approach),
+		AcceptanceCriteria: utf8Clean(t.AcceptanceCriteria),
+		Notes:              utf8Clean(t.Notes),
 		Status:             t.Status,
 		Priority:           t.Priority,
 		Category:           t.Category,

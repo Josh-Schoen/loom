@@ -9,6 +9,7 @@ import (
 	"context"
 	"fmt"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 	"unicode/utf8"
@@ -712,6 +713,8 @@ const maxOutputBytes = 32 * 1024
 
 // capOutput truncates on a rune boundary so the stored text stays valid UTF-8.
 func capOutput(s string) string {
+	// Tool output is arbitrary bytes; proto3 refuses invalid UTF-8.
+	s = strings.ToValidUTF8(s, "\uFFFD")
 	if len(s) <= maxOutputBytes {
 		return s
 	}
