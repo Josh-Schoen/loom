@@ -8,6 +8,7 @@ package scheduler
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"sync"
 	"time"
 
@@ -37,17 +38,25 @@ type Scheduler struct {
 	mu               sync.RWMutex
 	schedules        map[string]*loomv1.ScheduledWorkflow
 	runningWorkflows map[string]string // schedule_id -> execution_id
-	cronEngine       *cron.Cron
-	cronEntries      map[string]cron.EntryID
-	store            *Store
-	orchestrator     *orchestration.Orchestrator
-	registry         *agent.Registry
-	tracer           observability.Tracer
-	logger           *zap.Logger
-	loader           *Loader
-	stopCh           chan struct{}
-	wg               sync.WaitGroup
-	config           Config
+	// runningCancels holds each in-flight execution's cancel func, keyed by
+	// execution ID. Without it the only way to stop a hung workflow is to wait
+	// out max_execution_seconds, during which skip_if_running silently skips
+	// every scheduled run.
+	runningCancels map[string]context.CancelFunc
+	// cancelReasons records why an execution was cancelled, so the history entry
+	// can distinguish an operator stop from a timeout or a crash.
+	cancelReasons map[string]string
+	cronEngine    *cron.Cron
+	cronEntries   map[string]cron.EntryID
+	store         *Store
+	orchestrator  *orchestration.Orchestrator
+	registry      *agent.Registry
+	tracer        observability.Tracer
+	logger        *zap.Logger
+	loader        *Loader
+	stopCh        chan struct{}
+	wg            sync.WaitGroup
+	config        Config
 }
 
 // NewScheduler creates a new workflow scheduler.
@@ -78,6 +87,8 @@ func NewScheduler(ctx context.Context, config Config) (*Scheduler, error) {
 	s := &Scheduler{
 		schedules:        make(map[string]*loomv1.ScheduledWorkflow),
 		runningWorkflows: make(map[string]string),
+		runningCancels:   make(map[string]context.CancelFunc),
+		cancelReasons:    make(map[string]string),
 		cronEngine:       cronEngine,
 		cronEntries:      make(map[string]cron.EntryID),
 		store:            store,
@@ -380,6 +391,57 @@ func (s *Scheduler) TriggerNow(ctx context.Context, scheduleID string, skipIfRun
 	return executionID, nil
 }
 
+// CancelExecution stops a running execution.
+//
+// Returns false when no execution with that ID is in flight — already finished,
+// or never started. That is deliberately not an error: someone cancelling a run
+// that just completed has got the outcome they wanted, and turning the race into
+// a failure would only make the UI apologise for succeeding.
+//
+// Cancellation is cooperative. The execution's context is cancelled, which
+// unwinds the orchestrator at its next context check; work already committed by
+// earlier stages is not rolled back. The reason is recorded so the history entry
+// reads as an operator stop rather than a crash.
+func (s *Scheduler) CancelExecution(ctx context.Context, executionID, reason string) (bool, error) {
+	if executionID == "" {
+		return false, fmt.Errorf("execution_id is required")
+	}
+
+	s.mu.Lock()
+	cancel, running := s.runningCancels[executionID]
+	if running {
+		// Recorded before cancelling so executeWorkflow's classification cannot
+		// observe the cancelled context before it can see the reason.
+		s.cancelReasons[executionID] = reason
+	}
+	s.mu.Unlock()
+
+	if !running {
+		return false, nil
+	}
+
+	s.logger.Info("Cancelling workflow execution",
+		zap.String("execution_id", executionID),
+		zap.String("reason", reason))
+
+	cancel()
+	return true, nil
+}
+
+// RunningExecutions returns the execution IDs currently in flight, keyed by
+// schedule ID. Useful for an operations view that needs to offer a stop button
+// only where there is something to stop.
+func (s *Scheduler) RunningExecutions() map[string]string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	out := make(map[string]string, len(s.runningWorkflows))
+	for scheduleID, execID := range s.runningWorkflows {
+		out[scheduleID] = execID
+	}
+	return out
+}
+
 // GetSchedule retrieves a schedule by ID.
 func (s *Scheduler) GetSchedule(ctx context.Context, scheduleID string) (*loomv1.ScheduledWorkflow, error) {
 	return s.store.Get(ctx, scheduleID)
@@ -488,6 +550,18 @@ func (s *Scheduler) executeWorkflow(ctx context.Context, schedule *loomv1.Schedu
 	execCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
+	// Publish the cancel func so CancelExecution can reach this run. Registered
+	// after the running-marker above and torn down alongside it.
+	s.mu.Lock()
+	s.runningCancels[executionID] = cancel
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		delete(s.runningCancels, executionID)
+		delete(s.cancelReasons, executionID)
+		s.mu.Unlock()
+	}()
+
 	// Set workflow_id for session continuity in RESUME mode
 	if schedule.Schedule.SessionMode == loomv1.ScheduledSessionMode_SCHEDULED_SESSION_MODE_RESUME {
 		// Use schedule ID as stable workflow_id so agent sessions are deterministic
@@ -500,7 +574,7 @@ func (s *Scheduler) executeWorkflow(ctx context.Context, schedule *loomv1.Schedu
 
 	// Execute workflow via orchestrator
 	// TODO: Add variable interpolation support
-	_, err := s.orchestrator.ExecutePattern(execCtx, schedule.Pattern)
+	result, err := s.orchestrator.ExecutePattern(execCtx, schedule.Pattern)
 
 	duration := time.Since(startTime)
 
@@ -522,9 +596,32 @@ func (s *Scheduler) executeWorkflow(ctx context.Context, schedule *loomv1.Schedu
 		CompletedAt: time.Now().Unix(),
 		DurationMs:  duration.Milliseconds(),
 		WorkflowId:  workflowID,
+		Stages:      stagesFromResult(result),
 	}
 
-	if err != nil {
+	// A cancelled run is not a failed run. Counting an operator's stop as a
+	// failure would corrupt the success rate the UI uses to convey trust, and
+	// would make a deliberately stopped routine look broken.
+	s.mu.RLock()
+	cancelReason, wasCancelled := s.cancelReasons[executionID]
+	s.mu.RUnlock()
+
+	switch {
+	case wasCancelled:
+		execution.Status = "cancelled"
+		if cancelReason != "" {
+			execution.Error = cancelReason
+		} else {
+			execution.Error = "cancelled by operator"
+		}
+
+		s.logger.Info("Workflow execution cancelled",
+			zap.String("schedule_id", schedule.Id),
+			zap.String("execution_id", executionID),
+			zap.String("reason", cancelReason),
+			zap.Int64("duration_ms", duration.Milliseconds()))
+
+	case err != nil:
 		execution.Status = "failed"
 		execution.Error = err.Error()
 
@@ -537,7 +634,8 @@ func (s *Scheduler) executeWorkflow(ctx context.Context, schedule *loomv1.Schedu
 		if err := s.store.RecordFailure(ctx, schedule.Id, err.Error()); err != nil {
 			s.logger.Error("Failed to record failure", zap.Error(err))
 		}
-	} else {
+
+	default:
 		execution.Status = "success"
 
 		s.logger.Info("Workflow execution succeeded",
@@ -566,6 +664,36 @@ func (s *Scheduler) executeWorkflow(ctx context.Context, schedule *loomv1.Schedu
 	if err := s.store.UpdateNextExecution(ctx, schedule.Id, nextExec); err != nil {
 		s.logger.Error("Failed to update next execution", zap.Error(err))
 	}
+}
+
+// stagesFromResult compresses a workflow result into per-stage receipt rows —
+// who ran, how long, what it cost, which session holds the work. Stage outputs
+// are deliberately not copied: they live in each stage's session, and schedule
+// history is read far more often than any one run's output.
+func stagesFromResult(result *loomv1.WorkflowResult) []*loomv1.StageExecution {
+	if result == nil || len(result.AgentResults) == 0 {
+		return nil
+	}
+	stages := make([]*loomv1.StageExecution, 0, len(result.AgentResults))
+	for i, ar := range result.AgentResults {
+		st := &loomv1.StageExecution{
+			// Position defaults to result order; the executor's own stage
+			// number wins when present (fork-join results interleave).
+			Stage:      int32(i + 1), //nolint:gosec // result lists are small
+			AgentId:    ar.AgentId,
+			DurationMs: ar.DurationMs,
+			SessionId:  ar.Metadata["session_id"],
+		}
+		if n, convErr := strconv.Atoi(ar.Metadata["stage"]); convErr == nil && n > 0 {
+			st.Stage = int32(n) //nolint:gosec // stage counts are small
+		}
+		if ar.Cost != nil {
+			st.TotalTokens = ar.Cost.TotalTokens
+			st.CostUsd = ar.Cost.CostUsd
+		}
+		stages = append(stages, st)
+	}
+	return stages
 }
 
 // calculateNextExecution calculates the next execution time for a schedule.

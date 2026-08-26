@@ -618,6 +618,13 @@
             "in": "query",
             "required": false,
             "type": "boolean"
+          },
+          {
+            "name": "sessionId",
+            "description": "Filter to artifacts belonging to one session (optional). Unset means no\nsession filtering, preserving existing behaviour. This is what lets a\nremote surface render \"the files this session produced\" — the local\nartifact store has always supported it (artifacts.Filter.SessionID); the\nrequest message could not express it.",
+            "in": "query",
+            "required": false,
+            "type": "string"
           }
         ],
         "tags": [
@@ -709,6 +716,13 @@
           {
             "name": "name",
             "description": "Artifact name (alternative lookup if ID not provided)",
+            "in": "query",
+            "required": false,
+            "type": "string"
+          },
+          {
+            "name": "sessionId",
+            "description": "Session to scope a name lookup to (optional). Names are only unique within\na session, so a bare name lookup from a remote client is ambiguous without\nthis. Ignored when id is set. Unset falls back to the session carried in\nthe call context, preserving existing behaviour for in-session callers.",
             "in": "query",
             "required": false,
             "type": "string"
@@ -2869,6 +2883,47 @@
         ]
       }
     },
+    "/v1/workflows/executions/{executionId}:cancel": {
+      "post": {
+        "summary": "CancelWorkflowExecution stops an execution that is currently running.",
+        "description": "Pausing a schedule prevents future runs but does nothing about one already\nin flight, and max_execution_seconds only detects a stuck run after the\nfact. This is the operator's stop button: without it a workflow that hangs\nholds its schedule's slot until the timeout expires, and skip_if_running\nsilently skips every run in the meantime.\n\nCancellation is cooperative — the execution's context is cancelled and the\nrun is recorded as cancelled. Work already committed by earlier stages is\nnot rolled back.",
+        "operationId": "LoomService_CancelWorkflowExecution",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/v1CancelWorkflowExecutionResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "executionId",
+            "description": "Execution ID to cancel, as reported by ScheduledWorkflow.current_execution_id\nor by the response to TriggerScheduledWorkflow.",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/LoomServiceCancelWorkflowExecutionBody"
+            }
+          }
+        ],
+        "tags": [
+          "LoomService"
+        ]
+      }
+    },
     "/v1/workflows/schedules": {
       "get": {
         "summary": "ListScheduledWorkflows lists all scheduled workflows.",
@@ -3307,6 +3362,16 @@
         }
       },
       "description": "AnswerClarificationRequest provides an answer to a clarification question."
+    },
+    "LoomServiceCancelWorkflowExecutionBody": {
+      "type": "object",
+      "properties": {
+        "reason": {
+          "type": "string",
+          "description": "Optional human-readable reason, recorded in the execution history so the\nrecord distinguishes an operator stop from a crash."
+        }
+      },
+      "description": "CancelWorkflowExecutionRequest stops a running execution."
     },
     "LoomServicePauseScheduleBody": {
       "type": "object",
@@ -4168,6 +4233,10 @@
           "type": "string",
           "format": "int64",
           "title": "Soft delete timestamp (Unix seconds, optional)"
+        },
+        "sessionId": {
+          "type": "string",
+          "description": "Session this artifact belongs to. Empty for artifacts created outside a\nsession (user uploads, pre-session tooling). The store has recorded this\nsince sessions were introduced; it was simply never put on the wire, which\nleft remote clients unable to tell whose files they were looking at."
         }
       },
       "title": "Artifact represents a file in $LOOM_DATA_DIR/artifacts/"
@@ -4283,6 +4352,20 @@
         }
       },
       "description": "BusMessage is the envelope for pub/sub messages broadcast to topic subscribers.\nUnlike point-to-point CommunicationMessage, BusMessage is one-to-many."
+    },
+    "v1CancelWorkflowExecutionResponse": {
+      "type": "object",
+      "properties": {
+        "cancelled": {
+          "type": "boolean",
+          "description": "True when a running execution was found and signalled. False means the\nexecution was already finished or was never running — not an error, since\na user cancelling a run that just completed has got what they wanted."
+        },
+        "message": {
+          "type": "string",
+          "description": "Human-readable outcome, suitable for showing directly."
+        }
+      },
+      "description": "CancelWorkflowExecutionResponse reports what the cancellation did."
     },
     "v1CertificateInfo": {
       "type": "object",
@@ -7685,6 +7768,14 @@
         "workflowId": {
           "type": "string",
           "title": "Workflow ID used for this execution"
+        },
+        "stages": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "$ref": "#/definitions/v1StageExecution"
+          },
+          "title": "Per-stage results, in stage order (populated when the workflow ran far\nenough to produce them)"
         }
       },
       "description": "ScheduleExecution represents a single execution of a scheduled workflow."
@@ -8548,6 +8639,40 @@
       "default": "SPAWN_TRIGGER_TYPE_UNSPECIFIED",
       "description": "- CONSENSUS_NOT_REACHED: Spawn when consensus is not reached in debate/swarm\n - CONFIDENCE_BELOW: Spawn when average confidence falls below threshold\n - TIE_DETECTED: Spawn when voting results in a tie\n - ESCALATION_REQUESTED: Spawn when agent explicitly requests escalation\n - ALWAYS: Spawn unconditionally (for testing)\n - CUSTOM: Custom condition evaluated at runtime",
       "title": "SpawnTriggerType enumerates trigger conditions"
+    },
+    "v1StageExecution": {
+      "type": "object",
+      "properties": {
+        "stage": {
+          "type": "integer",
+          "format": "int32",
+          "title": "1-based stage position in the pipeline"
+        },
+        "agentId": {
+          "type": "string",
+          "title": "Agent that ran the stage"
+        },
+        "durationMs": {
+          "type": "string",
+          "format": "int64",
+          "title": "Stage duration in milliseconds"
+        },
+        "sessionId": {
+          "type": "string",
+          "title": "Session the stage ran in — transcript and artifacts are scoped to it"
+        },
+        "totalTokens": {
+          "type": "integer",
+          "format": "int32",
+          "title": "Total tokens used by the stage"
+        },
+        "costUsd": {
+          "type": "number",
+          "format": "double",
+          "title": "Cost in USD for the stage"
+        }
+      },
+      "description": "StageExecution summarizes one stage of a scheduled workflow execution:\nenough for a receipt — who ran, how long, what it cost, and which session\nholds the transcript and artifacts. Stage outputs are deliberately not\nduplicated here; they live in the stage's session."
     },
     "v1StepResult": {
       "type": "object",

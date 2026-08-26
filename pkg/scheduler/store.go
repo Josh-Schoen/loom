@@ -8,7 +8,9 @@ package scheduler
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -145,14 +147,87 @@ func (s *Store) migrate(ctx context.Context) error {
 		}
 	}
 
+	// Migration v2: per-stage receipt rows on each execution
+	if version < 2 {
+		s.logger.Info("Applying migration v2: per-stage execution records")
+
+		if _, err := s.db.ExecContext(ctx,
+			"ALTER TABLE schedule_executions ADD COLUMN stages_json TEXT"); err != nil {
+			if !isDuplicateColumnError(err) {
+				return fmt.Errorf("migration v2 failed: %w", err)
+			}
+		}
+
+		if _, err := s.db.ExecContext(ctx, "PRAGMA user_version = 2"); err != nil {
+			return fmt.Errorf("failed to update schema version: %w", err)
+		}
+	}
+
 	return nil
 }
 
-// isDuplicateColumnError checks if an error is a SQLite "duplicate column name" error.
+// stageRow is the stored form of a StageExecution. A named struct (rather than
+// serializing the proto type) keeps the stored shape independent of generated
+// code, so proto churn cannot silently change what old rows mean.
+type stageRow struct {
+	Stage       int32   `json:"stage"`
+	AgentID     string  `json:"agent_id"`
+	DurationMs  int64   `json:"duration_ms"`
+	SessionID   string  `json:"session_id,omitempty"`
+	TotalTokens int32   `json:"total_tokens,omitempty"`
+	CostUsd     float64 `json:"cost_usd,omitempty"`
+}
+
+func marshalStages(stages []*loomv1.StageExecution) (string, error) {
+	if len(stages) == 0 {
+		return "", nil
+	}
+	rows := make([]stageRow, 0, len(stages))
+	for _, st := range stages {
+		rows = append(rows, stageRow{
+			Stage:       st.Stage,
+			AgentID:     st.AgentId,
+			DurationMs:  st.DurationMs,
+			SessionID:   st.SessionId,
+			TotalTokens: st.TotalTokens,
+			CostUsd:     st.CostUsd,
+		})
+	}
+	b, err := json.Marshal(rows)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal stages: %w", err)
+	}
+	return string(b), nil
+}
+
+func unmarshalStages(data string) ([]*loomv1.StageExecution, error) {
+	if data == "" {
+		return nil, nil
+	}
+	var rows []stageRow
+	if err := json.Unmarshal([]byte(data), &rows); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal stages: %w", err)
+	}
+	stages := make([]*loomv1.StageExecution, 0, len(rows))
+	for _, r := range rows {
+		stages = append(stages, &loomv1.StageExecution{
+			Stage:       r.Stage,
+			AgentId:     r.AgentID,
+			DurationMs:  r.DurationMs,
+			SessionId:   r.SessionID,
+			TotalTokens: r.TotalTokens,
+			CostUsd:     r.CostUsd,
+		})
+	}
+	return stages, nil
+}
+
+// isDuplicateColumnError checks if an error is a SQLite "duplicate column
+// name" error. Matched by substring rather than per-column literals so every
+// migration's ALTER TABLE is covered, not just the ones someone remembered to
+// list here.
 func isDuplicateColumnError(err error) bool {
-	return err != nil && fmt.Sprintf("%v", err) != "" &&
-		(fmt.Sprintf("%v", err) == "duplicate column name: last_workflow_id" ||
-			fmt.Sprintf("%v", err) == "duplicate column name: workflow_id")
+	return err != nil && strings.Contains(err.Error(), "duplicate column name")
 }
 
 // Create persists a new scheduled workflow.
@@ -624,12 +699,17 @@ func (s *Store) RecordExecution(ctx context.Context, exec *loomv1.ScheduleExecut
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	stagesJSON, err := marshalStages(exec.Stages)
+	if err != nil {
+		return err
+	}
+
 	query := `
-		INSERT INTO schedule_executions (schedule_id, execution_id, started_at, completed_at, status, error, duration_ms, workflow_id)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO schedule_executions (schedule_id, execution_id, started_at, completed_at, status, error, duration_ms, workflow_id, stages_json)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`
 
-	_, err := s.db.ExecContext(ctx, query,
+	_, err = s.db.ExecContext(ctx, query,
 		scheduleID,
 		exec.ExecutionId,
 		exec.StartedAt,
@@ -638,6 +718,7 @@ func (s *Store) RecordExecution(ctx context.Context, exec *loomv1.ScheduleExecut
 		exec.Error,
 		exec.DurationMs,
 		exec.WorkflowId,
+		stagesJSON,
 	)
 
 	if err != nil {
@@ -653,7 +734,7 @@ func (s *Store) GetExecutionHistory(ctx context.Context, scheduleID string, limi
 	defer s.mu.RUnlock()
 
 	query := `
-		SELECT execution_id, started_at, completed_at, status, error, duration_ms, workflow_id
+		SELECT execution_id, started_at, completed_at, status, error, duration_ms, workflow_id, stages_json
 		FROM schedule_executions
 		WHERE schedule_id = ?
 		ORDER BY started_at DESC
@@ -674,6 +755,7 @@ func (s *Store) GetExecutionHistory(ctx context.Context, scheduleID string, limi
 			exec       loomv1.ScheduleExecution
 			errorMsg   sql.NullString
 			workflowID sql.NullString
+			stagesJSON sql.NullString
 		)
 
 		err := rows.Scan(
@@ -684,6 +766,7 @@ func (s *Store) GetExecutionHistory(ctx context.Context, scheduleID string, limi
 			&errorMsg,
 			&exec.DurationMs,
 			&workflowID,
+			&stagesJSON,
 		)
 
 		if err != nil {
@@ -692,6 +775,18 @@ func (s *Store) GetExecutionHistory(ctx context.Context, scheduleID string, limi
 
 		if errorMsg.Valid {
 			exec.Error = errorMsg.String
+		}
+		if stagesJSON.Valid {
+			stages, stageErr := unmarshalStages(stagesJSON.String)
+			if stageErr != nil {
+				// A corrupt stage record should not make the whole history
+				// unreadable — the run row itself is still true.
+				s.logger.Warn("Failed to decode stage records",
+					zap.String("execution_id", exec.ExecutionId),
+					zap.Error(stageErr))
+			} else {
+				exec.Stages = stages
+			}
 		}
 		if workflowID.Valid {
 			exec.WorkflowId = workflowID.String
