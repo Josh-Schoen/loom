@@ -497,8 +497,17 @@ func (t *TaskTrackedOrchestrator) findResumableBoard(ctx context.Context, patter
 		return "", 0
 	}
 
+	// Scope resume to the same scheduled routine when the caller identified
+	// one. Matching on pattern type alone let any pipeline resume any other
+	// pipeline's unfinished board — one routine's failed run polluting the
+	// next routine's tasks and stage bookkeeping.
+	info, hasInfo := ExecutionInfoFrom(ctx)
+
 	for _, b := range boards {
 		if b.Metadata["pattern_type"] != patternType || b.Metadata["created_by"] != "task_tracked_orchestrator" {
+			continue
+		}
+		if hasInfo && info.ScheduleID != "" && b.Metadata["schedule_id"] != info.ScheduleID {
 			continue
 		}
 
