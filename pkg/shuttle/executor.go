@@ -292,8 +292,11 @@ func (e *Executor) handleLargeResult(ctx context.Context, result *Result) error 
 		return fmt.Errorf("failed to serialize result: %w", err)
 	}
 
-	// Check if result exceeds threshold
-	if int64(len(data)) <= e.threshold {
+	// Check if result exceeds threshold. Negative threshold means inline
+	// everything (storage.DefaultSharedMemoryThreshold's documented
+	// meaning) — without this guard, -1 silently inverted into
+	// "reference everything".
+	if e.threshold < 0 || int64(len(data)) <= e.threshold {
 		return nil // Small result, keep inline
 	}
 

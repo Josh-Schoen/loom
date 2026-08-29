@@ -1158,7 +1158,11 @@ func setDefaults() {
 	defaultCachePath := filepath.Join(os.TempDir(), "loom", "cache")
 	viper.SetDefault("shared_memory.enabled", true)
 	viper.SetDefault("shared_memory.max_memory_bytes", 1024*1024*1024) // 1GB
-	viper.SetDefault("shared_memory.threshold_bytes", 0)               // 0 bytes - all tool results stored as references
+// Inline tool results up to 16KB (~4K tokens): agents must SEE small
+	// results to answer with them; a 0 threshold hid every result behind a
+	// memory reference and agents groped at previews until giving up.
+	// 0 remains a valid explicit always-reference choice; -1 inlines all.
+	viper.SetDefault("shared_memory.threshold_bytes", 16384)               // 0 bytes - all tool results stored as references
 	viper.SetDefault("shared_memory.compression_threshold", 1024*1024) // 1MB
 	viper.SetDefault("shared_memory.ttl_seconds", 3600)                // 1 hour
 	viper.SetDefault("shared_memory.disk_overflow_enabled", true)      // CRITICAL: Prevent data loss on memory pressure
