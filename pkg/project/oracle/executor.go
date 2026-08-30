@@ -125,6 +125,19 @@ func (e *VerifyingExecutor) Execute(ctx context.Context, toolName string, params
 	return result, nil
 }
 
+// explainParams narrows the execute call's params to just the statement:
+// execute-only options (max_rows, timeouts) fail the explain tool's schema
+// validation, which was the first live skip this check ever produced.
+func explainParams(params map[string]interface{}) map[string]interface{} {
+	out := make(map[string]interface{}, 1)
+	for _, key := range sqlParamKeys {
+		if sql, ok := params[key].(string); ok && strings.TrimSpace(sql) != "" {
+			out[key] = sql
+		}
+	}
+	return out
+}
+
 // predictionRecord never panics: a panic in check logic becomes a skip.
 func predictionRecord(p Prediction, explainTool string, explainErr error, result *shuttle.Result) (record VerificationRecord) {
 	start := time.Now()
@@ -142,7 +155,16 @@ func predictionRecord(p Prediction, explainTool string, explainErr error, result
 		return newRecord(RungExplainPrediction, VerdictSkip,
 			fmt.Sprintf("%s not available: %v", explainTool, explainErr), start)
 	}
-	return PredictionCheck(p, ActualRows(result))
+	rows, truncated := actualRowsInfo(result)
+	// A truncated result's row count is a floor, not the actual — comparing
+	// it to the estimate manufactures false warnings, the one failure the
+	// counter-metrics name as worse than no badge.
+	if truncated && rows >= 0 {
+		return newRecord(RungExplainPrediction, VerdictSkip,
+			fmt.Sprintf("explain predicted %d rows (%s); result truncated at %d rows — not comparable",
+				p.EstimatedRows, confidenceText(p), rows), start)
+	}
+	return PredictionCheck(p, rows)
 }
 
 // predict calls the explain tool with the same params and parses the plan.
@@ -188,7 +210,7 @@ func (e *VerifyingExecutor) explainOnce(ctx context.Context, tool string, params
 	cctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	result, err := e.inner.Execute(cctx, tool, params)
+	result, err := e.inner.Execute(cctx, tool, explainParams(params))
 	if err != nil {
 		return Prediction{}, err
 	}
@@ -266,28 +288,61 @@ func joinTextValues(items []interface{}) string {
 
 // ActualRows counts rows in a tool result, or -1 when unknown.
 func ActualRows(result *shuttle.Result) int64 {
+	rows, _ := actualRowsInfo(result)
+	return rows
+}
+
+// actualRowsInfo counts rows and reports whether the result declares itself
+// truncated. SQL MCP tools return a JSON STRING payload
+// ({"columns":…, "row_count":N, "rows":[[…]], "truncated":bool}) — seen
+// live from teradata-pecto — so string data gets one decode attempt.
+func actualRowsInfo(result *shuttle.Result) (int64, bool) {
 	if result == nil {
-		return -1
+		return -1, false
 	}
-	switch v := result.Data.(type) {
+	return rowsFromData(result.Data)
+}
+
+func rowsFromData(data interface{}) (int64, bool) {
+	switch v := data.(type) {
 	case []interface{}:
-		return int64(len(v))
+		return int64(len(v)), false
 	case []map[string]interface{}:
-		return int64(len(v))
+		return int64(len(v)), false
+	case string:
+		return rowsFromJSONText(v)
+	case []byte:
+		return rowsFromJSONText(string(v))
 	case map[string]interface{}:
-		switch rows := v["rows"].(type) {
-		case []interface{}:
-			return int64(len(rows))
-		case []map[string]interface{}:
-			return int64(len(rows))
-		}
+		truncated, _ := v["truncated"].(bool)
 		for _, key := range []string{"row_count", "rowCount"} {
 			if n, ok := numericValue(v[key]); ok {
-				return n
+				return n, truncated
 			}
 		}
+		switch rows := v["rows"].(type) {
+		case []interface{}:
+			return int64(len(rows)), truncated
+		case []map[string]interface{}:
+			return int64(len(rows)), truncated
+		}
 	}
-	return -1
+	return -1, false
+}
+
+func rowsFromJSONText(text string) (int64, bool) {
+	text = strings.TrimSpace(text)
+	if len(text) == 0 || (text[0] != '{' && text[0] != '[') {
+		return -1, false
+	}
+	var decoded interface{}
+	if err := json.Unmarshal([]byte(text), &decoded); err != nil {
+		return -1, false
+	}
+	if _, isText := decoded.(string); isText {
+		return -1, false // a JSON string is not a result payload
+	}
+	return rowsFromData(decoded)
 }
 
 func numericValue(value interface{}) (int64, bool) {
