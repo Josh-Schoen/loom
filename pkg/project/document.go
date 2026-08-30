@@ -77,9 +77,12 @@ type Cell struct {
 	// Inputs are upstream cell IDs — the DAG edges. Every entry names a
 	// cell in this document; entries are unique within a cell.
 	Inputs []string `yaml:"inputs,omitempty"`
-	// DeclaredGrain is the unique key of the output (sql cells). It must
-	// pass oracle.GrainCountSQL's identifier rule.
-	DeclaredGrain string `yaml:"declared_grain,omitempty"`
+	// DeclaredGrain is the unique key of the output (sql cells) — one
+	// column, or a comma-joined composite. In YAML it accepts a scalar OR a
+	// sequence (agents naturally write `declared_grain: [customer_id]`, and
+	// composite grains genuinely are lists); each part must pass
+	// oracle.GrainCountSQL's identifier rule.
+	DeclaredGrain GrainKey `yaml:"declared_grain,omitempty"`
 	// Source is sql text / python / markdown per Lang. CONTRACT: within
 	// Source, upstream cells are referenced as {{ ref('<cell_id>') }}, and
 	// every such ref must name a cell listed in Inputs — Compile rejects
@@ -169,8 +172,11 @@ func (d *Document) Validate() error {
 		if c.DeclaredGrain != "" {
 			// Same identifier rule as the grain check that runs the SQL:
 			// GrainCountSQL returns "" for anything it refuses to emit.
-			if oracle.GrainCountSQL(c.DeclaredGrain, "SELECT 1") == "" {
-				return fmt.Errorf("project: cell %q: declared_grain %q is not a valid grain identifier", c.ID, c.DeclaredGrain)
+			// Composite grains validate per column.
+			for _, part := range strings.Split(string(c.DeclaredGrain), ",") {
+				if oracle.GrainCountSQL(strings.TrimSpace(part), "SELECT 1") == "" {
+					return fmt.Errorf("project: cell %q: declared_grain %q is not a valid grain identifier", c.ID, c.DeclaredGrain)
+				}
 			}
 			if c.Lang == LangSQL && strings.TrimSpace(c.Source) == "" {
 				return fmt.Errorf("project: cell %q: sql cell with declared_grain has no source", c.ID)
@@ -263,4 +269,33 @@ func (d *Document) Cell(id string) (Cell, bool) {
 		}
 	}
 	return Cell{}, false
+}
+
+// GrainKey is a grain declaration: one column name, or a comma-joined
+// composite. YAML accepts either a scalar or a sequence of scalars —
+// agents write both shapes, and composite grains are honestly lists.
+type GrainKey string
+
+// UnmarshalYAML accepts `declared_grain: customer_id` and
+// `declared_grain: [customer_id, month]` alike.
+func (g *GrainKey) UnmarshalYAML(value *yaml.Node) error {
+	switch value.Kind {
+	case yaml.ScalarNode:
+		*g = GrainKey(strings.TrimSpace(value.Value))
+		return nil
+	case yaml.SequenceNode:
+		parts := make([]string, 0, len(value.Content))
+		for _, n := range value.Content {
+			if n.Kind != yaml.ScalarNode {
+				return fmt.Errorf("declared_grain: sequence entries must be column names")
+			}
+			if v := strings.TrimSpace(n.Value); v != "" {
+				parts = append(parts, v)
+			}
+		}
+		*g = GrainKey(strings.Join(parts, ", "))
+		return nil
+	default:
+		return fmt.Errorf("declared_grain: expected a column name or a list of column names")
+	}
 }

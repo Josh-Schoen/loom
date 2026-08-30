@@ -332,7 +332,7 @@ func renderPackageYAML(doc *Document, order, skipped []string) (string, error) {
 				sig.Parameters = append(sig.Parameters, packageParameter{Name: name, Domain: c.Params[name]})
 			}
 		}
-		sig.Cells = append(sig.Cells, packageCell{ID: c.ID, Lang: c.Lang, Grain: c.DeclaredGrain, Ref: c.Ref})
+		sig.Cells = append(sig.Cells, packageCell{ID: c.ID, Lang: c.Lang, Grain: string(c.DeclaredGrain), Ref: c.Ref})
 	}
 	sorted := append([]string(nil), skipped...)
 	sort.Strings(sorted)
@@ -372,7 +372,7 @@ func terminalGrain(doc *Document, order []string) string {
 		return ""
 	}
 	c, _ := doc.Cell(terminals[0])
-	return c.DeclaredGrain
+	return string(c.DeclaredGrain)
 }
 
 func ensureTrailingNewline(s string) string {
