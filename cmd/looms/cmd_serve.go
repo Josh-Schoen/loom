@@ -3123,14 +3123,33 @@ func runServe(cmd *cobra.Command, args []string) {
 			}
 		}
 
-		preflightCtx, preflightCancel := context.WithTimeout(context.Background(), 60*time.Second)
-		defer preflightCancel()
-
-		if err := server.ValidateProviders(preflightCtx, agents); err != nil {
-			logger.Fatal("LLM provider preflight check failed", zap.Error(err))
+		// A failed preflight must not crash the daemon: a transient outage of
+		// the provider (or a proxy gateway in front of it) would otherwise
+		// become a crash loop that respawns every MCP server on each attempt.
+		// Retry briefly, then serve anyway — a broken provider still surfaces
+		// loudly on the first request, where the user can actually see it.
+		var preflightErr error
+		for attempt := 1; attempt <= 3; attempt++ {
+			preflightCtx, preflightCancel := context.WithTimeout(context.Background(), 60*time.Second)
+			preflightErr = server.ValidateProviders(preflightCtx, agents)
+			preflightCancel()
+			if preflightErr == nil {
+				break
+			}
+			logger.Warn("LLM provider preflight check failed",
+				zap.Int("attempt", attempt),
+				zap.Error(preflightErr))
+			if attempt < 3 {
+				time.Sleep(time.Duration(attempt) * 5 * time.Second)
+			}
 		}
-		logger.Info("All LLM provider preflight checks passed",
-			zap.Int("agents_checked", len(agents)))
+		if preflightErr != nil {
+			logger.Error("LLM provider preflight failed after retries — serving anyway; requests to the affected provider will fail until it recovers",
+				zap.Error(preflightErr))
+		} else {
+			logger.Info("All LLM provider preflight checks passed",
+				zap.Int("agents_checked", len(agents)))
+		}
 	}
 
 	// Start server

@@ -566,9 +566,13 @@ type WeaveProgress struct {
 	// Unique identifier correlating started/completed events for the same tool call
 	ToolCallId string `protobuf:"bytes,20,opt,name=tool_call_id,json=toolCallId,proto3" json:"tool_call_id,omitempty"`
 	// Context window state (included in completion event)
-	ContextState  *ContextState `protobuf:"bytes,21,opt,name=context_state,json=contextState,proto3" json:"context_state,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	ContextState *ContextState `protobuf:"bytes,21,opt,name=context_state,json=contextState,proto3" json:"context_state,omitempty"`
+	// Verification records the oracle attached to this tool's result —
+	// a JSON array of VerificationRecord (pkg/project/oracle), empty when
+	// nothing was checked. Populated when is_tool_completed.
+	ToolVerification string `protobuf:"bytes,22,opt,name=tool_verification,json=toolVerification,proto3" json:"tool_verification,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
 }
 
 func (x *WeaveProgress) Reset() {
@@ -746,6 +750,13 @@ func (x *WeaveProgress) GetContextState() *ContextState {
 		return x.ContextState
 	}
 	return nil
+}
+
+func (x *WeaveProgress) GetToolVerification() string {
+	if x != nil {
+		return x.ToolVerification
+	}
+	return ""
 }
 
 // HITLRequestInfo carries information about a human-in-the-loop request.
@@ -10924,7 +10935,7 @@ const file_loom_v1_loom_proto_rawDesc = "" +
 	"\bmetadata\x18\x06 \x01(\v2\x1a.loom.v1.ExecutionMetadataR\bmetadata\x12@\n" +
 	"\vcorrections\x18\a \x03(\v2\x1e.loom.v1.SelfCorrectionAttemptR\vcorrections\x12\x19\n" +
 	"\bagent_id\x18\b \x01(\tR\aagentId\x12:\n" +
-	"\rcontext_state\x18\t \x01(\v2\x15.loom.v1.ContextStateR\fcontextState\"\xee\x06\n" +
+	"\rcontext_state\x18\t \x01(\v2\x15.loom.v1.ContextStateR\fcontextState\"\x9b\a\n" +
 	"\rWeaveProgress\x12-\n" +
 	"\x05stage\x18\x01 \x01(\x0e2\x17.loom.v1.ExecutionStageR\x05stage\x12\x1a\n" +
 	"\bprogress\x18\x02 \x01(\x05R\bprogress\x12\x18\n" +
@@ -10952,7 +10963,8 @@ const file_loom_v1_loom_proto_rawDesc = "" +
 	"\x10tool_duration_ms\x18\x13 \x01(\x03R\x0etoolDurationMs\x12 \n" +
 	"\ftool_call_id\x18\x14 \x01(\tR\n" +
 	"toolCallId\x12:\n" +
-	"\rcontext_state\x18\x15 \x01(\v2\x15.loom.v1.ContextStateR\fcontextState\"\x92\x02\n" +
+	"\rcontext_state\x18\x15 \x01(\v2\x15.loom.v1.ContextStateR\fcontextState\x12+\n" +
+	"\x11tool_verification\x18\x16 \x01(\tR\x10toolVerification\"\x92\x02\n" +
 	"\x0fHITLRequestInfo\x12\x1d\n" +
 	"\n" +
 	"request_id\x18\x01 \x01(\tR\trequestId\x12\x1a\n" +

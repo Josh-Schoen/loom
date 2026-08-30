@@ -29,6 +29,7 @@ import (
 	"github.com/teradata-labs/loom/pkg/metaagent/learning"
 	"github.com/teradata-labs/loom/pkg/observability"
 	"github.com/teradata-labs/loom/pkg/patterns"
+	"github.com/teradata-labs/loom/pkg/project/oracle"
 	"github.com/teradata-labs/loom/pkg/prompts"
 	"github.com/teradata-labs/loom/pkg/session"
 	"github.com/teradata-labs/loom/pkg/shuttle"
@@ -150,6 +151,12 @@ func NewAgent(backend fabric.ExecutionBackend, llmProvider LLMProvider, opts ...
 	// Create executor with tool registry
 	// Note: Pass instrumented executor via SetExecutor() if you want tool tracing
 	a.executor = shuttle.NewExecutor(a.tools)
+
+	// Verification oracle: attaches records to SQL tool results, never
+	// altering or failing them. The agent field type is concrete
+	// (*shuttle.Executor), so the wrapper is held separately and applied
+	// at the tool-call boundary in executeToolWithSelfCorrection.
+	a.verifier = oracle.NewVerifyingExecutor(a.executor)
 
 	// Set permission checker on executor if provided
 	if a.permissionChecker != nil {
@@ -1920,23 +1927,32 @@ func emitToolCompleted(ctx Context, progress int32, toolCall ToolCall, result *s
 
 		var durationMs int64
 		var data interface{}
+		var verification string
 		if result != nil {
 			durationMs = result.ExecutionTimeMs
 			data = result.Data
+			// The oracle's verdicts ride the result metadata; the UI renders
+			// them as badges. JSON here because proto carries them opaquely.
+			if recs := oracle.RecordsFrom(result); len(recs) > 0 {
+				if raw, err := json.Marshal(recs); err == nil {
+					verification = string(raw)
+				}
+			}
 		}
 
 		callback(ProgressEvent{
-			Stage:           StageToolExecution,
-			Progress:        progress,
-			Message:         fmt.Sprintf("Tool completed: %s", toolCall.Name),
-			ToolName:        toolCall.Name,
-			Timestamp:       time.Now(),
-			IsToolCompleted: true,
-			ToolResult:      data,
-			ToolError:       toolErr,
-			ToolSuccess:     toolSuccess,
-			ToolDurationMs:  durationMs,
-			ToolCallID:      toolCall.ID,
+			Stage:            StageToolExecution,
+			Progress:         progress,
+			Message:          fmt.Sprintf("Tool completed: %s", toolCall.Name),
+			ToolName:         toolCall.Name,
+			Timestamp:        time.Now(),
+			IsToolCompleted:  true,
+			ToolResult:       data,
+			ToolError:        toolErr,
+			ToolSuccess:      toolSuccess,
+			ToolDurationMs:   durationMs,
+			ToolCallID:       toolCall.ID,
+			ToolVerification: verification,
 		})
 	}
 }
@@ -3033,6 +3049,15 @@ func (c *contextWithValue) Value(key interface{}) interface{} {
 	return c.Context.Value(key)
 }
 
+// toolExecutor returns the executor tool calls go through: the verification
+// oracle when present, the bare executor otherwise.
+func (a *Agent) toolExecutor() oracle.ToolExecutor {
+	if a.verifier != nil {
+		return a.verifier
+	}
+	return a.executor
+}
+
 // executeToolWithSelfCorrection wraps tool execution with optional circuit breaker.
 // If circuit breaker is enabled, provides failure isolation for tools.
 // If guardrails are enabled, tracks errors for error analysis.
@@ -3059,7 +3084,7 @@ func (a *Agent) executeToolWithSelfCorrection(ctx Context, toolName string, inpu
 	if a.circuitBreakers != nil {
 		breaker := a.circuitBreakers.GetBreaker(toolName)
 		cbErr := breaker.Execute(func() error {
-			result, err = a.executor.Execute(ctxWithAgent, toolName, input)
+			result, err = a.toolExecutor().Execute(ctxWithAgent, toolName, input)
 			return err
 		})
 
@@ -3069,7 +3094,7 @@ func (a *Agent) executeToolWithSelfCorrection(ctx Context, toolName string, inpu
 		}
 	} else {
 		// No circuit breaker - execute directly
-		result, err = a.executor.Execute(ctxWithAgent, toolName, input)
+		result, err = a.toolExecutor().Execute(ctxWithAgent, toolName, input)
 	}
 
 	// If execution succeeded and guardrails enabled, clear error record

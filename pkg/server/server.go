@@ -385,6 +385,7 @@ func applyToolLifecycleFields(proto *loomv1.WeaveProgress, event agent.ProgressE
 	proto.ToolError = sanitizeUTF8(event.ToolError)
 	proto.ToolSuccess = event.ToolSuccess
 	proto.ToolDurationMs = event.ToolDurationMs
+	proto.ToolVerification = sanitizeUTF8(event.ToolVerification)
 
 	// Convert ToolInput map to proto Struct
 	if event.ToolInput != nil {

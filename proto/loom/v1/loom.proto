@@ -790,6 +790,11 @@ message WeaveProgress {
 
   // Context window state (included in completion event)
   ContextState context_state = 21;
+
+  // Verification records the oracle attached to this tool's result —
+  // a JSON array of VerificationRecord (pkg/project/oracle), empty when
+  // nothing was checked. Populated when is_tool_completed.
+  string tool_verification = 22;
 }
 
 // HITLRequestInfo carries information about a human-in-the-loop request.

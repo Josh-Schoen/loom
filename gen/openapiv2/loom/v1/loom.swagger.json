@@ -10036,6 +10036,10 @@
         "contextState": {
           "$ref": "#/definitions/v1ContextState",
           "title": "Context window state (included in completion event)"
+        },
+        "toolVerification": {
+          "type": "string",
+          "description": "Verification records the oracle attached to this tool's result —\na JSON array of VerificationRecord (pkg/project/oracle), empty when\nnothing was checked. Populated when is_tool_completed."
         }
       },
       "description": "WeaveProgress streams incremental updates during execution."

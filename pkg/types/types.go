@@ -485,6 +485,11 @@ type ProgressEvent struct {
 
 	// ToolCallID is a unique identifier correlating started/completed events for the same tool call
 	ToolCallID string
+
+	// ToolVerification is the oracle's verdicts on this tool's result — a
+	// JSON array of VerificationRecord (pkg/project/oracle), "" when nothing
+	// was checked (when IsToolCompleted)
+	ToolVerification string
 }
 
 // ProgressCallback is called when agent execution progress occurs.
