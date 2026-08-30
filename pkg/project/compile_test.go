@@ -147,7 +147,7 @@ func TestCompileDBTProject(t *testing.T) {
 	got := files["dbt_project.yml"]
 	for _, want := range []string{
 		"name: at_risk_revenue\n",
-		"profile: at_risk_revenue\n",
+		"profile: loom_project\n",
 		`model-paths: ["models"]`,
 		`test-paths: ["tests"]`,
 		`macro-paths: ["macros"]`,

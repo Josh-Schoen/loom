@@ -256,6 +256,17 @@ func runProject(ctx context.Context, doc *project.Document, docPath, buildDir st
 
 	// --no-partial-parse: the project is regenerated from the document on
 	// every compile, so a cached manifest can only be stale.
+	// Best-effort audit-table setup first: the row-audit post-hook INSERTs
+	// into loom_audit, which a fresh schema (or a teardown) lacks. Failure
+	// here is ignored — an already-existing table errors harmlessly, and a
+	// real problem resurfaces loudly in the build's own records.
+	setupCtx, setupCancel := context.WithTimeout(ctx, 2*time.Minute)
+	setupCmd := exec.CommandContext(setupCtx, binPath,
+		"run-operation", "loom_setup", "--no-partial-parse", "--profiles-dir", profilesDir)
+	setupCmd.Dir = buildDir
+	_, _ = setupCmd.CombinedOutput()
+	setupCancel()
+
 	args := []string{"build", "--no-partial-parse", "--profiles-dir", profilesDir}
 
 	runCtx, cancel := context.WithTimeout(ctx, runProjectTimeout)
@@ -363,7 +374,7 @@ func validateSummary(doc *project.Document, docPath string) map[string]interface
 		}
 		entry := map[string]interface{}{"id": c.ID, "lang": c.Lang}
 		if c.DeclaredGrain != "" {
-			entry["grain"] = c.DeclaredGrain
+			entry["grain"] = string(c.DeclaredGrain)
 		}
 		if len(c.Inputs) > 0 {
 			entry["inputs"] = c.Inputs
