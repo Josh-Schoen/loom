@@ -124,6 +124,10 @@ func (t *ShellExecuteTool) Execute(ctx context.Context, params map[string]interf
 	// Extract session ID from context for path restrictions
 	sessionID := session.SessionIDFromContext(ctx)
 
+	// Working-directory grant issued by the caller for this request, if any.
+	// An empty grant means no confinement was requested and legacy behavior applies.
+	grant := session.WorkingDirFromContext(ctx)
+
 	// Determine LOOM_DATA_DIR (from environment or config)
 	loomDataDir := t.loomDataDir
 	if loomDataDir == "" {
@@ -147,9 +151,16 @@ func (t *ShellExecuteTool) Execute(ctx context.Context, params map[string]interf
 	// Determine working directory
 	// Priority: 1) explicit working_dir param, 2) LOOM_SANDBOX_DIR (agent execution context)
 	// Note: LOOM_SANDBOX_DIR defaults to LOOM_DATA_DIR (see config.GetLoomSandboxDir)
+	// A grant replaces the sandbox default and anchors relative overrides.
 	workingDir := config.GetLoomSandboxDir()
+	if grant != "" {
+		workingDir = grant
+	}
 	if wd, ok := params["working_dir"].(string); ok && wd != "" {
 		workingDir = wd // Explicit override always wins
+		if grant != "" && !filepath.IsAbs(wd) {
+			workingDir = filepath.Join(grant, wd)
+		}
 	}
 
 	timeoutSeconds := DefaultShellTimeout
@@ -224,14 +235,22 @@ func (t *ShellExecuteTool) Execute(ctx context.Context, params map[string]interf
 		}, nil
 	}
 
-	// Session-based path restrictions
-	if loomDataDir != "" && sessionID != "" {
-		// Ensure working directory is within LOOM_DATA_DIR or whitelisted directories
+	// Session-based path restrictions.
+	// A grant is enough to require confinement on its own: a caller who names a
+	// working directory wants execution kept inside it even without a session.
+	if grant != "" || (loomDataDir != "" && sessionID != "") {
+		// Ensure working directory is within the grant, LOOM_DATA_DIR or whitelisted directories
 		absWorkingDir, _ := filepath.Abs(cleanWorkingDir)
-		absLoomDataDir, _ := filepath.Abs(loomDataDir)
 
-		// Check if path is within LOOM_DATA_DIR or a whitelisted directory
-		isAllowed := strings.HasPrefix(absWorkingDir, absLoomDataDir)
+		isAllowed := false
+		if grant != "" {
+			absGrant, _ := filepath.Abs(grant)
+			isAllowed = isWithinDir(absWorkingDir, absGrant)
+		}
+		if !isAllowed && loomDataDir != "" {
+			absLoomDataDir, _ := filepath.Abs(loomDataDir)
+			isAllowed = strings.HasPrefix(absWorkingDir, absLoomDataDir)
+		}
 		if !isAllowed {
 			// Whitelist /tmp for temporary file operations (common for agent workflows)
 			if runtime.GOOS != "windows" && strings.HasPrefix(absWorkingDir, "/tmp") {
@@ -247,12 +266,18 @@ func (t *ShellExecuteTool) Execute(ctx context.Context, params map[string]interf
 		}
 
 		if !isAllowed {
+			message := fmt.Sprintf("Working directory outside LOOM_DATA_DIR: %s", cleanWorkingDir)
+			suggestion := "Execute commands within LOOM_SANDBOX_DIR, LOOM_DATA_DIR, or /tmp"
+			if grant != "" {
+				message = fmt.Sprintf("Working directory outside the granted directory %s: %s", grant, cleanWorkingDir)
+				suggestion = fmt.Sprintf("Execute commands within %s, LOOM_DATA_DIR, or /tmp", grant)
+			}
 			return &shuttle.Result{
 				Success: false,
 				Error: &shuttle.Error{
 					Code:       "PATH_RESTRICTED",
-					Message:    fmt.Sprintf("Working directory outside LOOM_DATA_DIR: %s", cleanWorkingDir),
-					Suggestion: "Execute commands within LOOM_SANDBOX_DIR, LOOM_DATA_DIR, or /tmp",
+					Message:    message,
+					Suggestion: suggestion,
 				},
 				ExecutionTimeMs: time.Since(start).Milliseconds(),
 			}, nil
@@ -305,6 +330,10 @@ func (t *ShellExecuteTool) Execute(ctx context.Context, params map[string]interf
 		if scratchpadDir, err := artifacts.GetScratchpadDir(sessionID); err == nil {
 			cmd.Env = append(cmd.Env, fmt.Sprintf("SESSION_SCRATCHPAD_DIR=%s", scratchpadDir))
 		}
+	}
+
+	if grant != "" {
+		cmd.Env = append(cmd.Env, fmt.Sprintf("LOOM_WORKING_DIR=%s", grant))
 	}
 
 	// Capture stdout and stderr

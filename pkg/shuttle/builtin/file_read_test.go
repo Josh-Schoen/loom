@@ -25,8 +25,8 @@ func TestFileReadTool_Name(t *testing.T) {
 func TestFileReadTool_Description(t *testing.T) {
 	tool := NewFileReadTool("")
 	desc := tool.Description()
-	assert.Contains(t, desc, "DEPRECATED")
 	assert.Contains(t, desc, "local filesystem")
+	assert.Contains(t, desc, "granted repository")
 }
 
 func TestFileReadTool_InputSchema(t *testing.T) {

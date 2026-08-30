@@ -58,3 +58,28 @@ func AgentIDFromContext(ctx context.Context) string {
 	}
 	return ""
 }
+
+// workingDirKey is the context key for the working-directory grant
+type workingDirKey struct{}
+
+// ContextWithWorkingDir carries the caller's per-request working-directory grant
+// (WeaveRequest.context["working_dir"]) through to tool execution. Tools that honor
+// the grant confine filesystem work to this subtree plus LOOM_DATA_DIR and the OS
+// temp locations. An empty dir leaves the context unchanged so that callers who send
+// no grant keep the unscoped behavior.
+func ContextWithWorkingDir(ctx context.Context, dir string) context.Context {
+	if dir == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, workingDirKey{}, dir)
+}
+
+// WorkingDirFromContext extracts the working-directory grant from the context.
+// Returns empty string when no grant was issued, which tools must treat as
+// "no confinement requested" rather than "deny everything".
+func WorkingDirFromContext(ctx context.Context) string {
+	if dir, ok := ctx.Value(workingDirKey{}).(string); ok {
+		return dir
+	}
+	return ""
+}

@@ -29,6 +29,7 @@ import (
 	"github.com/teradata-labs/loom/pkg/orchestration"
 	"github.com/teradata-labs/loom/pkg/patterns"
 	"github.com/teradata-labs/loom/pkg/scheduler"
+	"github.com/teradata-labs/loom/pkg/session"
 	"github.com/teradata-labs/loom/pkg/shuttle"
 	"github.com/teradata-labs/loom/pkg/shuttle/builtin"
 	"github.com/teradata-labs/loom/pkg/storage"
@@ -670,6 +671,39 @@ func (s *MultiAgentServer) ListAgents(ctx context.Context, req *loomv1.ListAgent
 	}, nil
 }
 
+// workingDirRequestKey is the WeaveRequest.context entry carrying the caller's
+// working-directory grant.
+const workingDirRequestKey = "working_dir"
+
+// workingDirFromRequest extracts and validates the caller's working-directory grant.
+// Returns an empty string when no grant was sent. A grant must be an absolute path to
+// an existing directory: relative paths cannot be resolved server-side because the
+// server's working directory is unrelated to the caller's.
+func workingDirFromRequest(req *loomv1.WeaveRequest) (string, error) {
+	if req == nil || req.Context == nil {
+		return "", nil
+	}
+	raw := req.Context[workingDirRequestKey]
+	if raw == "" {
+		return "", nil
+	}
+
+	dir := filepath.Clean(raw)
+	if !filepath.IsAbs(dir) {
+		return "", fmt.Errorf("must be an absolute path, got %q", raw)
+	}
+
+	info, err := os.Stat(dir)
+	if err != nil {
+		return "", fmt.Errorf("cannot access %q: %v", dir, err)
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("%q is not a directory", dir)
+	}
+
+	return dir, nil
+}
+
 // Weave executes a user query using the specified agent.
 func (s *MultiAgentServer) Weave(ctx context.Context, req *loomv1.WeaveRequest) (*loomv1.WeaveResponse, error) {
 	if req.Query == "" {
@@ -707,6 +741,13 @@ func (s *MultiAgentServer) Weave(ctx context.Context, req *loomv1.WeaveRequest) 
 	if sessionID == "" {
 		sessionID = GenerateSessionID()
 	}
+
+	// Attach the caller's working-directory grant so filesystem tools can honor it
+	workingDir, err := workingDirFromRequest(req)
+	if err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "working_dir invalid: %v", err)
+	}
+	ctx = session.ContextWithWorkingDir(ctx, workingDir)
 
 	// Add progress multiplexer to context if available for this agent
 	s.mu.RLock()
@@ -855,6 +896,13 @@ func (s *MultiAgentServer) StreamWeave(req *loomv1.WeaveRequest, stream loomv1.L
 		sessionID = GenerateSessionID()
 	}
 
+	// Attach the caller's working-directory grant so filesystem tools can honor it
+	workingDir, err := workingDirFromRequest(req)
+	if err != nil {
+		return status.Errorf(codes.InvalidArgument, "working_dir invalid: %v", err)
+	}
+	ctx := session.ContextWithWorkingDir(stream.Context(), workingDir)
+
 	// Register manage_ephemeral_agents tool if not already registered
 	// This allows agents to spawn and despawn sub-agents dynamically
 	toolNames := ag.ListTools()
@@ -876,7 +924,7 @@ func (s *MultiAgentServer) StreamWeave(req *loomv1.WeaveRequest, stream loomv1.L
 	}
 
 	// Spawn workflow sub-agents if this is a workflow coordinator
-	if err := s.spawnWorkflowSubAgents(stream.Context(), ag, resolvedAgentID, sessionID); err != nil {
+	if err := s.spawnWorkflowSubAgents(ctx, ag, resolvedAgentID, sessionID); err != nil {
 		s.logger.Warn("Failed to spawn workflow sub-agents (workflow may run with limited functionality)",
 			zap.String("workflow", resolvedAgentID),
 			zap.Error(err))
@@ -916,14 +964,14 @@ func (s *MultiAgentServer) StreamWeave(req *loomv1.WeaveRequest, stream loomv1.L
 	progressCallback := func(event agent.ProgressEvent) {
 		select {
 		case progressChan <- event:
-		case <-stream.Context().Done():
+		case <-ctx.Done():
 			// Context cancelled, stop sending
 		}
 	}
 
 	// Execute agent with progress callback
 	go func() {
-		resp, err := ag.ChatWithProgress(stream.Context(), sessionID, req.Query, progressCallback)
+		resp, err := ag.ChatWithProgress(ctx, sessionID, req.Query, progressCallback)
 		resultChan <- agentResult{resp: resp, err: err}
 		close(progressChan)
 	}()
@@ -982,7 +1030,7 @@ func (s *MultiAgentServer) StreamWeave(req *loomv1.WeaveRequest, stream loomv1.L
 			agentDone = true
 			// Continue to drain remaining progress events
 
-		case <-stream.Context().Done():
+		case <-ctx.Done():
 			return status.Error(codes.Canceled, "client cancelled request")
 		}
 	}
