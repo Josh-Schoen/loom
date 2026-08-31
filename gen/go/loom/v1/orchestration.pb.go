@@ -2058,7 +2058,12 @@ type ScheduleConfig struct {
 	// Variables to pass to workflow execution
 	Variables map[string]string `protobuf:"bytes,6,rep,name=variables,proto3" json:"variables,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
 	// Session mode for workflow agents (NEW = fresh each tick, RESUME = continue previous)
-	SessionMode   ScheduledSessionMode `protobuf:"varint,7,opt,name=session_mode,json=sessionMode,proto3,enum=loom.v1.ScheduledSessionMode" json:"session_mode,omitempty"`
+	SessionMode ScheduledSessionMode `protobuf:"varint,7,opt,name=session_mode,json=sessionMode,proto3,enum=loom.v1.ScheduledSessionMode" json:"session_mode,omitempty"`
+	// Optional: path to the project.yaml this schedule belongs to.
+	// Empty means the schedule is not attributed to any project; a UI may
+	// display such a schedule under a default heading, but nothing writes a
+	// path here on the schedule's behalf.
+	ProjectPath   string `protobuf:"bytes,8,opt,name=project_path,json=projectPath,proto3" json:"project_path,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2140,6 +2145,13 @@ func (x *ScheduleConfig) GetSessionMode() ScheduledSessionMode {
 		return x.SessionMode
 	}
 	return ScheduledSessionMode_SCHEDULED_SESSION_MODE_UNSPECIFIED
+}
+
+func (x *ScheduleConfig) GetProjectPath() string {
+	if x != nil {
+		return x.ProjectPath
+	}
+	return ""
 }
 
 // ScheduledWorkflow represents a workflow with automatic execution schedule.
@@ -2550,7 +2562,7 @@ const file_loom_v1_orchestration_proto_rawDesc = "" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"m\n" +
 	"\x17ExecuteWorkflowResponse\x12!\n" +
 	"\fexecution_id\x18\x01 \x01(\tR\vexecutionId\x12/\n" +
-	"\x06result\x18\x02 \x01(\v2\x17.loom.v1.WorkflowResultR\x06result\"\xfc\x02\n" +
+	"\x06result\x18\x02 \x01(\v2\x17.loom.v1.WorkflowResultR\x06result\"\x9f\x03\n" +
 	"\x0eScheduleConfig\x12\x12\n" +
 	"\x04cron\x18\x01 \x01(\tR\x04cron\x12\x1a\n" +
 	"\btimezone\x18\x02 \x01(\tR\btimezone\x12\x18\n" +
@@ -2558,7 +2570,8 @@ const file_loom_v1_orchestration_proto_rawDesc = "" +
 	"\x0fskip_if_running\x18\x04 \x01(\bR\rskipIfRunning\x122\n" +
 	"\x15max_execution_seconds\x18\x05 \x01(\x05R\x13maxExecutionSeconds\x12D\n" +
 	"\tvariables\x18\x06 \x03(\v2&.loom.v1.ScheduleConfig.VariablesEntryR\tvariables\x12@\n" +
-	"\fsession_mode\x18\a \x01(\x0e2\x1d.loom.v1.ScheduledSessionModeR\vsessionMode\x1a<\n" +
+	"\fsession_mode\x18\a \x01(\x0e2\x1d.loom.v1.ScheduledSessionModeR\vsessionMode\x12!\n" +
+	"\fproject_path\x18\b \x01(\tR\vprojectPath\x1a<\n" +
 	"\x0eVariablesEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xee\x03\n" +

@@ -7731,6 +7731,10 @@
         "sessionMode": {
           "$ref": "#/definitions/v1ScheduledSessionMode",
           "title": "Session mode for workflow agents (NEW = fresh each tick, RESUME = continue previous)"
+        },
+        "projectPath": {
+          "type": "string",
+          "description": "Optional: path to the project.yaml this schedule belongs to.\nEmpty means the schedule is not attributed to any project; a UI may\ndisplay such a schedule under a default heading, but nothing writes a\npath here on the schedule's behalf."
         }
       },
       "description": "ScheduleConfig defines when a workflow should execute automatically.\nUsed in workflow YAML files under 'schedule:' section and in RPC calls."
