@@ -7,6 +7,7 @@ package builtin
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -128,12 +129,14 @@ const (
 	dbtFailedTest = "failed_test" // writes an artifact with a failing test, exit 1
 	dbtNoArtifact = "no_artifact" // writes nothing, exit 1 (config/connection error)
 	dbtMissing    = "missing"     // LOOM_DBT_BIN points at nothing
+	dbtShowFails  = "show_fails"  // build works, every `dbt show` errors out
 )
 
-// writeFakeDBT installs a shell script standing in for dbt. It ignores every
-// argument, optionally copies a canned run_results.json into ./target (dbt
-// writes that artifact relative to its project directory), and exits with the
-// requested code.
+// writeFakeDBT installs a shell script standing in for dbt. It branches on the
+// positional action — `show` answers with a canned preview payload, anything
+// else (build, run-operation) optionally copies a canned run_results.json into
+// ./target (dbt writes that artifact relative to its project directory) — and
+// exits with the requested code.
 func writeFakeDBT(t *testing.T, mode string) string {
 	t.Helper()
 	if runtime.GOOS == "windows" {
@@ -147,11 +150,37 @@ func writeFakeDBT(t *testing.T, mode string) string {
 
 	var body strings.Builder
 	body.WriteString("#!/bin/sh\n")
+	// Preview capture is a SECOND kind of invocation: run_project calls
+	// `dbt show --select <cell> ...` after the build. The stand-in branches on
+	// the positional action ($1) exactly as dbt does, so a test can make the
+	// build succeed while every preview fails.
+	body.WriteString("if [ \"$1\" = \"show\" ]; then\n")
+	if mode == dbtShowFails {
+		body.WriteString("  echo \"12:00:06  Database Error in model $3: relation not found\" >&2\n")
+		body.WriteString("  exit 1\n")
+	} else {
+		// Shaped like dbt 1.12's ShowNode log event: ordinary log lines, then
+		// the payload keyed by the node name, its first line carrying the
+		// logger's timestamp prefix — so the JSON does not start at a line
+		// boundary and the column order lives only in the row key order.
+		body.WriteString("  sel=\"$3\"\n")
+		body.WriteString("  echo \"12:00:06  Running with dbt=1.12.0 (stand-in)\"\n")
+		body.WriteString("  echo \"12:00:07  Previewing node '$sel':\"\n")
+		body.WriteString("  echo \"12:00:07  {\"\n")
+		body.WriteString("  echo \"  \\\"$sel\\\": [\"\n")
+		body.WriteString("  echo '    {\"order_day\": \"2026-08-01\", \"total_amount\": 1234.5, \"label\": \"aug\"},'\n")
+		body.WriteString("  echo '    {\"order_day\": \"2026-08-02\", \"total_amount\": 9007199254740993, \"label\": null}'\n")
+		body.WriteString("  echo \"  ]\"\n")
+		body.WriteString("  echo \"}\"\n")
+		body.WriteString("  echo \"12:00:08  Done.\"\n")
+		body.WriteString("  exit 0\n")
+	}
+	body.WriteString("fi\n")
 	body.WriteString("echo \"12:00:00  Running with dbt=1.12.0 (stand-in)\"\n")
 
 	exitCode := 0
 	switch mode {
-	case dbtPass, dbtFailedTest:
+	case dbtPass, dbtFailedTest, dbtShowFails:
 		artifact := runResultsFixture("pass", 0)
 		if mode == dbtFailedTest {
 			artifact = runResultsFixture("fail", 3)
@@ -226,6 +255,26 @@ func relFiles(t *testing.T, dir string) []string {
 		t.Fatalf("walk %s: %v", dir, err)
 	}
 	return out
+}
+
+// previewsDir is where run_project persists sampled results.
+func previewsDir(buildDir string) string {
+	return filepath.Join(buildDir, "target", "loom_previews")
+}
+
+// readPreview loads one persisted preview, keeping the raw bytes: the literal
+// text is the only place a number's precision can be checked.
+func readPreview(t *testing.T, buildDir, cellID string) (project.CellPreview, []byte) {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join(previewsDir(buildDir), cellID+".json"))
+	if err != nil {
+		t.Fatalf("read preview for %s: %v", cellID, err)
+	}
+	var p project.CellPreview
+	if err := json.Unmarshal(raw, &p); err != nil {
+		t.Fatalf("preview for %s is not valid JSON: %v", cellID, err)
+	}
+	return p, raw
 }
 
 func rungVerdicts(records []oracle.VerificationRecord) map[string][]string {
@@ -430,6 +479,78 @@ func TestRunProjectTool_Actions(t *testing.T) {
 			},
 		},
 		{
+			name:        "run captures one preview per model cell",
+			doc:         validProjectDoc,
+			action:      "run",
+			dbtMode:     dbtPass,
+			wantSuccess: true,
+			check: func(t *testing.T, res *shuttle.Result, env runProjectEnv) {
+				data := resultData(t, res)
+				if data["previews"] != 2 {
+					t.Errorf("previews = %v, want 2 (one per model cell)", data["previews"])
+				}
+				// The preview selection IS the model selection: the prose cell
+				// and the source-less call cell never became models.
+				if got := relFiles(t, previewsDir(env.buildDir)); len(got) != 2 ||
+					got[0] != "daily_totals.json" || got[1] != "orders.json" {
+					t.Fatalf("preview files = %v, want exactly the two model cells", got)
+				}
+				for _, id := range []string{"orders", "daily_totals"} {
+					p, raw := readPreview(t, env.buildDir, id)
+					// Column ORDER is the payload's row-key order, not
+					// alphabetical — sorting would put label first.
+					if strings.Join(p.Columns, ",") != "order_day,total_amount,label" {
+						t.Errorf("%s columns = %v, want dbt's column order", id, p.Columns)
+					}
+					if len(p.Rows) != 2 {
+						t.Fatalf("%s rows = %v, want 2", id, p.Rows)
+					}
+					if len(p.Rows[0]) != 3 || p.Rows[0][0] != "2026-08-01" {
+						t.Errorf("%s first row = %v, want values aligned to columns", id, p.Rows[0])
+					}
+					// A row's missing/null value stays null rather than
+					// shifting the columns along.
+					if p.Rows[1][2] != nil {
+						t.Errorf("%s null cell = %v, want nil", id, p.Rows[1][2])
+					}
+					if p.Truncated {
+						t.Errorf("%s Truncated = true with 2 rows", id)
+					}
+					// A warehouse id past 2^53 must survive verbatim: the
+					// parser keeps numbers literal instead of via float64.
+					if !strings.Contains(string(raw), "9007199254740993") {
+						t.Errorf("%s lost number precision: %s", id, raw)
+					}
+				}
+			},
+		},
+		{
+			name:   "a run whose previews all fail is unchanged",
+			doc:    validProjectDoc,
+			action: "run",
+			// Previews are BEST-EFFORT: dbt show erroring for every cell must
+			// leave the records, the verdicts and the success untouched.
+			dbtMode:     dbtShowFails,
+			wantSuccess: true,
+			check: func(t *testing.T, res *shuttle.Result, env runProjectEnv) {
+				if got := len(oracle.RecordsFrom(res)); got != 5 {
+					t.Errorf("records = %d, want the same 5 as a clean run", got)
+				}
+				data := resultData(t, res)
+				if data["worstVerdict"] != oracle.VerdictPass {
+					t.Errorf("worstVerdict = %v, want pass", data["worstVerdict"])
+				}
+				if data["previews"] != 0 {
+					t.Errorf("previews = %v, want 0", data["previews"])
+				}
+				// No file at all: a missing preview IS the signal, so nothing
+				// half-written is left behind.
+				if got := relFiles(t, previewsDir(env.buildDir)); len(got) != 0 {
+					t.Errorf("preview files = %v, want none", got)
+				}
+			},
+		},
+		{
 			name:            "run without an artifact fails with the dbt tail",
 			doc:             validProjectDoc,
 			action:          "run",
@@ -437,12 +558,17 @@ func TestRunProjectTool_Actions(t *testing.T) {
 			wantSuccess:     false,
 			wantErrCode:     "DBT_NO_ARTIFACT",
 			wantErrContains: []string{"run_results.json", "Credentials in profile"},
-			check: func(t *testing.T, res *shuttle.Result, _ runProjectEnv) {
+			check: func(t *testing.T, res *shuttle.Result, env runProjectEnv) {
 				if len(oracle.RecordsFrom(res)) != 0 {
 					t.Error("no dbt artifact must mean no records")
 				}
 				if tail, _ := res.Error.Details["dbt_tail"].(string); !strings.Contains(tail, "Credentials") {
 					t.Errorf("Details[dbt_tail] = %q, want the dbt error", tail)
+				}
+				// Nothing ran, so there is nothing to preview: capture is
+				// skipped entirely rather than asking dbt show 2 more times.
+				if _, err := os.Stat(previewsDir(env.buildDir)); !os.IsNotExist(err) {
+					t.Errorf("previews directory exists (stat err %v) after a run that produced no artifact", err)
 				}
 			},
 		},
@@ -471,9 +597,9 @@ func TestRunProjectTool_Actions(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			env := setupRunProject(t, tt.doc)
 			if tt.dbtMode != dbtNone {
-				t.Setenv(envDBTBin, writeFakeDBT(t, tt.dbtMode))
+				t.Setenv(project.EnvDBTBin, writeFakeDBT(t, tt.dbtMode))
 				// Never let a test read a real profiles file.
-				t.Setenv(envDBTProfilesDir, filepath.Join(env.dataDir, "dbt-profiles"))
+				t.Setenv(project.EnvDBTProfilesDir, filepath.Join(env.dataDir, "dbt-profiles"))
 			}
 
 			ctx := session.ContextWithWorkingDir(context.Background(), env.repo)
@@ -650,5 +776,148 @@ func TestRunProjectTool_InputSchema(t *testing.T) {
 	}
 	if len(schema.Properties) != 2 {
 		t.Errorf("schema has %d properties, want exactly path and action", len(schema.Properties))
+	}
+}
+
+// TestParseDBTShow pins the tolerant parser against every payload shape dbt
+// has wrapped its preview in, plus the noise it wraps them with. The parser is
+// deliberately shape-agnostic (see project.ParseDBTShow) — these cases are the reason.
+func TestParseDBTShow(t *testing.T) {
+	// hundredRows is a payload at the row cap, which is how Truncated is
+	// decided: dbt stopped at --limit, so there is more result than this.
+	hundredRows := func() string {
+		var b strings.Builder
+		b.WriteString(`{"daily_totals": [`)
+		for i := 0; i < 100; i++ {
+			if i > 0 {
+				b.WriteString(",")
+			}
+			fmt.Fprintf(&b, `{"n": %d}`, i)
+		}
+		b.WriteString("]}")
+		return b.String()
+	}()
+
+	tests := []struct {
+		name          string
+		output        string
+		wantOK        bool
+		wantColumns   []string
+		wantRows      int
+		wantTruncated bool
+		// wantFirst is the first row, compared by its rendered JSON so a
+		// json.Number and a float both read as their literal text.
+		wantFirst string
+	}{
+		{
+			name: "dbt 1.12 select shape, log-prefixed and pretty printed",
+			output: "12:00:06  Running with dbt=1.12.0\n" +
+				"12:00:07  Previewing node 'daily_totals':\n" +
+				"12:00:07  {\n  \"daily_totals\": [\n" +
+				"    {\"order_day\": \"2026-08-01\", \"total_amount\": 1234.5},\n" +
+				"    {\"order_day\": \"2026-08-02\", \"total_amount\": 99}\n" +
+				"  ]\n}\n12:00:08  Done.\n",
+			wantOK:      true,
+			wantColumns: []string{"order_day", "total_amount"},
+			wantRows:    2,
+			wantFirst:   `["2026-08-01",1234.5]`,
+		},
+		{
+			name:        "inline show shape",
+			output:      `{"show": [{"a": 1, "b": "x"}]}`,
+			wantOK:      true,
+			wantColumns: []string{"a", "b"},
+			wantRows:    1,
+			wantFirst:   `[1,"x"]`,
+		},
+		{
+			name:        "object carrying the node name beside the rows",
+			output:      "12:00:07  {\"node\": \"daily_totals\", \"show\": [{\"a\": 2}]}\n",
+			wantOK:      true,
+			wantColumns: []string{"a"},
+			wantRows:    1,
+			wantFirst:   `[2]`,
+		},
+		{
+			name:        "bare array of rows",
+			output:      "[{\"z\": 1, \"a\": 2}]\n",
+			wantOK:      true,
+			wantColumns: []string{"z", "a"}, // key order, not sorted
+			wantRows:    1,
+			wantFirst:   `[1,2]`,
+		},
+		{
+			name:        "ragged rows: the first row's order, then the extras sorted",
+			output:      `{"show": [{"b": 1, "a": 2}, {"b": 3, "a": 4, "z": 5, "c": 6}]}`,
+			wantOK:      true,
+			wantColumns: []string{"b", "a", "c", "z"},
+			wantRows:    2,
+			wantFirst:   `[1,2,null,null]`,
+		},
+		{
+			name:          "a payload at the row cap is truncated",
+			output:        hundredRows,
+			wantOK:        true,
+			wantColumns:   []string{"n"},
+			wantRows:      100,
+			wantTruncated: true,
+			wantFirst:     `[0]`,
+		},
+		{
+			name:   "log output with no payload",
+			output: "12:00:06  Running with dbt=1.12.0\n12:00:07  Nothing to do.\n",
+		},
+		{
+			name:   "a database error instead of a preview",
+			output: "12:00:06  Database Error in model daily_totals: relation not found\n",
+		},
+		{
+			// An empty result yields no preview file, and the absent file is
+			// the UI's "no preview" signal — better than an empty grid that
+			// claims the result is empty when the payload was simply unread.
+			name:   "an empty row array is not a preview",
+			output: `{"show": []}`,
+		},
+		{
+			name:   "empty output",
+			output: "",
+		},
+		{
+			name:   "truncated JSON",
+			output: `{"show": [{"a": 1`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := project.ParseDBTShow([]byte(tt.output))
+			if ok != tt.wantOK {
+				t.Fatalf("ok = %v, want %v (got %+v)", ok, tt.wantOK, got)
+			}
+			if !tt.wantOK {
+				return
+			}
+			if strings.Join(got.Columns, ",") != strings.Join(tt.wantColumns, ",") {
+				t.Errorf("columns = %v, want %v", got.Columns, tt.wantColumns)
+			}
+			if len(got.Rows) != tt.wantRows {
+				t.Fatalf("rows = %d, want %d", len(got.Rows), tt.wantRows)
+			}
+			if got.Truncated != tt.wantTruncated {
+				t.Errorf("Truncated = %v, want %v", got.Truncated, tt.wantTruncated)
+			}
+			first, err := json.Marshal(got.Rows[0])
+			if err != nil {
+				t.Fatalf("marshal first row: %v", err)
+			}
+			if string(first) != tt.wantFirst {
+				t.Errorf("first row = %s, want %s", first, tt.wantFirst)
+			}
+			for i, row := range got.Rows {
+				if len(row) != len(got.Columns) {
+					t.Fatalf("row %d has %d values, want %d", i, len(row), len(got.Columns))
+				}
+			}
+		})
 	}
 }

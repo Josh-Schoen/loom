@@ -93,21 +93,14 @@ func renderProject(doc *Document) (files map[string]string, skipped []string, er
 
 	var models []string // cell IDs that emit a dbt model, in topo order
 	for _, id := range order {
-		c := byID[id]
-		switch {
-		case c.Lang == LangSQL:
-			if strings.TrimSpace(c.Source) == "" {
-				skipped = append(skipped, id)
-				continue
-			}
+		// One predicate for "this cell becomes a dbt model", shared with the
+		// runner's preview pass (EmitsModel): a cell that compiles to a model
+		// but gets no preview, or the reverse, is always a bug.
+		if EmitsModel(byID[id]) {
 			models = append(models, id)
-		case c.Lang == LangCall && strings.TrimSpace(c.Source) != "":
-			// v1: registry resolution is out of scope — a call cell only
-			// compiles when it carries its own source.
-			models = append(models, id)
-		default:
-			skipped = append(skipped, id)
+			continue
 		}
+		skipped = append(skipped, id)
 	}
 
 	files = map[string]string{}

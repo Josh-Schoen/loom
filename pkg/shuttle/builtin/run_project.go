@@ -7,12 +7,8 @@ package builtin
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
-	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -33,48 +29,9 @@ const (
 )
 
 const (
-	// runProjectTimeout bounds one dbt invocation. dbt builds are minutes,
-	// not seconds; a hung warehouse connection must not hold the agent
-	// forever.
-	runProjectTimeout = 15 * time.Minute
-
-	// runProjectOutputCap bounds captured dbt output. dbt is chatty and the
-	// output rides back through an LLM context, so the tail is kept (dbt
-	// reports its errors last) and the head is dropped.
-	runProjectOutputCap = 64 * 1024
-
 	// runProjectTailLines is how much dbt output travels in Result.Data.
 	runProjectTailLines = 20
-
-	// runProjectCacheDir holds compiled dbt projects. Generated dbt code and
-	// dbt's own target/ artifacts live under LOOM_DATA_DIR, never in the
-	// user's repo: the repo holds the project document, nothing derived.
-	runProjectCacheDir = "projects-cache"
-
-	// runProjectBuildSubdir is the compiled project root inside a cache entry.
-	runProjectBuildSubdir = "build"
-
-	// runProjectPathHashLen is how much of the project path's sha256 names
-	// the cache entry — enough to separate documents, short enough to read.
-	runProjectPathHashLen = 16
 )
-
-// Environment variables read at Execute time (never at construction, so a
-// daemon that learns its dbt location later still works).
-const (
-	// envDBTBin overrides the dbt binary. Looked up on PATH.
-	envDBTBin = "LOOM_DBT_BIN"
-	// envDBTProfilesDir overrides the dbt profiles directory — the file that
-	// carries connection details. CONSTRAINT: warehouse credentials reach
-	// dbt through that profile's env_var() indirection from the daemon's own
-	// environment. They are never tool parameters and this tool never sees
-	// them.
-	envDBTProfilesDir = "LOOM_DBT_PROFILES_DIR"
-)
-
-// defaultDBTProfilesSubdir is the profiles directory inside LOOM_DATA_DIR used
-// when envDBTProfilesDir is unset (~/.loom/dbt-spike by default).
-const defaultDBTProfilesSubdir = "dbt-spike"
 
 // RunProjectTool validates, compiles and runs a Loom project document.
 //
@@ -227,6 +184,10 @@ func (t *RunProjectTool) Execute(ctx context.Context, params map[string]interfac
 
 // runProject invokes dbt in buildDir and folds its artifact into records.
 //
+// The dbt invocation itself lives in pkg/project (project.Run): the desktop's
+// single-cell rerun shares it, and one copy of "which flags dbt gets" is the
+// whole point. What stays here is the REPORTING contract below.
+//
 // FAILURE SEMANTICS, deliberately asymmetric:
 //   - dbt exits nonzero but wrote target/run_results.json → Success:true. A
 //     failing grain or metamorphic test IS a successful verification run: the
@@ -237,70 +198,21 @@ func (t *RunProjectTool) Execute(ctx context.Context, params map[string]interfac
 //     running anything (profile, credentials, connection), so there is nothing
 //     to verify and the dbt output is the only useful evidence.
 func runProject(ctx context.Context, doc *project.Document, docPath, buildDir string, skipped []string, start time.Time) *shuttle.Result {
-	binName := os.Getenv(envDBTBin)
-	if strings.TrimSpace(binName) == "" {
-		binName = "dbt"
-	}
-	binPath, lookErr := exec.LookPath(binName)
-	if lookErr != nil {
-		return runProjectFailure(start, "DBT_NOT_FOUND",
-			fmt.Sprintf("dbt binary %q not found on PATH: %v", binName, lookErr),
+	binPath, profilesDir, err := project.ResolveDBT(config.GetLoomDataDir())
+	if err != nil {
+		return runProjectFailure(start, "DBT_NOT_FOUND", err.Error(),
 			fmt.Sprintf("Install dbt with the warehouse adapter, or set %s to its absolute path. "+
-				"Until then use action 'compile' — the generated project is written to %s.", envDBTBin, buildDir))
+				"Until then use action 'compile' — the generated project is written to %s.", project.EnvDBTBin, buildDir))
 	}
 
-	profilesDir := strings.TrimSpace(os.Getenv(envDBTProfilesDir))
-	if profilesDir == "" {
-		profilesDir = filepath.Join(config.GetLoomDataDir(), defaultDBTProfilesSubdir)
+	outcome := project.Run(ctx, doc, buildDir, project.RunOptions{
+		DBTBin:      binPath,
+		ProfilesDir: profilesDir,
+	})
+	if outcome.Err != nil {
+		return runProjectDBTFailure(start, buildDir, outcome.Output, outcome.ExitCode, outcome.Err.Error())
 	}
-
-	// --no-partial-parse: the project is regenerated from the document on
-	// every compile, so a cached manifest can only be stale.
-	// Best-effort audit-table setup first: the row-audit post-hook INSERTs
-	// into loom_audit, which a fresh schema (or a teardown) lacks. Failure
-	// here is ignored — an already-existing table errors harmlessly, and a
-	// real problem resurfaces loudly in the build's own records.
-	setupCtx, setupCancel := context.WithTimeout(ctx, 2*time.Minute)
-	setupCmd := exec.CommandContext(setupCtx, binPath,
-		"run-operation", "loom_setup", "--no-partial-parse", "--profiles-dir", profilesDir)
-	setupCmd.Dir = buildDir
-	_, _ = setupCmd.CombinedOutput()
-	setupCancel()
-
-	args := []string{"build", "--no-partial-parse", "--profiles-dir", profilesDir}
-
-	runCtx, cancel := context.WithTimeout(ctx, runProjectTimeout)
-	defer cancel()
-
-	// #nosec G204 -- binPath comes from the daemon's own environment (LOOM_DBT_BIN),
-	// not from tool parameters, and the arguments are fixed.
-	cmd := exec.CommandContext(runCtx, binPath, args...)
-	cmd.Dir = buildDir
-	// cmd.Env stays nil so the child inherits the daemon environment: that is
-	// how the dbt profile's env_var() indirection reaches its credentials
-	// without any secret passing through this tool.
-	combined, runErr := cmd.CombinedOutput()
-	output := capTail(string(combined), runProjectOutputCap)
-	exitCode := 0
-	var exitErr *exec.ExitError
-	switch {
-	case errors.As(runErr, &exitErr):
-		exitCode = exitErr.ExitCode()
-	case runErr != nil:
-		exitCode = -1
-	}
-
-	artifactPath := filepath.Join(buildDir, "target", "run_results.json")
-	artifact, readErr := os.ReadFile(artifactPath) // #nosec G304 -- path derived from LOOM_DATA_DIR, not from input
-	if readErr != nil {
-		return runProjectDBTFailure(start, buildDir, output, exitCode,
-			fmt.Sprintf("dbt produced no run_results.json (%v)", readErr))
-	}
-	byCell, foldErr := project.RecordsFromRunResults(artifact)
-	if foldErr != nil {
-		return runProjectDBTFailure(start, buildDir, output, exitCode,
-			fmt.Sprintf("dbt run_results.json is unreadable: %v", foldErr))
-	}
+	byCell := outcome.Records
 
 	// Deterministic ordering: dependency order of the document, so the
 	// records arrive in the order the cells ran.
@@ -341,11 +253,12 @@ func runProject(ctx context.Context, doc *project.Document, docPath, buildDir st
 			"document":     docPath,
 			"buildDir":     buildDir,
 			"skipped":      skipped,
-			"dbt_exit":     exitCode,
+			"dbt_exit":     outcome.ExitCode,
 			"cells":        cells,
 			"records":      len(all),
+			"previews":     outcome.Previews,
 			"worstVerdict": worst,
-			"dbt_tail":     tailLines(output, runProjectTailLines),
+			"dbt_tail":     project.TailLines(outcome.Output, runProjectTailLines),
 		},
 		ExecutionTimeMs: time.Since(start).Milliseconds(),
 	}
@@ -383,7 +296,7 @@ func validateSummary(doc *project.Document, docPath string) map[string]interface
 
 		// Mirrors project.Compile's model selection: only a sql or call cell
 		// carrying source becomes a dbt model.
-		if !emitsModel(c) {
+		if !project.EmitsModel(c) {
 			willSkip = append(willSkip, c.ID)
 			if c.Lang == project.LangCall {
 				unresolvedCalls = append(unresolvedCalls, c.ID)
@@ -405,22 +318,12 @@ func validateSummary(doc *project.Document, docPath string) map[string]interface
 	return data
 }
 
-// emitsModel reports whether a cell compiles to a dbt model.
-func emitsModel(c project.Cell) bool {
-	if strings.TrimSpace(c.Source) == "" {
-		return false
-	}
-	return c.Lang == project.LangSQL || c.Lang == project.LangCall
-}
-
-// projectBuildDir is the compile destination for a project document: keyed by
-// the document's absolute path so two documents never share a build tree, and
-// rooted in LOOM_DATA_DIR so generated dbt code and dbt's target/ artifacts
-// stay out of the user's git repo.
+// projectBuildDir is the compile destination for a document under the
+// daemon's data directory. The derivation itself lives in project.BuildDir —
+// cmd/loom-desktop reads the same tree and a byte of drift would show the user
+// "no runs yet" forever, with nothing to indicate why.
 func projectBuildDir(absDocPath string) string {
-	sum := sha256.Sum256([]byte(absDocPath))
-	key := hex.EncodeToString(sum[:])[:runProjectPathHashLen]
-	return filepath.Join(config.GetLoomDataDir(), runProjectCacheDir, key, runProjectBuildSubdir)
+	return project.BuildDir(config.GetLoomDataDir(), absDocPath)
 }
 
 // cellVerdicts summarizes one cell's records as "<rung>=<verdict>" strings.
@@ -479,30 +382,6 @@ func countFiles(dir string) (int, error) {
 	return n, err
 }
 
-// capTail keeps the last max bytes of s, marking what was dropped. dbt reports
-// its errors last, so the tail is the half worth keeping.
-func capTail(s string, max int) string {
-	if len(s) <= max {
-		return s
-	}
-	return fmt.Sprintf("[... %d bytes of earlier dbt output dropped ...]\n%s", len(s)-max, s[len(s)-max:])
-}
-
-// tailLines returns the last n non-empty lines of s.
-func tailLines(s string, n int) string {
-	lines := strings.Split(strings.TrimRight(s, "\n"), "\n")
-	kept := make([]string, 0, len(lines))
-	for _, l := range lines {
-		if strings.TrimSpace(l) != "" {
-			kept = append(kept, l)
-		}
-	}
-	if len(kept) > n {
-		kept = kept[len(kept)-n:]
-	}
-	return strings.Join(kept, "\n")
-}
-
 func runProjectFailure(start time.Time, code, message, suggestion string) *shuttle.Result {
 	return &shuttle.Result{
 		Success: false,
@@ -518,7 +397,7 @@ func runProjectFailure(start time.Time, code, message, suggestion string) *shutt
 // runProjectDBTFailure reports a dbt invocation that produced no verdicts. The
 // dbt tail is the whole diagnosis, so it goes in the message.
 func runProjectDBTFailure(start time.Time, buildDir, output string, exitCode int, reason string) *shuttle.Result {
-	tail := tailLines(output, runProjectTailLines)
+	tail := project.TailLines(output, runProjectTailLines)
 	if tail == "" {
 		tail = "(dbt produced no output)"
 	}
