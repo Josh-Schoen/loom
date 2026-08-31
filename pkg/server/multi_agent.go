@@ -2750,14 +2750,16 @@ func (s *MultiAgentServer) GetSession(ctx context.Context, req *loomv1.GetSessio
 	return nil, status.Error(codes.NotFound, "session not found")
 }
 
-// ListSessions lists all sessions across all agents.
+// ListSessions lists live sessions across all agents merged with the sessions
+// that exist only in the persistent store, newest-updated first. Live entries
+// win on ID collision. Without the merge the listing empties on every daemon
+// restart, because the in-process map starts cold. See mergePersistedSessions
+// for the merge rules and its limits.
 func (s *MultiAgentServer) ListSessions(ctx context.Context, req *loomv1.ListSessionsRequest) (*loomv1.ListSessionsResponse, error) {
 	// Extract user ID for multi-tenant isolation (empty for single-tenant SQLite).
 	callerUserID := postgres.UserIDFromContext(ctx)
 
 	s.mu.RLock()
-	defer s.mu.RUnlock()
-
 	var allSessions []*loomv1.Session
 	for _, ag := range s.agents {
 		sessions := ag.ListSessions()
@@ -2770,6 +2772,10 @@ func (s *MultiAgentServer) ListSessions(ctx context.Context, req *loomv1.ListSes
 			allSessions = append(allSessions, ConvertSession(sess))
 		}
 	}
+	// Release before the store read: it does I/O and needs none of the agent map.
+	s.mu.RUnlock()
+
+	allSessions = mergePersistedSessions(ctx, s.sessionStore, allSessions, callerUserID, s.logger)
 
 	return &loomv1.ListSessionsResponse{
 		Sessions: allSessions,
@@ -2825,31 +2831,42 @@ func (s *MultiAgentServer) GetConversationHistory(ctx context.Context, req *loom
 
 	// Try to find the session in any agent to verify it exists
 	s.mu.RLock()
-	defer s.mu.RUnlock()
-
+	loaded := false
 	for _, ag := range s.agents {
-		_, ok := ag.GetSession(req.SessionId)
-		if ok {
-			// Reload messages from database to ensure IDs are populated
-			// (in-memory messages don't have database IDs until reloaded)
-			messages, err := s.sessionStore.LoadMessages(ctx, req.SessionId)
-			if err != nil {
-				return nil, status.Errorf(codes.Internal, "failed to load messages: %v", err)
-			}
-
-			protoMessages := make([]*loomv1.Message, len(messages))
-			for i, msg := range messages {
-				protoMessages[i] = ConvertMessage(&msg)
-			}
-
-			return &loomv1.ConversationHistory{
-				SessionId: req.SessionId,
-				Messages:  protoMessages,
-			}, nil
+		if _, ok := ag.GetSession(req.SessionId); ok {
+			loaded = true
+			break
 		}
 	}
+	s.mu.RUnlock()
 
-	return nil, status.Error(codes.NotFound, "session not found")
+	if !loaded {
+		// Not loaded in memory (e.g. every session after a daemon restart) — read
+		// the history out of the store. Read-only: this does not adopt the session
+		// into memory.
+		return persistedConversationHistory(ctx, s.sessionStore, req.SessionId, s.logger)
+	}
+
+	if s.sessionStore == nil {
+		return nil, status.Error(codes.Internal, "no session store configured")
+	}
+
+	// Reload messages from database to ensure IDs are populated
+	// (in-memory messages don't have database IDs until reloaded)
+	messages, err := s.sessionStore.LoadMessages(ctx, req.SessionId)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to load messages: %v", err)
+	}
+
+	protoMessages := make([]*loomv1.Message, len(messages))
+	for i := range messages {
+		protoMessages[i] = ConvertMessage(&messages[i])
+	}
+
+	return &loomv1.ConversationHistory{
+		SessionId: req.SessionId,
+		Messages:  protoMessages,
+	}, nil
 }
 
 // ListTools lists all registered tools from the default agent.

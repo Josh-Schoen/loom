@@ -13,7 +13,10 @@
 // limitations under the License.
 package agent
 
-import "context"
+import (
+	"context"
+	"time"
+)
 
 // SessionStorage defines the backend-agnostic interface for session persistence.
 // Implementations include SQLite (SessionStore) and PostgreSQL (postgres.SessionStore).
@@ -70,3 +73,50 @@ type SoftDeleteStorage interface {
 
 // Compile-time check: SessionStore (SQLite) implements SessionStorage.
 var _ SessionStorage = (*SessionStore)(nil)
+
+// SessionMetadata is a per-session summary that can be answered from the
+// sessions table without loading the conversation. It exists because
+// SessionStorage.ListSessions returns IDs only, which is not enough to render a
+// session listing (no name, no timestamps, no message count).
+type SessionMetadata struct {
+	// ID is the session identifier.
+	ID string
+
+	// Name is the human-readable session name. Empty when the session was
+	// never named — callers must not invent one; render the ID instead.
+	Name string
+
+	// AgentID is the agent that owns the session ("" when unrecorded).
+	AgentID string
+
+	// ParentSessionID links sub-agent sessions to their coordinator ("" for
+	// top-level sessions).
+	ParentSessionID string
+
+	// CreatedAt / UpdatedAt come from the sessions row.
+	CreatedAt time.Time
+	UpdatedAt time.Time
+
+	// TotalCostUSD and TotalTokens are the persisted running totals.
+	TotalCostUSD float64
+	TotalTokens  int
+
+	// MessageCount is the number of persisted messages for the session.
+	MessageCount int
+}
+
+// SessionMetadataLister is an optional SessionStorage capability: listing
+// persisted sessions with the metadata needed to display them. Not every
+// backend implements it — use a type assertion, as with SoftDeleteStorage:
+//
+//	if l, ok := store.(SessionMetadataLister); ok {
+//	    infos, err := l.ListSessionInfos(ctx, 0)
+//	}
+type SessionMetadataLister interface {
+	// ListSessionInfos returns persisted session summaries, newest-updated
+	// first. limit <= 0 means SessionMetadataLimitDefault.
+	ListSessionInfos(ctx context.Context, limit int) ([]SessionMetadata, error)
+}
+
+// Compile-time check: SessionStore (SQLite) implements SessionMetadataLister.
+var _ SessionMetadataLister = (*SessionStore)(nil)

@@ -35,6 +35,7 @@ import (
 	"github.com/teradata-labs/loom/pkg/shuttle"
 	"github.com/teradata-labs/loom/pkg/shuttle/builtin"
 	"github.com/teradata-labs/loom/pkg/shuttle/metadata"
+	"github.com/teradata-labs/loom/pkg/storage/postgres"
 	"github.com/teradata-labs/loom/pkg/types"
 	"go.uber.org/zap"
 	"google.golang.org/grpc/codes"
@@ -426,7 +427,9 @@ func (s *Server) GetSession(ctx context.Context, req *loomv1.GetSessionRequest) 
 	return ConvertSession(session), nil
 }
 
-// ListSessions lists all sessions.
+// ListSessions lists live in-process sessions merged with the sessions that
+// exist only in the persistent store, newest-updated first. Live entries win on
+// ID collision. See mergePersistedSessions for the merge rules and its limits.
 func (s *Server) ListSessions(ctx context.Context, req *loomv1.ListSessionsRequest) (*loomv1.ListSessionsResponse, error) {
 	sessions := s.agent.ListSessions()
 
@@ -434,6 +437,9 @@ func (s *Server) ListSessions(ctx context.Context, req *loomv1.ListSessionsReque
 	for i, sess := range sessions {
 		protoSessions[i] = ConvertSession(sess)
 	}
+
+	protoSessions = mergePersistedSessions(ctx, s.sessionStore, protoSessions,
+		postgres.UserIDFromContext(ctx), zap.L())
 
 	return &loomv1.ListSessionsResponse{
 		Sessions: protoSessions,
@@ -471,7 +477,9 @@ func (s *Server) GetConversationHistory(ctx context.Context, req *loomv1.GetConv
 
 	session, ok := s.agent.GetSession(req.SessionId)
 	if !ok {
-		return nil, status.Error(codes.NotFound, "session not found")
+		// Not loaded in memory — read the history out of the store. Read-only:
+		// this does not adopt the session into memory.
+		return persistedConversationHistory(ctx, s.sessionStore, req.SessionId, zap.L())
 	}
 
 	messages := session.GetMessages()

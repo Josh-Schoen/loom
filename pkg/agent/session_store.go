@@ -1154,6 +1154,101 @@ func (s *SessionStore) ListSessions(ctx context.Context) ([]string, error) {
 	return sessionIDs, nil
 }
 
+// SessionMetadataLimitDefault caps ListSessionInfos when the caller passes no
+// limit. The sessions table grows without bound (429 rows on one developer
+// machine), and the listing is read by UIs that render every row, so the
+// default is a page, not the table.
+const SessionMetadataLimitDefault = 200
+
+// ListSessionInfos returns persisted session summaries, newest-updated first.
+//
+// limit <= 0 means SessionMetadataLimitDefault (200). A positive limit is
+// honored as given.
+//
+// The message count is a correlated COUNT(*) on messages, served by
+// idx_messages_session; the ordering is served by idx_sessions_updated.
+// Messages themselves are not loaded — use LoadMessages or LoadSession for that.
+func (s *SessionStore) ListSessionInfos(ctx context.Context, limit int) ([]SessionMetadata, error) {
+	ctx, span := s.tracer.StartSpan(ctx, "session_store.list_session_infos")
+	defer s.tracer.EndSpan(span)
+
+	if limit <= 0 {
+		limit = SessionMetadataLimitDefault
+	}
+	span.SetAttribute("limit", fmt.Sprintf("%d", limit))
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	query := `
+		SELECT
+			s.id,
+			s.name,
+			s.agent_id,
+			s.parent_session_id,
+			s.created_at,
+			s.updated_at,
+			s.total_cost_usd,
+			s.total_tokens,
+			(SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id) AS message_count
+		FROM sessions s
+		ORDER BY s.updated_at DESC, s.id
+		LIMIT ?
+	`
+
+	rows, err := s.db.QueryContext(ctx, query, limit)
+	if err != nil {
+		span.RecordError(err)
+		return nil, fmt.Errorf("failed to query session metadata: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var infos []SessionMetadata
+	for rows.Next() {
+		var (
+			info                           SessionMetadata
+			name, agentID, parentSessionID sql.NullString
+			createdAt, updatedAt           int64
+		)
+		if err := rows.Scan(
+			&info.ID,
+			&name,
+			&agentID,
+			&parentSessionID,
+			&createdAt,
+			&updatedAt,
+			&info.TotalCostUSD,
+			&info.TotalTokens,
+			&info.MessageCount,
+		); err != nil {
+			span.RecordError(err)
+			return nil, fmt.Errorf("failed to scan session metadata: %w", err)
+		}
+		// Optional columns are NULL for sessions saved without them; leave the
+		// zero value rather than substituting a placeholder.
+		if name.Valid {
+			info.Name = name.String
+		}
+		if agentID.Valid {
+			info.AgentID = agentID.String
+		}
+		if parentSessionID.Valid {
+			info.ParentSessionID = parentSessionID.String
+		}
+		info.CreatedAt = time.Unix(createdAt, 0)
+		info.UpdatedAt = time.Unix(updatedAt, 0)
+		infos = append(infos, info)
+	}
+
+	if err := rows.Err(); err != nil {
+		span.RecordError(err)
+		return nil, fmt.Errorf("error iterating session metadata: %w", err)
+	}
+
+	span.SetAttribute("session_count", fmt.Sprintf("%d", len(infos)))
+	return infos, nil
+}
+
 // SaveMemorySnapshot persists a memory snapshot (L2 summary) to the database.
 // This is used by the swap layer to archive L2 summaries when they exceed the token limit.
 func (s *SessionStore) SaveMemorySnapshot(ctx context.Context, sessionID, snapshotType, content string, tokenCount int) error {
