@@ -56,7 +56,14 @@ type Document struct {
 	APIVersion string   `yaml:"apiVersion"`
 	Kind       string   `yaml:"kind"`
 	Metadata   Metadata `yaml:"metadata"`
-	Cells      []Cell   `yaml:"cells"`
+	// Requires names the packages this project needs — the DECLARED layer of
+	// the environment (docs/plan-agentic-projects.md). It is a spec in git,
+	// not an installer: what is REALIZED lives in the project-local venv and
+	// the vendored web-library store, and the two are compared, never
+	// conflated. Document-level rather than metadata, because metadata is
+	// identity and this is dependency.
+	Requires []string `yaml:"requires,omitempty"`
+	Cells    []Cell   `yaml:"cells"`
 }
 
 // Metadata identifies the project. Variant names the sealed-definition
@@ -125,8 +132,8 @@ func Parse(data []byte) (*Document, error) {
 
 // Validate fails on anything that cannot compile: wrong kind or apiVersion,
 // bad or duplicate cell IDs, unknown or duplicated inputs, dependency
-// cycles, grain identifiers that cannot reach a warehouse, and grain-bearing
-// sql cells with no source.
+// cycles, grain identifiers that cannot reach a warehouse, grain-bearing
+// sql cells with no source, and empty requires entries.
 func (d *Document) Validate() error {
 	if d.APIVersion != APIVersionV1 {
 		return fmt.Errorf("project: apiVersion %q: want %q", d.APIVersion, APIVersionV1)
@@ -139,6 +146,11 @@ func (d *Document) Validate() error {
 	}
 	if len(d.Cells) == 0 {
 		return fmt.Errorf("project: no cells")
+	}
+	for i, req := range d.Requires {
+		if strings.TrimSpace(req) == "" {
+			return fmt.Errorf("project: requires[%d] is empty", i)
+		}
 	}
 
 	seen := make(map[string]bool, len(d.Cells))

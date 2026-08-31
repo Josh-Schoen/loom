@@ -339,3 +339,68 @@ func TestCellLookup(t *testing.T) {
 		t.Fatal("Cell: want miss for unknown id")
 	}
 }
+
+// requires: is the DECLARED environment layer — it must survive a real
+// Load off disk (the desktop's Environment panel reads it from there), an
+// absent field must read as an empty list rather than an error, and an empty
+// entry must be refused (nothing can satisfy "").
+func TestRequiresRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	const withRequires = `apiVersion: loom/v1
+kind: Project
+metadata: {name: churn}
+requires:
+  - pandas>=2.0
+  - scikit_learn
+cells:
+  - id: orders
+    lang: sql
+    source: SELECT 1 AS x
+`
+	dir := t.TempDir()
+	path := filepath.Join(dir, "project.yaml")
+	if err := os.WriteFile(path, []byte(withRequires), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	doc, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(doc.Requires) != 2 || doc.Requires[0] != "pandas>=2.0" || doc.Requires[1] != "scikit_learn" {
+		t.Fatalf("Load: requires = %#v", doc.Requires)
+	}
+
+	const noRequires = `apiVersion: loom/v1
+kind: Project
+metadata: {name: churn}
+cells:
+  - id: orders
+    lang: sql
+    source: SELECT 1 AS x
+`
+	bare, err := Parse([]byte(noRequires))
+	if err != nil {
+		t.Fatalf("Parse without requires: %v", err)
+	}
+	if len(bare.Requires) != 0 {
+		t.Fatalf("Parse without requires: requires = %#v, want empty", bare.Requires)
+	}
+
+	const emptyEntry = `apiVersion: loom/v1
+kind: Project
+metadata: {name: churn}
+requires:
+  - pandas
+  - "  "
+cells:
+  - id: orders
+    lang: sql
+    source: SELECT 1 AS x
+`
+	if _, err := Parse([]byte(emptyEntry)); err == nil {
+		t.Fatal("Parse: want error for an empty requires entry")
+	} else if !strings.Contains(err.Error(), "requires[1] is empty") {
+		t.Fatalf("Parse: error %q does not name the empty entry", err)
+	}
+}
