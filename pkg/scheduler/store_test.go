@@ -95,6 +95,49 @@ func TestStore_Update(t *testing.T) {
 	assert.Equal(t, schedule.NextExecutionAt, retrieved.NextExecutionAt)
 }
 
+// project_path rides ScheduleConfig through the store's schedule_json column.
+// protojson carries new fields without a schema change, and List/Get read the
+// same column — so the assertion is that Create, Get, Update and List all
+// return the attribution the caller stored, and that an unattributed schedule
+// stays unattributed rather than acquiring a value on the way through.
+func TestStore_ProjectPathRoundTrips(t *testing.T) {
+	ctx := context.Background()
+	store := setupTestStore(t)
+	defer func() { _ = store.Close() }()
+
+	attributed := createTestSchedule("project-path-1", "attributed-workflow")
+	attributed.Schedule.ProjectPath = "/repos/analytics/sales/project.yaml"
+	require.NoError(t, store.Create(ctx, attributed))
+
+	unattributed := createTestSchedule("project-path-2", "unattributed-workflow")
+	require.NoError(t, store.Create(ctx, unattributed))
+
+	got, err := store.Get(ctx, attributed.Id)
+	require.NoError(t, err)
+	assert.Equal(t, "/repos/analytics/sales/project.yaml", got.Schedule.ProjectPath)
+
+	gotNone, err := store.Get(ctx, unattributed.Id)
+	require.NoError(t, err)
+	assert.Empty(t, gotNone.Schedule.ProjectPath, "an unattributed schedule must not gain a path")
+
+	// Re-attribution survives Update.
+	got.Schedule.ProjectPath = "/repos/analytics/finance/project.yaml"
+	require.NoError(t, store.Update(ctx, got))
+	reread, err := store.Get(ctx, attributed.Id)
+	require.NoError(t, err)
+	assert.Equal(t, "/repos/analytics/finance/project.yaml", reread.Schedule.ProjectPath)
+
+	// List reads the same column through a different scan path.
+	listed, err := store.List(ctx)
+	require.NoError(t, err)
+	paths := map[string]string{}
+	for _, s := range listed {
+		paths[s.Id] = s.Schedule.GetProjectPath()
+	}
+	assert.Equal(t, "/repos/analytics/finance/project.yaml", paths[attributed.Id])
+	assert.Empty(t, paths[unattributed.Id])
+}
+
 func TestStore_Delete(t *testing.T) {
 	ctx := context.Background()
 	store := setupTestStore(t)

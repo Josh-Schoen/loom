@@ -335,6 +335,10 @@ func (e *PipelineExecutor) executeStageWithSpan(ctx context.Context, workflowID 
 	meta := map[string]string{
 		"stage":      fmt.Sprintf("%d", stageNum),
 		"agent_name": ag.GetName(),
+		// The session is where the stage's transcript and artifacts live.
+		// Recording it here is what lets a schedule's history point back to
+		// them without consumers re-deriving the naming convention above.
+		"session_id": sessionID,
 	}
 	if response.Thinking != "" {
 		meta["thinking"] = response.Thinking

@@ -196,6 +196,12 @@ func (o *Orchestrator) GetAgent(ctx context.Context, id string) (*agent.Agent, e
 			o.RegisterAgent(id, ag)
 			return ag, nil
 		}
+		// Propagate the registry's own error. An agent whose config exists
+		// but whose construction failed (bad model id, missing provider
+		// credentials) is a different problem from an unknown name, and
+		// collapsing both to "not found" sends whoever reads the run history
+		// hunting for a typo that is not there.
+		return nil, fmt.Errorf("agent %s: %w", id, err)
 	}
 
 	return nil, fmt.Errorf("agent not found: %s", id)

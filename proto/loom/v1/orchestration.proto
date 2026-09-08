@@ -464,6 +464,12 @@ message ScheduleConfig {
 
   // Session mode for workflow agents (NEW = fresh each tick, RESUME = continue previous)
   ScheduledSessionMode session_mode = 7;
+
+  // Optional: path to the project.yaml this schedule belongs to.
+  // Empty means the schedule is not attributed to any project; a UI may
+  // display such a schedule under a default heading, but nothing writes a
+  // path here on the schedule's behalf.
+  string project_path = 8;
 }
 
 // ScheduledSessionMode controls session lifecycle for scheduled workflow executions.

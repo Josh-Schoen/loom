@@ -1,0 +1,39 @@
+# go-teradata — internal fork of the Teradata GoSQL driver.
+#
+# Driver sources at the repo root and in goteragss/ are synced from the
+# internal gosqldriver upstream by the go-teradata-sync tooling and are kept
+# byte-stable against it: style-level vet findings in synced code are
+# intentionally not fixed here (each fix becomes permanent drift the sync
+# must replay forever). The vet recipe therefore disables the `unreachable`
+# and `printf` analyzers for synced packages, while examples/ (first-party
+# code) gets the full vet gate. Synced code is not gofmt-clean by upstream
+# convention, so there is no fmt gate.
+
+# List available recipes
+default:
+    @just --list
+
+# Compile all packages (pure Go, CGO disabled)
+build:
+    CGO_ENABLED=0 go build ./...
+
+# Compile with the Kerberos mechanism (CGO; loads GSS via dlopen at runtime)
+build-krb5:
+    go build -tags krb5 ./...
+
+# Vet: tuned gate for synced packages, full gate for first-party code
+vet:
+    go vet -unreachable=false -printf=false ./. ./goteragss
+    go vet ./examples/...
+
+# Run all tests with the race detector (vet runs separately via `just vet`)
+test:
+    go test -race -vet=off -count=1 ./...
+
+# Run goteragss tests with the KRB5 mechanism compiled in.
+# Requires a Kerberos-configured host (kinit/keytab); fails elsewhere.
+test-krb5:
+    go test -tags krb5 -race -vet=off -count=1 ./goteragss/
+
+# Full CI gate: everything a sync PR must pass
+ci: build build-krb5 vet test

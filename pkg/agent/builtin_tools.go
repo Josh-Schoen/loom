@@ -639,6 +639,11 @@ func (t *QueryToolResultTool) queryMemoryData(ctx context.Context, refID string,
 			Error: &shuttle.Error{
 				Code:    "not_found",
 				Message: fmt.Sprintf("Reference %s not found", refID),
+				// Stale references are normal: in-memory results do not
+				// survive server restarts, and old ids linger in long
+				// session histories. Without this hint agents flail
+				// through tool_search instead of recovering (seen live).
+				Suggestion: "This reference no longer exists — stored results do not survive server restarts. Re-run the original tool to get fresh data, then query the NEW reference id it returns.",
 			},
 		}, nil
 	}

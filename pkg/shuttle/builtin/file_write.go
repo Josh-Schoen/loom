@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/teradata-labs/loom/pkg/session"
 	"github.com/teradata-labs/loom/pkg/shuttle"
 )
 
@@ -54,8 +55,8 @@ func (t *FileWriteTool) Name() string {
 // Deprecated: Description loaded from PromptRegistry (prompts/tools/file.yaml).
 // This fallback is used only when prompts are not configured.
 func (t *FileWriteTool) Description() string {
-	return `⚠️ DEPRECATED: Use workspace (action=write, scope=artifact) or shell_execute instead.
-Writes content to files on the local filesystem, creating parent directories automatically. Won't overwrite system files.`
+	return `Writes content to files on the local filesystem, creating parent directories automatically. Won't overwrite system files. ` +
+		`With a working-repository grant active, relative paths resolve inside the granted repository and writes stay confined to it.`
 }
 
 func (t *FileWriteTool) InputSchema() *shuttle.JSONSchema {
@@ -133,11 +134,28 @@ func (t *FileWriteTool) Execute(ctx context.Context, params map[string]interface
 		mode = m
 	}
 
+	// Working-directory grant issued by the caller for this request, if any.
+	grant := session.WorkingDirFromContext(ctx)
+
 	// Safety: Clean the path and make it absolute
 	cleanPath := filepath.Clean(path)
 
-	// If relative, make it relative to baseDir
-	if !filepath.IsAbs(cleanPath) {
+	if grant != "" {
+		resolved, allowed := resolveGrantedPath(path, grant)
+		if !allowed {
+			return &shuttle.Result{
+				Success: false,
+				Error: &shuttle.Error{
+					Code:       "PATH_RESTRICTED",
+					Message:    fmt.Sprintf("Path outside the granted directory: %s", resolved),
+					Suggestion: fmt.Sprintf("Write files within %s, LOOM_DATA_DIR, or a temporary directory", grant),
+				},
+				ExecutionTimeMs: time.Since(start).Milliseconds(),
+			}, nil
+		}
+		cleanPath = resolved
+	} else if !filepath.IsAbs(cleanPath) {
+		// If relative, make it relative to baseDir
 		cleanPath = filepath.Join(t.baseDir, cleanPath)
 	}
 

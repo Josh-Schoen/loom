@@ -40,6 +40,26 @@ func UserIDFromContext(ctx context.Context) string {
 	return ""
 }
 
+// defaultAssignedKey marks the context's user ID as assigned by server
+// configuration (a single-tenant default) rather than asserted by the caller.
+type defaultAssignedKey struct{}
+
+// ContextWithDefaultAssignedUserID attaches a user ID that the server assigned
+// from configuration because the caller asserted none. Ownership stamping and
+// RLS treat it like any user ID; guards that must distinguish "a tenant is
+// calling" from "the single-tenant default was applied" check
+// UserIDWasDefaultAssigned.
+func ContextWithDefaultAssignedUserID(ctx context.Context, userID string) context.Context {
+	return context.WithValue(ContextWithUserID(ctx, userID), defaultAssignedKey{}, true)
+}
+
+// UserIDWasDefaultAssigned reports whether the context's user ID came from
+// server configuration rather than from the caller.
+func UserIDWasDefaultAssigned(ctx context.Context) bool {
+	v, _ := ctx.Value(defaultAssignedKey{}).(bool)
+	return v
+}
+
 // execInTx executes fn within a database transaction. If a user ID is
 // present in the context, it sets the PostgreSQL session variable
 // app.current_user_id via SET LOCAL (scoped to the transaction) to

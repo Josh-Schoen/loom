@@ -25,6 +25,7 @@ import (
 	"github.com/teradata-labs/loom/pkg/memory"
 	"github.com/teradata-labs/loom/pkg/observability"
 	"github.com/teradata-labs/loom/pkg/patterns"
+	"github.com/teradata-labs/loom/pkg/project/oracle"
 	"github.com/teradata-labs/loom/pkg/prompts"
 	"github.com/teradata-labs/loom/pkg/shuttle"
 	"github.com/teradata-labs/loom/pkg/skills"
@@ -68,6 +69,10 @@ type Agent struct {
 
 	// Tool executor
 	executor *shuttle.Executor
+
+	// Verification oracle wrapping executor. Non-SQL tools pass through
+	// unchanged; SQL results carry verification records in Result.Metadata.
+	verifier *oracle.VerifyingExecutor
 
 	// Permission checker for tool execution
 	permissionChecker *shuttle.PermissionChecker

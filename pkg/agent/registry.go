@@ -1121,7 +1121,15 @@ func (r *Registry) createLLMProvider(config *loomv1.LLMConfig) (LLMProvider, err
 	case "anthropic":
 		apiKey := os.Getenv("ANTHROPIC_API_KEY")
 		if apiKey == "" {
-			return nil, fmt.Errorf("ANTHROPIC_API_KEY environment variable not set")
+			// Deployments that key the server through Loom config (for
+			// example a LiteLLM / AI-gateway setup) carry the credential
+			// as LOOM_LLM_ANTHROPIC_API_KEY only; an agent naming
+			// provider "anthropic" inline must not demand a second copy
+			// of the same secret.
+			apiKey = os.Getenv("LOOM_LLM_ANTHROPIC_API_KEY")
+		}
+		if apiKey == "" {
+			return nil, fmt.Errorf("no Anthropic API key: set ANTHROPIC_API_KEY or LOOM_LLM_ANTHROPIC_API_KEY")
 		}
 		return anthropic.NewClient(anthropic.Config{
 			APIKey:            apiKey,

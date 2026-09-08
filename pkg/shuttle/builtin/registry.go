@@ -21,6 +21,7 @@ func All(promptRegistry prompts.PromptRegistry) []shuttle.Tool {
 	tools := []shuttle.Tool{
 		NewHTTPClientTool(),
 		NewWebSearchTool(),
+		NewBrowserNavigateTool(),
 		NewFileWriteTool(""),
 		NewFileReadTool(""),
 		NewVisionTool(""),
@@ -28,6 +29,7 @@ func All(promptRegistry prompts.PromptRegistry) []shuttle.Tool {
 		NewGRPCClientTool(),
 		NewShellExecuteTool(""),
 		NewAgentManagementTool(),
+		NewRunProjectTool(),
 		shuttle.NewContactHumanTool(shuttle.ContactHumanConfig{}),
 	}
 
@@ -52,6 +54,8 @@ func ByName(name string) shuttle.Tool {
 		return NewHTTPClientTool()
 	case "web_search":
 		return NewWebSearchTool()
+	case "browser_navigate":
+		return NewBrowserNavigateTool()
 	case "file_write":
 		return NewFileWriteTool("")
 	case "file_read":
@@ -66,6 +70,8 @@ func ByName(name string) shuttle.Tool {
 		return NewShellExecuteTool("")
 	case "agent_management":
 		return NewAgentManagementTool()
+	case "run_project":
+		return NewRunProjectTool()
 	case "contact_human":
 		return shuttle.NewContactHumanTool(shuttle.ContactHumanConfig{})
 	default:
@@ -80,6 +86,7 @@ func Names() []string {
 	return []string{
 		"http_request",
 		"web_search",
+		"browser_navigate",
 		"file_write",
 		"file_read",
 		"analyze_image",
@@ -87,6 +94,7 @@ func Names() []string {
 		"grpc_call",
 		"shell_execute",
 		"agent_management",
+		"run_project",
 		"contact_human",
 	}
 }

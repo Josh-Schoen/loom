@@ -96,12 +96,14 @@ func extractUserID(ctx context.Context, cfg UserIDConfig) (context.Context, erro
 		return nil, status.Error(codes.Unauthenticated, "x-user-id header required")
 	}
 
-	// Use default
+	// Use default. Marked default-assigned so single-tenant guards (e.g. the
+	// persisted-session merge in ListSessions) can tell this identity apart
+	// from one a caller asserted via the header.
 	defaultID := cfg.DefaultUserID
 	if defaultID == "" {
 		defaultID = "default-user"
 	}
-	return postgres.ContextWithUserID(ctx, defaultID), nil
+	return postgres.ContextWithDefaultAssignedUserID(ctx, defaultID), nil
 }
 
 // maxUserIDLength is the maximum allowed length of a user ID.

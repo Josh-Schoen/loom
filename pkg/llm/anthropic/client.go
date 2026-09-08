@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -36,6 +37,8 @@ const (
 	DefaultAnthropicModel = "claude-sonnet-4-5-20250929"
 	// DefaultAnthropicEndpoint is the default Anthropic API endpoint
 	DefaultAnthropicEndpoint = "https://api.anthropic.com/v1/messages"
+	// MessagesPath is the request path appended to a base URL that has none.
+	MessagesPath = "/v1/messages"
 	// DefaultMaxTokens is the default maximum tokens per request
 	DefaultMaxTokens = 4096
 	// DefaultTemperature is the default LLM temperature
@@ -113,6 +116,10 @@ func NewClient(config Config) *Client {
 			config.Endpoint = DefaultAnthropicEndpoint
 		}
 	}
+	// Accept a bare origin as well as a full messages URL. Requests are POSTed
+	// to Endpoint verbatim, so an origin on its own used to fail with a bare
+	// "405 Method Not Allowed" that named nothing useful.
+	config.Endpoint = NormalizeEndpoint(config.Endpoint)
 	if config.Timeout == 0 {
 		config.Timeout = DefaultTimeout
 	}
@@ -837,3 +844,34 @@ var _ llmtypes.LLMProvider = (*Client)(nil)
 
 // Ensure Client implements StreamingLLMProvider interface.
 var _ llmtypes.StreamingLLMProvider = (*Client)(nil)
+
+// NormalizeEndpoint turns a user-supplied base URL into the full messages
+// endpoint this client POSTs to.
+//
+// A bare origin gets MessagesPath appended; anything that already carries a
+// path is returned unchanged, so a gateway routing the API somewhere
+// non-standard still works. An empty string stays empty, leaving the caller to
+// apply its own default.
+//
+// Proxies such as LiteLLM commonly publish an Anthropic-compatible route at
+// /v1/messages, so "https://gateway.example.com" is the natural thing for a
+// user to type and is what this accepts.
+func NormalizeEndpoint(endpoint string) string {
+	trimmed := strings.TrimSpace(endpoint)
+	if trimmed == "" {
+		return ""
+	}
+	trimmed = strings.TrimRight(trimmed, "/")
+
+	u, err := url.Parse(trimmed)
+	if err != nil || u.Host == "" {
+		// Not parseable as an absolute URL. Hand it back untouched rather than
+		// silently rewriting it, and let the request surface the error.
+		return trimmed
+	}
+	if u.Path == "" {
+		u.Path = MessagesPath
+		return u.String()
+	}
+	return trimmed
+}

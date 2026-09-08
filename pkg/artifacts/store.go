@@ -781,7 +781,12 @@ func (s *SQLiteStore) scanArtifact(ctx context.Context, row *sql.Row) (*Artifact
 		sizeBytes, createdAt, updatedAt               int64
 		lastAccessedAt, deletedAt                     sql.NullInt64
 		accessCount                                   int
-		tagsJSON, metadataJSON                        string
+		// NULLABLE, and the columns really do carry NULL: rows written
+		// before tags/metadata were always serialised have no value, and
+		// scanning those into a plain string fails the whole listing —
+		// one such row made every Files panel read of its session an
+		// opaque SQL error. buildArtifact already treats "" as absent.
+		tagsJSON, metadataJSON sql.NullString
 	)
 
 	err := row.Scan(
@@ -796,7 +801,7 @@ func (s *SQLiteStore) scanArtifact(ctx context.Context, row *sql.Row) (*Artifact
 	return s.buildArtifact(
 		id, name, path, source, sourceAgentID, purpose, contentType,
 		sizeBytes, createdAt, updatedAt, checksum, lastAccessedAt, deletedAt,
-		accessCount, tagsJSON, metadataJSON, sessionID,
+		accessCount, tagsJSON.String, metadataJSON.String, sessionID,
 	)
 }
 
@@ -808,7 +813,12 @@ func (s *SQLiteStore) scanArtifactFromRows(rows *sql.Rows) (*Artifact, error) {
 		sizeBytes, createdAt, updatedAt               int64
 		lastAccessedAt, deletedAt                     sql.NullInt64
 		accessCount                                   int
-		tagsJSON, metadataJSON                        string
+		// NULLABLE, and the columns really do carry NULL: rows written
+		// before tags/metadata were always serialised have no value, and
+		// scanning those into a plain string fails the whole listing —
+		// one such row made every Files panel read of its session an
+		// opaque SQL error. buildArtifact already treats "" as absent.
+		tagsJSON, metadataJSON sql.NullString
 	)
 
 	err := rows.Scan(
@@ -823,7 +833,7 @@ func (s *SQLiteStore) scanArtifactFromRows(rows *sql.Rows) (*Artifact, error) {
 	return s.buildArtifact(
 		id, name, path, source, sourceAgentID, purpose, contentType,
 		sizeBytes, createdAt, updatedAt, checksum, lastAccessedAt, deletedAt,
-		accessCount, tagsJSON, metadataJSON, sessionID,
+		accessCount, tagsJSON.String, metadataJSON.String, sessionID,
 	)
 }
 

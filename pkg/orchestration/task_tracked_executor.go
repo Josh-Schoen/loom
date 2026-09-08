@@ -17,6 +17,7 @@ package orchestration
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"go.uber.org/zap"
@@ -69,13 +70,14 @@ func (t *TaskTrackedOrchestrator) ExecutePattern(ctx context.Context, pattern *l
 	// Create board + tasks if no prior board exists.
 	var stageTasks []*task.Task
 	if boardID == "" {
-		var err error
-		_, stageTasks, err = t.createBoardFromPattern(ctx, patternType, pattern)
+		board, tasks, err := t.createBoardFromPattern(ctx, patternType, pattern)
 		if err != nil {
 			t.logger.Warn("task tracking: failed to create board, executing without tracking",
 				zap.Error(err))
 			return t.inner.ExecutePattern(ctx, pattern)
 		}
+		boardID = board.ID
+		stageTasks = tasks
 	} else {
 		t.logger.Info("task tracking: resuming from prior execution",
 			zap.String("board_id", boardID),
@@ -101,6 +103,15 @@ func (t *TaskTrackedOrchestrator) ExecutePattern(ctx context.Context, pattern *l
 	// Record results into tasks regardless of success/failure.
 	t.recordResults(ctx, stageTasks, result, err)
 
+	// Hand the board back through result metadata so the caller (the
+	// scheduler) can record which board holds this run's steps and outputs.
+	if result != nil && boardID != "" {
+		if result.Metadata == nil {
+			result.Metadata = map[string]string{}
+		}
+		result.Metadata["board_id"] = boardID
+	}
+
 	return result, err
 }
 
@@ -119,12 +130,25 @@ func (t *TaskTrackedOrchestrator) createBoardFromPattern(
 ) (*task.TaskBoard, []*task.Task, error) {
 
 	boardName := fmt.Sprintf("workflow:%s:%s", patternType, time.Now().Format("20060102-150405"))
+	metadata := map[string]string{
+		"pattern_type": patternType,
+		"created_by":   "task_tracked_orchestrator",
+	}
+	// Stamp the run's identity when the caller provided it (the scheduler
+	// does). This is what lets a run's history find its board again — an
+	// unstamped board is visible in the task UI but unreachable from the
+	// routine that produced it.
+	if info, ok := ExecutionInfoFrom(ctx); ok {
+		if info.ScheduleID != "" {
+			metadata["schedule_id"] = info.ScheduleID
+		}
+		if info.ExecutionID != "" {
+			metadata["execution_id"] = info.ExecutionID
+		}
+	}
 	board, err := t.manager.CreateBoard(ctx, &task.TaskBoard{
-		Name: boardName,
-		Metadata: map[string]string{
-			"pattern_type": patternType,
-			"created_by":   "task_tracked_orchestrator",
-		},
+		Name:     boardName,
+		Metadata: metadata,
 	})
 	if err != nil {
 		return nil, nil, fmt.Errorf("create board: %w", err)
@@ -427,8 +451,9 @@ func (t *TaskTrackedOrchestrator) recordResults(
 			continue
 		}
 
-		// Update notes with the stage output.
-		output := agentResult.Output
+		// Update notes with the stage output. Sanitized: proto3 cannot marshal
+		// invalid UTF-8, and tool output is arbitrary bytes.
+		output := strings.ToValidUTF8(agentResult.Output, "\uFFFD")
 		if len(output) > 1000 {
 			output = output[:1000] + "\n[output truncated]"
 		}
@@ -474,8 +499,17 @@ func (t *TaskTrackedOrchestrator) findResumableBoard(ctx context.Context, patter
 		return "", 0
 	}
 
+	// Scope resume to the same scheduled routine when the caller identified
+	// one. Matching on pattern type alone let any pipeline resume any other
+	// pipeline's unfinished board — one routine's failed run polluting the
+	// next routine's tasks and stage bookkeeping.
+	info, hasInfo := ExecutionInfoFrom(ctx)
+
 	for _, b := range boards {
 		if b.Metadata["pattern_type"] != patternType || b.Metadata["created_by"] != "task_tracked_orchestrator" {
+			continue
+		}
+		if hasInfo && info.ScheduleID != "" && b.Metadata["schedule_id"] != info.ScheduleID {
 			continue
 		}
 

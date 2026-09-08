@@ -94,6 +94,31 @@ func TestUserIDUnaryInterceptor_MissingHeader_RequireFalse_DefaultUserId(t *test
 	assert.Equal(t, "ok", resp)
 	require.NotNil(t, capturedCtx, "handler must be called")
 	assert.Equal(t, "test-user", postgres.UserIDFromContext(capturedCtx))
+	assert.True(t, postgres.UserIDWasDefaultAssigned(capturedCtx),
+		"a configured default must be marked default-assigned so single-tenant guards can tell it from an asserted tenant")
+}
+
+// A header-asserted user ID must NOT be marked default-assigned — the
+// persisted-session merge (and any future single-tenant guard) keys off this.
+func TestUserIDUnaryInterceptor_ValidHeader_NotDefaultAssigned(t *testing.T) {
+	interceptor := UserIDUnaryInterceptor(UserIDConfig{RequireUserID: false})
+
+	md := metadata.New(map[string]string{UserIDHeader: "alice"})
+	ctx := metadata.NewIncomingContext(context.Background(), md)
+
+	var capturedCtx context.Context
+	handler := func(ctx context.Context, req any) (any, error) {
+		capturedCtx = ctx
+		return "ok", nil
+	}
+
+	_, err := interceptor(ctx, nil, &grpc.UnaryServerInfo{}, handler)
+
+	require.NoError(t, err)
+	require.NotNil(t, capturedCtx, "handler must be called")
+	assert.Equal(t, "alice", postgres.UserIDFromContext(capturedCtx))
+	assert.False(t, postgres.UserIDWasDefaultAssigned(capturedCtx),
+		"a caller-asserted user ID must not read as default-assigned")
 }
 
 func TestUserIDUnaryInterceptor_MissingHeader_RequireFalse_FallbackDefault(t *testing.T) {

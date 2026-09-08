@@ -29,6 +29,7 @@ import (
 	"github.com/teradata-labs/loom/pkg/orchestration"
 	"github.com/teradata-labs/loom/pkg/patterns"
 	"github.com/teradata-labs/loom/pkg/scheduler"
+	"github.com/teradata-labs/loom/pkg/session"
 	"github.com/teradata-labs/loom/pkg/shuttle"
 	"github.com/teradata-labs/loom/pkg/shuttle/builtin"
 	"github.com/teradata-labs/loom/pkg/storage"
@@ -670,6 +671,39 @@ func (s *MultiAgentServer) ListAgents(ctx context.Context, req *loomv1.ListAgent
 	}, nil
 }
 
+// workingDirRequestKey is the WeaveRequest.context entry carrying the caller's
+// working-directory grant.
+const workingDirRequestKey = "working_dir"
+
+// workingDirFromRequest extracts and validates the caller's working-directory grant.
+// Returns an empty string when no grant was sent. A grant must be an absolute path to
+// an existing directory: relative paths cannot be resolved server-side because the
+// server's working directory is unrelated to the caller's.
+func workingDirFromRequest(req *loomv1.WeaveRequest) (string, error) {
+	if req == nil || req.Context == nil {
+		return "", nil
+	}
+	raw := req.Context[workingDirRequestKey]
+	if raw == "" {
+		return "", nil
+	}
+
+	dir := filepath.Clean(raw)
+	if !filepath.IsAbs(dir) {
+		return "", fmt.Errorf("must be an absolute path, got %q", raw)
+	}
+
+	info, err := os.Stat(dir)
+	if err != nil {
+		return "", fmt.Errorf("cannot access %q: %v", dir, err)
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("%q is not a directory", dir)
+	}
+
+	return dir, nil
+}
+
 // Weave executes a user query using the specified agent.
 func (s *MultiAgentServer) Weave(ctx context.Context, req *loomv1.WeaveRequest) (*loomv1.WeaveResponse, error) {
 	if req.Query == "" {
@@ -707,6 +741,13 @@ func (s *MultiAgentServer) Weave(ctx context.Context, req *loomv1.WeaveRequest) 
 	if sessionID == "" {
 		sessionID = GenerateSessionID()
 	}
+
+	// Attach the caller's working-directory grant so filesystem tools can honor it
+	workingDir, err := workingDirFromRequest(req)
+	if err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "working_dir invalid: %v", err)
+	}
+	ctx = session.ContextWithWorkingDir(ctx, workingDir)
 
 	// Add progress multiplexer to context if available for this agent
 	s.mu.RLock()
@@ -855,6 +896,13 @@ func (s *MultiAgentServer) StreamWeave(req *loomv1.WeaveRequest, stream loomv1.L
 		sessionID = GenerateSessionID()
 	}
 
+	// Attach the caller's working-directory grant so filesystem tools can honor it
+	workingDir, err := workingDirFromRequest(req)
+	if err != nil {
+		return status.Errorf(codes.InvalidArgument, "working_dir invalid: %v", err)
+	}
+	ctx := session.ContextWithWorkingDir(stream.Context(), workingDir)
+
 	// Register manage_ephemeral_agents tool if not already registered
 	// This allows agents to spawn and despawn sub-agents dynamically
 	toolNames := ag.ListTools()
@@ -876,7 +924,7 @@ func (s *MultiAgentServer) StreamWeave(req *loomv1.WeaveRequest, stream loomv1.L
 	}
 
 	// Spawn workflow sub-agents if this is a workflow coordinator
-	if err := s.spawnWorkflowSubAgents(stream.Context(), ag, resolvedAgentID, sessionID); err != nil {
+	if err := s.spawnWorkflowSubAgents(ctx, ag, resolvedAgentID, sessionID); err != nil {
 		s.logger.Warn("Failed to spawn workflow sub-agents (workflow may run with limited functionality)",
 			zap.String("workflow", resolvedAgentID),
 			zap.Error(err))
@@ -916,14 +964,14 @@ func (s *MultiAgentServer) StreamWeave(req *loomv1.WeaveRequest, stream loomv1.L
 	progressCallback := func(event agent.ProgressEvent) {
 		select {
 		case progressChan <- event:
-		case <-stream.Context().Done():
+		case <-ctx.Done():
 			// Context cancelled, stop sending
 		}
 	}
 
 	// Execute agent with progress callback
 	go func() {
-		resp, err := ag.ChatWithProgress(stream.Context(), sessionID, req.Query, progressCallback)
+		resp, err := ag.ChatWithProgress(ctx, sessionID, req.Query, progressCallback)
 		resultChan <- agentResult{resp: resp, err: err}
 		close(progressChan)
 	}()
@@ -982,7 +1030,7 @@ func (s *MultiAgentServer) StreamWeave(req *loomv1.WeaveRequest, stream loomv1.L
 			agentDone = true
 			// Continue to drain remaining progress events
 
-		case <-stream.Context().Done():
+		case <-ctx.Done():
 			return status.Error(codes.Canceled, "client cancelled request")
 		}
 	}
@@ -2684,8 +2732,6 @@ func (s *MultiAgentServer) GetSession(ctx context.Context, req *loomv1.GetSessio
 
 	// Try to find the session in any agent
 	s.mu.RLock()
-	defer s.mu.RUnlock()
-
 	for _, ag := range s.agents {
 		session, ok := ag.GetSession(req.SessionId)
 		if ok {
@@ -2695,21 +2741,27 @@ func (s *MultiAgentServer) GetSession(ctx context.Context, req *loomv1.GetSessio
 			if callerUserID != "" && session.UserID != "" && session.UserID != callerUserID {
 				continue
 			}
+			s.mu.RUnlock()
 			return ConvertSession(session), nil
 		}
 	}
+	s.mu.RUnlock()
 
-	return nil, status.Error(codes.NotFound, "session not found")
+	// Not loaded in any agent — answer from the store, as ListSessions does,
+	// so a session the listing shows can also be fetched by ID.
+	return persistedSession(ctx, s.sessionStore, req.SessionId, callerUserID, s.logger)
 }
 
-// ListSessions lists all sessions across all agents.
+// ListSessions lists live sessions across all agents merged with the sessions
+// that exist only in the persistent store, newest-updated first. Live entries
+// win on ID collision. Without the merge the listing empties on every daemon
+// restart, because the in-process map starts cold. See mergePersistedSessions
+// for the merge rules and its limits.
 func (s *MultiAgentServer) ListSessions(ctx context.Context, req *loomv1.ListSessionsRequest) (*loomv1.ListSessionsResponse, error) {
 	// Extract user ID for multi-tenant isolation (empty for single-tenant SQLite).
 	callerUserID := postgres.UserIDFromContext(ctx)
 
 	s.mu.RLock()
-	defer s.mu.RUnlock()
-
 	var allSessions []*loomv1.Session
 	for _, ag := range s.agents {
 		sessions := ag.ListSessions()
@@ -2722,6 +2774,10 @@ func (s *MultiAgentServer) ListSessions(ctx context.Context, req *loomv1.ListSes
 			allSessions = append(allSessions, ConvertSession(sess))
 		}
 	}
+	// Release before the store read: it does I/O and needs none of the agent map.
+	s.mu.RUnlock()
+
+	allSessions = mergePersistedSessions(ctx, s.sessionStore, allSessions, callerUserID, s.logger)
 
 	return &loomv1.ListSessionsResponse{
 		Sessions: allSessions,
@@ -2745,6 +2801,14 @@ func (s *MultiAgentServer) DeleteSession(ctx context.Context, req *loomv1.Delete
 			found = true
 			break
 		}
+	}
+	// A session no agent has loaded is still a session if the store has it
+	// (every one of them, after a daemon restart). Decide BEFORE the store
+	// delete below removes the evidence — this used to answer NotFound after
+	// having deleted the row.
+	if !found {
+		_, found = persistedSessionInfo(ctx, s.sessionStore, req.SessionId,
+			postgres.UserIDFromContext(ctx), s.logger)
 	}
 
 	// Cleanup any spawned sub-agents before deleting parent session
@@ -2777,31 +2841,42 @@ func (s *MultiAgentServer) GetConversationHistory(ctx context.Context, req *loom
 
 	// Try to find the session in any agent to verify it exists
 	s.mu.RLock()
-	defer s.mu.RUnlock()
-
+	loaded := false
 	for _, ag := range s.agents {
-		_, ok := ag.GetSession(req.SessionId)
-		if ok {
-			// Reload messages from database to ensure IDs are populated
-			// (in-memory messages don't have database IDs until reloaded)
-			messages, err := s.sessionStore.LoadMessages(ctx, req.SessionId)
-			if err != nil {
-				return nil, status.Errorf(codes.Internal, "failed to load messages: %v", err)
-			}
-
-			protoMessages := make([]*loomv1.Message, len(messages))
-			for i, msg := range messages {
-				protoMessages[i] = ConvertMessage(&msg)
-			}
-
-			return &loomv1.ConversationHistory{
-				SessionId: req.SessionId,
-				Messages:  protoMessages,
-			}, nil
+		if _, ok := ag.GetSession(req.SessionId); ok {
+			loaded = true
+			break
 		}
 	}
+	s.mu.RUnlock()
 
-	return nil, status.Error(codes.NotFound, "session not found")
+	if !loaded {
+		// Not loaded in memory (e.g. every session after a daemon restart) — read
+		// the history out of the store. Read-only: this does not adopt the session
+		// into memory.
+		return persistedConversationHistory(ctx, s.sessionStore, req.SessionId, s.logger)
+	}
+
+	if s.sessionStore == nil {
+		return nil, status.Error(codes.Internal, "no session store configured")
+	}
+
+	// Reload messages from database to ensure IDs are populated
+	// (in-memory messages don't have database IDs until reloaded)
+	messages, err := s.sessionStore.LoadMessages(ctx, req.SessionId)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to load messages: %v", err)
+	}
+
+	protoMessages := make([]*loomv1.Message, len(messages))
+	for i := range messages {
+		protoMessages[i] = ConvertMessage(&messages[i])
+	}
+
+	return &loomv1.ConversationHistory{
+		SessionId: req.SessionId,
+		Messages:  protoMessages,
+	}, nil
 }
 
 // ListTools lists all registered tools from the default agent.
@@ -4045,6 +4120,46 @@ func (s *MultiAgentServer) PauseSchedule(ctx context.Context, req *loomv1.PauseS
 
 // ResumeSchedule resumes a paused schedule.
 // The schedule will start executing again according to its cron expression.
+// CancelWorkflowExecution stops an execution that is currently running.
+//
+// Pausing a schedule prevents future runs but leaves one already in flight
+// alone, and max_execution_seconds only notices a stuck run once its deadline
+// passes. This is the stop button in between.
+func (s *MultiAgentServer) CancelWorkflowExecution(ctx context.Context, req *loomv1.CancelWorkflowExecutionRequest) (*loomv1.CancelWorkflowExecutionResponse, error) {
+	if req.ExecutionId == "" {
+		return nil, status.Error(codes.InvalidArgument, "execution_id is required")
+	}
+
+	s.mu.RLock()
+	sched := s.scheduler
+	s.mu.RUnlock()
+
+	if sched == nil {
+		return nil, status.Error(codes.FailedPrecondition, "scheduler not configured")
+	}
+
+	cancelled, err := sched.CancelExecution(ctx, req.ExecutionId, req.Reason)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to cancel execution: %v", err)
+	}
+
+	// Not-running is a successful no-op, not an error: an execution that
+	// finished a moment before the request already gave the caller what they
+	// asked for. Reporting NotFound here would make the UI apologise for a race
+	// it won.
+	if !cancelled {
+		return &loomv1.CancelWorkflowExecutionResponse{
+			Cancelled: false,
+			Message:   "execution is not running — it already finished, or never started",
+		}, nil
+	}
+
+	return &loomv1.CancelWorkflowExecutionResponse{
+		Cancelled: true,
+		Message:   "cancellation signalled; the run stops at its next checkpoint",
+	}, nil
+}
+
 func (s *MultiAgentServer) ResumeSchedule(ctx context.Context, req *loomv1.ResumeScheduleRequest) (*emptypb.Empty, error) {
 	if req.ScheduleId == "" {
 		return nil, status.Error(codes.InvalidArgument, "schedule_id is required")

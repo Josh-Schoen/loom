@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/teradata-labs/loom/pkg/session"
 	"github.com/teradata-labs/loom/pkg/shuttle"
 )
 
@@ -56,8 +57,8 @@ func (t *FileReadTool) Name() string {
 // Deprecated: Description loaded from PromptRegistry (prompts/tools/file.yaml).
 // This fallback is used only when prompts are not configured.
 func (t *FileReadTool) Description() string {
-	return `⚠️ DEPRECATED: Use workspace (action=read, scope=artifact) or shell_execute (cat) instead.
-Reads text and binary files from the local filesystem. Max 10MB. Won't read sensitive system paths.`
+	return `Reads text and binary files from the local filesystem. Max 10MB. Won't read sensitive system paths. ` +
+		`With a working-repository grant active, relative paths resolve inside the granted repository and reads stay confined to it.`
 }
 
 func (t *FileReadTool) InputSchema() *shuttle.JSONSchema {
@@ -107,11 +108,28 @@ func (t *FileReadTool) Execute(ctx context.Context, params map[string]interface{
 		startLine = int(s)
 	}
 
+	// Working-directory grant issued by the caller for this request, if any.
+	grant := session.WorkingDirFromContext(ctx)
+
 	// Safety: Clean the path and make it absolute
 	cleanPath := filepath.Clean(path)
 
-	// If relative, make it relative to baseDir
-	if !filepath.IsAbs(cleanPath) {
+	if grant != "" {
+		resolved, allowed := resolveGrantedPath(path, grant)
+		if !allowed {
+			return &shuttle.Result{
+				Success: false,
+				Error: &shuttle.Error{
+					Code:       "PATH_RESTRICTED",
+					Message:    fmt.Sprintf("Path outside the granted directory: %s", resolved),
+					Suggestion: fmt.Sprintf("Read files within %s, LOOM_DATA_DIR, or a temporary directory", grant),
+				},
+				ExecutionTimeMs: time.Since(start).Milliseconds(),
+			}, nil
+		}
+		cleanPath = resolved
+	} else if !filepath.IsAbs(cleanPath) {
+		// If relative, make it relative to baseDir
 		cleanPath = filepath.Join(t.baseDir, cleanPath)
 	}
 
