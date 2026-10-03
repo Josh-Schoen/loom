@@ -9,8 +9,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 	"github.com/robfig/cron/v3"
@@ -925,7 +928,7 @@ func (s *Scheduler) executeWorkflow(ctx context.Context, schedule *loomv1.Schedu
 
 	// Execute workflow via orchestrator
 	// TODO: Add variable interpolation support
-	_, err := s.orchestrator.ExecutePattern(execCtx, schedule.Pattern)
+	result, err := s.orchestrator.ExecutePattern(execCtx, schedule.Pattern)
 
 	// Linearization point. Reading the cancel state and closing the run to
 	// further cancellation happen in one critical section, immediately on
@@ -975,6 +978,9 @@ func (s *Scheduler) executeWorkflow(ctx context.Context, schedule *loomv1.Schedu
 		CompletedAt: time.Now().Unix(),
 		DurationMs:  duration.Milliseconds(),
 		WorkflowId:  workflowID,
+		Stages:      stagesFromResult(result),
+		Output:      capOutput(result.GetMergedOutput()),
+		BoardId:     result.GetMetadata()["board_id"],
 	}
 
 	// A canceled run is not a failed run. Counting an operator's stop as a
@@ -1055,6 +1061,66 @@ func (s *Scheduler) executeWorkflow(ctx context.Context, schedule *loomv1.Schedu
 	if err := s.store.UpdateNextExecution(ctx, schedule.Id, nextExec); err != nil {
 		s.logger.Error("Failed to update next execution", zap.Error(err))
 	}
+}
+
+// runWorkflowID picks the workflow_id a run's history and sessions are filed
+// under: RESUME mode threads every run of a schedule onto that schedule's own
+// id so they share one session lineage; every other mode gets a fresh id per
+// run (its own execution id), so NEW-mode runs never collide.
+func runWorkflowID(mode loomv1.ScheduledSessionMode, scheduleID, executionID string) string {
+	if mode == loomv1.ScheduledSessionMode_SCHEDULED_SESSION_MODE_RESUME {
+		return scheduleID
+	}
+	return executionID
+}
+
+// stagesFromResult compresses a workflow result into per-stage receipt rows —
+// who ran, how long, what it cost, which session holds the work. Stage outputs
+// are deliberately not copied: they live in each stage's session, and schedule
+// history is read far more often than any one run's output.
+func stagesFromResult(result *loomv1.WorkflowResult) []*loomv1.StageExecution {
+	if result == nil || len(result.AgentResults) == 0 {
+		return nil
+	}
+	stages := make([]*loomv1.StageExecution, 0, len(result.AgentResults))
+	for i, ar := range result.AgentResults {
+		st := &loomv1.StageExecution{
+			// Position defaults to result order; the executor's own stage
+			// number wins when present (fork-join results interleave).
+			Stage:      int32(i + 1), //nolint:gosec // result lists are small
+			AgentId:    ar.AgentId,
+			DurationMs: ar.DurationMs,
+			SessionId:  ar.Metadata["session_id"],
+		}
+		if n, convErr := strconv.Atoi(ar.Metadata["stage"]); convErr == nil && n > 0 {
+			st.Stage = int32(n) //nolint:gosec // stage counts are small
+		}
+		if ar.Cost != nil {
+			st.TotalTokens = ar.Cost.TotalTokens
+			st.CostUsd = ar.Cost.CostUsd
+		}
+		stages = append(stages, st)
+	}
+	return stages
+}
+
+// maxOutputBytes caps the output stored per execution. History is read far
+// more often than any single run's full output; the cap keeps a chatty run
+// from bloating every history query. Full stage outputs live in task notes.
+const maxOutputBytes = 32 * 1024
+
+// capOutput truncates on a rune boundary so the stored text stays valid UTF-8.
+func capOutput(s string) string {
+	// Tool output is arbitrary bytes; proto3 refuses invalid UTF-8.
+	s = strings.ToValidUTF8(s, "�")
+	if len(s) <= maxOutputBytes {
+		return s
+	}
+	cut := s[:maxOutputBytes]
+	for len(cut) > 0 && !utf8.ValidString(cut) {
+		cut = cut[:len(cut)-1]
+	}
+	return cut + "\n… [output truncated]"
 }
 
 // calculateNextExecution calculates the next execution time for a schedule.

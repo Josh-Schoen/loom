@@ -55,7 +55,7 @@ func savePersisted(t *testing.T, store *agent.SessionStore, id, name string, upd
 	}
 	for _, content := range messages {
 		msg := agent.Message{Role: "user", Content: content, Timestamp: updated}
-		if err := store.SaveMessage(ctx, id, msg); err != nil {
+		if err := store.SaveMessage(ctx, id, &msg, true); err != nil {
 			t.Fatalf("SaveMessage(%s): %v", id, err)
 		}
 	}

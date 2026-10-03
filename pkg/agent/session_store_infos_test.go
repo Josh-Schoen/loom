@@ -66,7 +66,7 @@ func TestSessionStore_ListSessionInfos_Populated(t *testing.T) {
 	}
 	for i := 0; i < 3; i++ {
 		msg := Message{Role: "user", Content: fmt.Sprintf("m%d", i), Timestamp: updated}
-		if err := store.SaveMessage(ctx, session.ID, msg); err != nil {
+		if err := store.SaveMessage(ctx, session.ID, &msg, true); err != nil {
 			t.Fatalf("SaveMessage: %v", err)
 		}
 	}
@@ -224,7 +224,8 @@ func TestSessionStore_GetSessionInfo(t *testing.T) {
 		t.Fatalf("SaveSession: %v", err)
 	}
 	for i := 0; i < 3; i++ {
-		if err := store.SaveMessage(ctx, "sess-one", Message{Role: "user", Content: fmt.Sprintf("m%d", i), Timestamp: updated}); err != nil {
+		msg := Message{Role: "user", Content: fmt.Sprintf("m%d", i), Timestamp: updated}
+		if err := store.SaveMessage(ctx, "sess-one", &msg, true); err != nil {
 			t.Fatalf("SaveMessage: %v", err)
 		}
 	}

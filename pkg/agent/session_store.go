@@ -1666,6 +1666,8 @@ func (s *SessionStore) GetSessionInfo(ctx context.Context, sessionID string) (Se
 		return SessionMetadata{}, err
 	}
 	return info, nil
+}
+
 // MarkEvicted sets evicted=1 on the given rows in one transaction (relief
 // operation; HLD §5.2). Flags are write-once — no code path clears them.
 func (s *SessionStore) MarkEvicted(ctx context.Context, sessionID string, seqs []int64) error {

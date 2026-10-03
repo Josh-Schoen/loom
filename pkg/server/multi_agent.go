@@ -3447,14 +3447,6 @@ func (s *MultiAgentServer) DeleteSession(ctx context.Context, req *loomv1.Delete
 	} else if deleteAgent == nil {
 		return nil, status.Error(codes.NotFound, "session not found")
 	}
-	// A session no agent has loaded is still a session if the store has it
-	// (every one of them, after a daemon restart). Decide BEFORE the store
-	// delete below removes the evidence — this used to answer NotFound after
-	// having deleted the row.
-	if !found {
-		_, found = persistedSessionInfo(ctx, s.sessionStore, req.SessionId,
-			postgres.UserIDFromContext(ctx), s.logger)
-	}
 
 	if err := artifacts.CompleteSessionArtifactMetadata(req.SessionId); err != nil {
 		s.logger.Warn("session artifact metadata completion failed",
@@ -3534,27 +3526,6 @@ func (s *MultiAgentServer) GetConversationHistory(ctx context.Context, req *loom
 	// the history out of the store. Read-only: this does not adopt the session
 	// into memory.
 	return persistedConversationHistory(ctx, s.sessionStore, req.SessionId, s.logger)
-
-	if s.sessionStore == nil {
-		return nil, status.Error(codes.Internal, "no session store configured")
-	}
-
-	// Reload messages from database to ensure IDs are populated
-	// (in-memory messages don't have database IDs until reloaded)
-	messages, err := s.sessionStore.LoadMessages(ctx, req.SessionId)
-	if err != nil {
-		return nil, status.Errorf(codes.Internal, "failed to load messages: %v", err)
-	}
-
-	protoMessages := make([]*loomv1.Message, len(messages))
-	for i := range messages {
-		protoMessages[i] = ConvertMessage(&messages[i])
-	}
-
-	return &loomv1.ConversationHistory{
-		SessionId: req.SessionId,
-		Messages:  protoMessages,
-	}, nil
 }
 
 // ListTools lists all registered tools from the default agent.
@@ -4933,46 +4904,6 @@ func (s *MultiAgentServer) CancelScheduledExecution(ctx context.Context, req *lo
 
 // ResumeSchedule resumes a paused schedule.
 // The schedule will start executing again according to its cron expression.
-// CancelWorkflowExecution stops an execution that is currently running.
-//
-// Pausing a schedule prevents future runs but leaves one already in flight
-// alone, and max_execution_seconds only notices a stuck run once its deadline
-// passes. This is the stop button in between.
-func (s *MultiAgentServer) CancelWorkflowExecution(ctx context.Context, req *loomv1.CancelWorkflowExecutionRequest) (*loomv1.CancelWorkflowExecutionResponse, error) {
-	if req.ExecutionId == "" {
-		return nil, status.Error(codes.InvalidArgument, "execution_id is required")
-	}
-
-	s.mu.RLock()
-	sched := s.scheduler
-	s.mu.RUnlock()
-
-	if sched == nil {
-		return nil, status.Error(codes.FailedPrecondition, "scheduler not configured")
-	}
-
-	cancelled, err := sched.CancelExecution(ctx, req.ExecutionId, req.Reason)
-	if err != nil {
-		return nil, status.Errorf(codes.Internal, "failed to cancel execution: %v", err)
-	}
-
-	// Not-running is a successful no-op, not an error: an execution that
-	// finished a moment before the request already gave the caller what they
-	// asked for. Reporting NotFound here would make the UI apologise for a race
-	// it won.
-	if !cancelled {
-		return &loomv1.CancelWorkflowExecutionResponse{
-			Cancelled: false,
-			Message:   "execution is not running — it already finished, or never started",
-		}, nil
-	}
-
-	return &loomv1.CancelWorkflowExecutionResponse{
-		Cancelled: true,
-		Message:   "cancellation signalled; the run stops at its next checkpoint",
-	}, nil
-}
-
 func (s *MultiAgentServer) ResumeSchedule(ctx context.Context, req *loomv1.ResumeScheduleRequest) (*emptypb.Empty, error) {
 	if req.ScheduleId == "" {
 		return nil, status.Error(codes.InvalidArgument, "schedule_id is required")

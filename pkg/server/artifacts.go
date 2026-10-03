@@ -59,7 +59,8 @@ func (s *MultiAgentServer) ListArtifacts(ctx context.Context, req *loomv1.ListAr
 	if req.SessionId != "" {
 		if err := s.authorizeSessionScope(ctx, req.SessionId); err != nil {
 			return nil, err
-		}		filter.SessionID = &req.SessionId
+		}
+		filter.SessionID = &req.SessionId
 	}
 
 	// Apply default limit
@@ -108,7 +109,8 @@ func (s *MultiAgentServer) GetArtifact(ctx context.Context, req *loomv1.GetArtif
 		if sessionID == "" {
 			sessionID = session.SessionIDFromContext(ctx)
 		} else if err := s.authorizeSessionScope(ctx, sessionID); err != nil {
-			return nil, err		}
+			return nil, err
+		}
 		art, err = s.artifactStore.GetByName(ctx, req.Name, sessionID)
 	} else {
 		return nil, status.Error(codes.InvalidArgument, "either id or name must be provided")
