@@ -80,8 +80,10 @@ func ByName(name string) shuttle.Tool {
 }
 
 // Names returns the names of all builtin tools.
-// Note: spawn_agent is NOT included - it requires per-agent context (session ID, spawn handler)
-// and must be created via NewSpawnAgentTool() when setting up agents.
+// Note: manage_ephemeral_agents requires per-session context (session ID, spawn
+// handler) and is created at request time via NewManageEphemeralAgentsTool().
+// It is listed here so YAML configs can include it in tools.builtin as an
+// opt-in gate for sub-agent spawning.
 func Names() []string {
 	return []string{
 		"http_request",
@@ -96,6 +98,7 @@ func Names() []string {
 		"agent_management",
 		"run_project",
 		"contact_human",
+		"manage_ephemeral_agents",
 	}
 }
 

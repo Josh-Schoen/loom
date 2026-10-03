@@ -1,6 +1,6 @@
 # LongMemEval Benchmark Guide
 
-**Version**: v1.2.0 | **Status**: ✅ Implemented (branch `feat/longmemeval-benchmark`)
+**Version**: v1.3.0 | **Status**: ✅ Implemented (merged to `main` via PR #159)
 
 ## Table of Contents
 
@@ -37,8 +37,31 @@ The six question categories are:
 
 - Loom server running (`just build-server && ./bin/looms serve`)
 - An LLM provider configured in `~/.loom/looms.yaml` with judge access (examples in this guide use Bedrock Opus 4.6)
+- `server.allow_time_override: true` in `~/.loom/looms.yaml`. In the memory modes (`ingest`, `multi-session`, `conversation`) the harness sends each haystack session's date as `WeaveRequest.occurred_at` so extraction anchors memories at the historical date instead of the run day; `context-stuffing` never sends it, so the baseline runs on a stock server. Without the flag, the server rejects the first memory-mode turn with `FAILED_PRECONDITION` and the harness aborts the whole run with a nonzero exit, naming the flag (pass `--occurred-at=false` to run without the override; memories then anchor to the run date instead of the historical session date. Note: the only A/B measured so far — oracle x30, temporal-reasoning — scored slightly HIGHER with the override off (100% vs 93.3%), because the extractor also reads dates from the conversation text itself; the override's value is mechanism correctness on full haystacks where the text cue may be absent, not a measured accuracy win)
+- For `--mode conversation` additionally `server.allow_assistant_override: true`. Generation-free replay sends the dataset's assistant turns verbatim (`WeaveRequest.replay_assistant_message`); it is gated separately from timestamp anchoring because it lets the caller write the assistant's side of the conversation. The harness aborts the run with a nonzero exit in two cases: the server refuses the field (`FAILED_PRECONDITION`, flag off), or the server accepts the turn but answers with text other than the scripted assistant turn. The second case means the server ignored the field. A looms build that predates generation-free replay, such as v1.4.0, drops the unknown field and generates a new assistant turn, so the run would otherwise become generative replay and still exit 0. Upgrade looms or use another `--mode`. A user turn whose dataset reply is blank (a few occur in the S set) cannot be replayed, so it is sent as a normal generating turn
 - Benchmark binary built: `just build-longmemeval`
 - Network access to `huggingface.co` for the one-time dataset download (~285 MB for the oracle set)
+
+## Scoring with the official LongMemEval judge
+
+The official metric comes from `scripts/longmemeval-eval/evaluate_qa.py` (adapted from
+[xiaowu0162/LongMemEval](https://github.com/xiaowu0162/LongMemEval); judge prompts are byte-identical to upstream):
+
+```bash
+pip install -r scripts/longmemeval-eval/requirements.txt
+# judge model backends: gpt-5.1 (OpenAI, OPENAI_API_KEY), azure-gpt
+# (AZURE_OPENAI_ENDPOINT/_API_KEY/_DEPLOYMENT_ID), or
+# claude-opus-4-6-bedrock (AWS default credential chain)
+python3 scripts/longmemeval-eval/evaluate_qa.py \
+    results/hypotheses.jsonl data/longmemeval_oracle.json claude-opus-4-6-bedrock
+```
+
+Known deviation from upstream, disclosed: the judge reply budget is 64 tokens
+(upstream: `max_tokens: 10`); the verdict check is upstream's substring
+`'yes' in response`, so a verbose judge has marginally more room to emit an
+incidental "yes". Kept for parity with the runs published on the PRs; flip the
+`JUDGE_MAX_TOKENS` constant at the top of the script to 10 to reproduce
+upstream exactly.
 
 ## Quick Start
 
@@ -175,6 +198,7 @@ Selected with `--mode`:
 |------|----------|----------|
 | `ingest` (default) | All haystack sessions + the question run through one agent session. Memory is built during ingestion; the question is asked in the same session. | Evaluating how well graph memory builds from a contiguous stream. |
 | `multi-session` | Separate agent session per haystack conversation, then the question is asked in a fresh session. Cross-session recall via graph memory + conversation memory. | Evaluating real-world Loom usage where sessions are bounded. Note: underperforms ingest mode today (see [Results](#results-we-observed)). |
+| `conversation` | Replays every haystack turn, in order, into one continuous session — user turns as user messages and the original assistant turns recorded verbatim (generation-free), never regenerated. The question is asked in the same thread. Unlike the blob-per-session modes, this exercises the memory pipeline as a live chat would: salience accumulates turn-by-turn and context compression fires as the thread grows. Requires `server.allow_assistant_override: true` (plus `server.allow_time_override: true` for date anchoring). | Evaluating memory under realistic accumulation (salience + compression), not just retrieval over a static transcript. |
 | `context-stuffing` | All session history is injected directly into one Weave call as prompt context; no memory system involved. | Baseline comparison. |
 
 Additional run flags:
@@ -182,6 +206,7 @@ Additional run flags:
 | Flag | Default | What it does |
 |------|---------|--------------|
 | `--isolate` | `true` | Create a fresh `lme-tmp-<qid>` agent per entry; delete it afterward. Ensures no cross-entry memory bleed. |
+| `--occurred-at` | `true` | Send haystack/question dates as `WeaveRequest.occurred_at` so memories anchor at historical dates. Requires `server.allow_time_override: true` on the server. Ignored in `context-stuffing` mode — the no-memory baseline never sends `occurred_at` and runs on a stock server. |
 | `--concurrency` | `3` | Number of entries processed in parallel. Lower to `2` if you see Bedrock throttling. |
 | `--server` | `localhost:60051` | Loom gRPC address. |
 | `--agent` | `""` | Use a specific agent ID instead of cloning the default. |

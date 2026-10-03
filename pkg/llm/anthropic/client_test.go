@@ -227,6 +227,45 @@ func TestClient_ConvertMessages(t *testing.T) {
 	}
 }
 
+func TestClient_ConvertMessages_SkillBodySidecarCoalesces(t *testing.T) {
+	client := &Client{}
+
+	messages := []types.Message{
+		{Role: "user", Content: "load the alpha skill"},
+		{Role: "assistant", ToolCalls: []types.ToolCall{
+			{ID: "t1", Name: "manage_skills",
+				Input: map[string]interface{}{"action": "load", "name": "alpha"}},
+		}},
+		{Role: "tool", ToolUseID: "t1", Content: "Skill loaded: alpha"},
+		{Role: "user", Content: "ALPHA SKILL BODY"},
+	}
+
+	_, apiMessages := client.convertMessages(messages)
+
+	// The tool_result (user-role on the wire) and the following sidecar text
+	// coalesce into ONE user message with mixed blocks — never two consecutive
+	// user-role wire messages (Anthropic 400: roles must alternate).
+	if len(apiMessages) != 3 {
+		t.Fatalf("expected 3 wire messages (sidecar coalesced), got %d", len(apiMessages))
+	}
+	for i := 1; i < len(apiMessages); i++ {
+		if apiMessages[i].Role == "user" && apiMessages[i-1].Role == "user" {
+			t.Fatalf("consecutive user-role wire messages at index %d", i)
+		}
+	}
+	last := apiMessages[2]
+	if last.Role != "user" || len(last.Content) != 2 {
+		t.Fatalf("expected one user message with 2 blocks (tool_result + sidecar text), got role=%s blocks=%d",
+			last.Role, len(last.Content))
+	}
+	if last.Content[0].Type != "tool_result" || last.Content[0].ToolUseID != "t1" {
+		t.Errorf("first block must be the t1 tool_result, got %+v", last.Content[0])
+	}
+	if last.Content[1].Type != "text" || last.Content[1].Text != "ALPHA SKILL BODY" {
+		t.Errorf("second block must be the sidecar text, got %+v", last.Content[1])
+	}
+}
+
 func TestContentBlock_MarshalJSON_ToolUseAlwaysHasInput(t *testing.T) {
 	// Anthropic API requires tool_use blocks to always have "input" present.
 	// Even when the LLM returns a tool call with no arguments, the serialized
@@ -625,7 +664,9 @@ func TestClient_Chat_SystemBlockCacheControl(t *testing.T) {
 	client := NewClient(Config{APIKey: "test-key", Endpoint: server.URL})
 	ctx := &mockContext{Context: context.Background()}
 	msgs := []types.Message{
-		{Role: "system", Content: "You are a helpful assistant."},
+		{Role: "system", Content: "ROM operating guide.", CacheBreakpoint: true},
+		{Role: "system", Content: "covers msg:1-5 …summary…", CacheBreakpoint: true},
+		{Role: "system", Content: "transient soft reminder"},
 		{Role: "user", Content: "hi"},
 	}
 	_, err := client.Chat(ctx, msgs, nil)
@@ -633,7 +674,9 @@ func TestClient_Chat_SystemBlockCacheControl(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	// Verify the system block contains cache_control: ephemeral
+	// The compile's markers decide: each marked system message is its own
+	// block carrying cache_control; the unmarked one carries none — ROM and
+	// summary cache independently, and a fold cannot bust ROM's prefix.
 	var parsed map[string]interface{}
 	if err := json.Unmarshal(capturedBody, &parsed); err != nil {
 		t.Fatalf("failed to parse request body: %v", err)
@@ -643,17 +686,21 @@ func TestClient_Chat_SystemBlockCacheControl(t *testing.T) {
 		t.Fatal("expected system field in request")
 	}
 	systemBlocks, ok := systemRaw.([]interface{})
-	if !ok || len(systemBlocks) == 0 {
-		t.Fatal("expected system to be an array of blocks")
+	if !ok || len(systemBlocks) != 3 {
+		t.Fatalf("expected 3 system blocks (one per source message), got %v", systemRaw)
 	}
-	block := systemBlocks[0].(map[string]interface{})
-	cc, hasCacheControl := block["cache_control"]
-	if !hasCacheControl {
-		t.Error("expected cache_control on system block")
-	}
-	ccMap := cc.(map[string]interface{})
-	if ccMap["type"] != "ephemeral" {
-		t.Errorf("expected cache_control.type == ephemeral, got %v", ccMap["type"])
+	for i, wantCC := range []bool{true, true, false} {
+		block := systemBlocks[i].(map[string]interface{})
+		cc, hasCacheControl := block["cache_control"]
+		if hasCacheControl != wantCC {
+			t.Errorf("system block %d: cache_control present=%v, want %v", i, hasCacheControl, wantCC)
+			continue
+		}
+		if wantCC {
+			if ccMap := cc.(map[string]interface{}); ccMap["type"] != "ephemeral" {
+				t.Errorf("system block %d: cache_control.type == %v, want ephemeral", i, ccMap["type"])
+			}
+		}
 	}
 }
 

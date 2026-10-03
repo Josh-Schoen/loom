@@ -27,9 +27,11 @@ import (
 	"github.com/teradata-labs/loom/pkg/llm/bedrock"
 	"github.com/teradata-labs/loom/pkg/llm/gemini"
 	"github.com/teradata-labs/loom/pkg/llm/huggingface"
+	"github.com/teradata-labs/loom/pkg/llm/litellm"
 	"github.com/teradata-labs/loom/pkg/llm/mistral"
 	"github.com/teradata-labs/loom/pkg/llm/ollama"
 	"github.com/teradata-labs/loom/pkg/llm/openai"
+	"github.com/teradata-labs/loom/pkg/llm/scheduler"
 	"github.com/teradata-labs/loom/pkg/mcp/manager"
 	"github.com/teradata-labs/loom/pkg/memory"
 	"github.com/teradata-labs/loom/pkg/observability"
@@ -71,9 +73,10 @@ type Registry struct {
 	onReload     ReloadCallback         // Callback when config changes
 
 	// Agent dependencies (injected by server)
-	errorStore        ErrorStore                 // For error tracking and retrieval
-	permissionChecker *shuttle.PermissionChecker // For permission validation
-	artifactStore     interface{}                // artifacts.Store for workspace tool
+	permissionChecker *shuttle.PermissionChecker   // For permission validation
+	admissionChain    *shuttle.Chain               // Admission hook chain for tool-call admission
+	identityResolver  func(context.Context) string // Resolves AdmissionRequest.UserID from the call context
+	artifactStore     interface{}                  // artifacts.Store for workspace tool
 
 	// providerPool is the server-level named provider pool injected by cmd_serve.go.
 	// Agents can reference pool entries by name in their LLM config (e.g., provider: "fast").
@@ -95,12 +98,13 @@ type Registry struct {
 
 	// taskManager + taskDecomposer are the server-level task subsystem
 	// handles injected by cmd_serve.go. When set, every agent built through
-	// buildAgent gets WithTaskBoard wired so the skills-overhaul Phase D
-	// (task emission) path can fire. The agent's per-config
+	// buildAgent gets WithTaskBoard wired so the skill task emitter can fire
+	// on a manage_skills load. The agent's per-config
 	// memory.task_board.enabled flag controls only tool surfacing
 	// (task_board builtin + kanban prompt supplement + in-context
-	// injection) — emission and the sticky-while-open-tasks checker are
-	// always-on whenever a manager is present. Protected by mu.
+	// injection) — emission (on a new skill activation) and the
+	// sticky-while-open-tasks checker are wired whenever a manager is
+	// present. Protected by mu.
 	taskManager    *task.Manager
 	taskDecomposer *task.Decomposer
 
@@ -145,9 +149,10 @@ type RegistryConfig struct {
 	ToolRegistry *toolregistry.Registry // Tool search registry for dynamic tool discovery
 
 	// Agent dependencies (injected by server)
-	ErrorStore        ErrorStore                 // For error tracking and retrieval
-	PermissionChecker *shuttle.PermissionChecker // For permission validation
-	ArtifactStore     interface{}                // artifacts.Store for workspace tool
+	PermissionChecker *shuttle.PermissionChecker   // For permission validation
+	AdmissionChain    *shuttle.Chain               // Admission hook chain for tool-call admission
+	IdentityResolver  func(context.Context) string // Resolves AdmissionRequest.UserID from the call context
+	ArtifactStore     interface{}                  // artifacts.Store for workspace tool
 
 	// Database encryption (opt-in for enterprise deployments)
 	EncryptDatabase bool   // Enable SQLCipher encryption
@@ -209,8 +214,9 @@ func NewRegistry(config RegistryConfig) (*Registry, error) {
 		tracer:            config.Tracer,
 		sessionStore:      config.SessionStore,
 		toolRegistry:      config.ToolRegistry,
-		errorStore:        config.ErrorStore,
 		permissionChecker: config.PermissionChecker,
+		admissionChain:    config.AdmissionChain,
+		identityResolver:  config.IdentityResolver,
 		artifactStore:     config.ArtifactStore,
 	}
 
@@ -387,6 +393,13 @@ func (r *Registry) LoadAgents(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// WorkflowsDir returns the directory holding saved workflow YAML definitions
+// ($LOOM_DATA_DIR/workflows). Used by the server to resolve workflow_ref (run a
+// saved workflow by name) and to list runnable workflows.
+func (r *Registry) WorkflowsDir() string {
+	return filepath.Join(r.configDir, "workflows")
 }
 
 // LoadWorkflows loads workflow files and registers their coordinator agents
@@ -750,12 +763,14 @@ func (r *Registry) buildAgent(ctx context.Context, config *loomv1.AgentConfig) (
 		opts = append(opts, r.BuildSkillsOptions(skillsConfig, classifierLLM, llmProvider, config.Name)...)
 	}
 
-	// Wire the task subsystem whenever the registry has a manager, so the
-	// skills-overhaul task emitter (Phase D) is reachable for every agent
-	// built through this path. The per-agent memory.task_board.enabled flag
+	// Wire the task subsystem whenever the registry has a manager, so the skill
+	// task emitter is reachable for every agent built through this path. It
+	// fires on a manage_skills load, for a skill that was not already active
+	// for the session, on a goroutine detached from the turn
+	// (Agent.emitSkillTasksAsync). The per-agent memory.task_board.enabled flag
 	// continues to gate *tool surfacing* downstream
 	// (Agent.checkAndRegisterTaskBoardTool, taskBoardPromptSupplement,
-	// buildTaskContext) — emission is unconditional once a manager is wired.
+	// buildTaskContext) — emission needs only a manager and an activation.
 	//
 	// We synthesize a disabled TaskBoardConfig when the agent did not
 	// declare one, so a.taskBoardConfig is never nil. That keeps the
@@ -841,12 +856,18 @@ func (r *Registry) buildAgent(ctx context.Context, config *loomv1.AgentConfig) (
 			}
 		}
 
-		// Set context limits on memory if specified
+		// Set context limits on memory if specified. The reservation is
+		// resolved against the request's real max_tokens (§5.1 "usable"), not
+		// taken from config alone — the marks must never sit above the
+		// provider's refusal line.
 		if config.Llm != nil {
 			if config.Llm.MaxContextTokens > 0 || config.Llm.ReservedOutputTokens > 0 {
 				memory.SetContextLimits(
 					int(config.Llm.MaxContextTokens),
-					int(config.Llm.ReservedOutputTokens))
+					EffectiveOutputReservation(
+						config.Llm.Provider, config.Llm.Model,
+						int(config.Llm.MaxTokens), int(config.Llm.ReservedOutputTokens),
+						int(config.Llm.MaxContextTokens)))
 			}
 		}
 
@@ -864,12 +885,14 @@ func (r *Registry) buildAgent(ctx context.Context, config *loomv1.AgentConfig) (
 	}
 
 	// Inject server dependencies if available
-	if r.errorStore != nil {
-		opts = append(opts, WithErrorStore(r.errorStore))
-	}
-
 	if r.permissionChecker != nil {
 		opts = append(opts, WithPermissionChecker(r.permissionChecker))
+	}
+	if r.admissionChain != nil {
+		opts = append(opts, WithAdmissionHooks(r.admissionChain))
+	}
+	if r.identityResolver != nil {
+		opts = append(opts, WithIdentityResolver(r.identityResolver))
 	}
 
 	// Create agent with configuration
@@ -882,11 +905,6 @@ func (r *Registry) buildAgent(ctx context.Context, config *loomv1.AgentConfig) (
 	// Configure shared memory threshold from config
 	if config.Memory != nil && config.Memory.SharedMemoryThresholdBytes != 0 {
 		agent.SetSharedMemoryThreshold(config.Memory.SharedMemoryThresholdBytes)
-	}
-
-	// Configure max tool results from config
-	if config.Memory != nil && config.Memory.MaxToolResults > 0 {
-		agent.SetMaxToolResults(int(config.Memory.MaxToolResults))
 	}
 
 	// Register workspace tool if artifactStore is available
@@ -927,6 +945,11 @@ func (r *Registry) buildAgent(ctx context.Context, config *loomv1.AgentConfig) (
 	if config.Tools != nil && len(config.Tools.Builtin) > 0 {
 		// Filter builtin tools based on config
 		for _, toolName := range config.Tools.Builtin {
+			// The server constructs this tool later with request-scoped session
+			// and agent identifiers when the configuration explicitly opts in.
+			if toolName == "manage_ephemeral_agents" {
+				continue
+			}
 			tool := builtin.ByName(toolName)
 			if tool != nil {
 				// Wrap with PromptAwareTool if prompts registry available
@@ -961,7 +984,14 @@ func (r *Registry) buildAgent(ctx context.Context, config *loomv1.AgentConfig) (
 		// No backward compatibility: tool_search must be explicitly listed in config
 
 		if shouldRegisterToolSearch {
-			searchTool := shuttle.Tool(toolregistry.NewSearchTool(r.toolRegistry))
+			st := toolregistry.NewSearchTool(r.toolRegistry)
+			// Hide tools the agent's permission policy would refuse, so the model
+			// never discovers (and then calls) a disabled tool via tool_search.
+			// Read lazily so it reflects the checker regardless of wiring order.
+			st.SetToolFilter(func(name string) bool {
+				return agent.permissionChecker == nil || agent.permissionChecker.Advertisable(name)
+			})
+			searchTool := shuttle.Tool(st)
 			// Wrap with PromptAwareTool for externalized descriptions
 			if agent.prompts != nil {
 				searchTool = shuttle.NewPromptAwareTool(searchTool, agent.prompts, "tools.tool_search")
@@ -976,7 +1006,7 @@ func (r *Registry) buildAgent(ctx context.Context, config *loomv1.AgentConfig) (
 		// Wrap the MCP manager to satisfy the shuttle.MCPManager interface
 		var mcpMgrAdapter shuttle.MCPManager
 		if r.mcpMgr != nil {
-			mcpMgrAdapter = &mcpManagerAdapter{mgr: r.mcpMgr}
+			mcpMgrAdapter = toolregistry.NewShuttleMCPManager(r.mcpMgr)
 		}
 		agent.SetToolRegistryForDynamicDiscovery(r.toolRegistry, mcpMgrAdapter)
 		r.logger.Debug("Enabled dynamic tool registration for agent",
@@ -1148,7 +1178,7 @@ func (r *Registry) createLLMProvider(config *loomv1.LLMConfig) (LLMProvider, err
 		if profile == "" {
 			profile = "default"
 		}
-		return bedrock.NewClient(bedrock.Config{
+		return bedrock.NewClientForModel(bedrock.Config{
 			Region:            region,
 			Profile:           profile,
 			ModelID:           config.Model,
@@ -1167,6 +1197,7 @@ func (r *Registry) createLLMProvider(config *loomv1.LLMConfig) (LLMProvider, err
 			Model:             config.Model,
 			MaxTokens:         int(config.MaxTokens),
 			Temperature:       float64(config.Temperature),
+			Seed:              config.Seed,
 			RateLimiterConfig: rlCfg,
 		}), nil
 
@@ -1183,6 +1214,20 @@ func (r *Registry) createLLMProvider(config *loomv1.LLMConfig) (LLMProvider, err
 			RateLimiterConfig: rlCfg,
 		}), nil
 
+	case "litellm":
+		endpoint := os.Getenv("LITELLM_ENDPOINT")
+		if endpoint == "" {
+			endpoint = os.Getenv("LITELLM_BASE_URL")
+		}
+		return litellm.NewClient(litellm.Config{
+			Endpoint:          endpoint,
+			APIKey:            os.Getenv("LITELLM_API_KEY"),
+			Model:             config.Model,
+			MaxTokens:         int(config.MaxTokens),
+			Temperature:       float64(config.Temperature),
+			RateLimiterConfig: rlCfg,
+		}), nil
+
 	case "azure-openai", "azureopenai":
 		apiKey := os.Getenv("AZURE_OPENAI_API_KEY")
 		if apiKey == "" {
@@ -1192,14 +1237,19 @@ func (r *Registry) createLLMProvider(config *loomv1.LLMConfig) (LLMProvider, err
 		if endpoint == "" {
 			return nil, fmt.Errorf("AZURE_OPENAI_ENDPOINT environment variable not set")
 		}
-		return azureopenai.NewClient(azureopenai.Config{
+		azCfg := azureopenai.Config{
 			APIKey:            apiKey,
 			Endpoint:          endpoint,
 			DeploymentID:      config.Model,
 			MaxTokens:         int(config.MaxTokens),
 			Temperature:       float64(config.Temperature),
 			RateLimiterConfig: rlCfg,
-		})
+		}
+		if scheduler.Enabled() {
+			azCfg.CapacityObserver = scheduler.Default().For(
+				"azure-openai|"+endpoint+"|"+config.Model, scheduler.Config{})
+		}
+		return azureopenai.NewClient(azCfg)
 
 	case "mistral":
 		apiKey := os.Getenv("MISTRAL_API_KEY")
@@ -1253,9 +1303,18 @@ func (r *Registry) createLLMProvider(config *loomv1.LLMConfig) (LLMProvider, err
 // When proto config has disabled=true, returns a disabled rate limiter config.
 // Non-zero numeric fields override the provider defaults set by NewRateLimiter().
 func (r *Registry) buildRateLimiterConfig(proto *loomv1.LLMRateLimitConfig) llm.RateLimiterConfig {
+	return BuildRateLimiterConfig(proto, r.logger)
+}
+
+// BuildRateLimiterConfig converts the proto LLMRateLimitConfig to the llm
+// package config. Exported so every client-construction path (the agent
+// registry and looms' custom-LLM path) applies identical rate-limit
+// semantics — a client built without this is unthrottled and, because 429
+// retry lives inside the limiter, also retry-less (issue #348).
+func BuildRateLimiterConfig(proto *loomv1.LLMRateLimitConfig, logger *zap.Logger) llm.RateLimiterConfig {
 	cfg := llm.RateLimiterConfig{
 		Enabled: true,
-		Logger:  r.logger,
+		Logger:  logger,
 		// All numeric fields left at zero → NewRateLimiter() fills them from DefaultRateLimiterConfig()
 	}
 
@@ -1665,6 +1724,26 @@ func (r *Registry) GetConfig(name string) *loomv1.AgentConfig {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return r.configs[name]
+}
+
+// GraphMemoryEnabledFor reports whether graph memory is enabled for the agent
+// identified by GUID or name. Mirrors the server's subsystem wiring rule: on
+// unless the YAML explicitly sets memory.graph_memory.enabled: false. Unknown
+// agents (not registered, or ephemeral) resolve to the default-on behavior.
+func (r *Registry) GraphMemoryEnabledFor(nameOrID string) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	name := nameOrID
+	if info, ok := r.agentInfo[nameOrID]; ok {
+		name = info.Name
+	}
+	cfg, ok := r.configs[name]
+	if !ok || cfg == nil {
+		return true
+	}
+	gm := cfg.GetMemory().GetGraphMemory()
+	return gm == nil || gm.Enabled
 }
 
 // DeleteAgent removes an agent by name or GUID
@@ -2684,15 +2763,4 @@ func removeFile(path string) error {
 		return nil
 	}
 	return err
-}
-
-// mcpManagerAdapter adapts *manager.Manager to shuttle.MCPManager interface.
-// This is needed because manager.Manager.GetClient returns (*client.Client, error)
-// but the interface requires (interface{}, error) for generic handling.
-type mcpManagerAdapter struct {
-	mgr *manager.Manager
-}
-
-func (a *mcpManagerAdapter) GetClient(serverName string) (interface{}, error) {
-	return a.mgr.GetClient(serverName)
 }

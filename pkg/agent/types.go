@@ -15,6 +15,7 @@ package agent
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"sync"
 	"time"
@@ -22,6 +23,7 @@ import (
 	loomv1 "github.com/teradata-labs/loom/gen/go/loom/v1"
 	"github.com/teradata-labs/loom/pkg/communication"
 	"github.com/teradata-labs/loom/pkg/fabric"
+	mcpadapter "github.com/teradata-labs/loom/pkg/mcp/adapter"
 	"github.com/teradata-labs/loom/pkg/memory"
 	"github.com/teradata-labs/loom/pkg/observability"
 	"github.com/teradata-labs/loom/pkg/patterns"
@@ -34,6 +36,7 @@ import (
 	skilltasks "github.com/teradata-labs/loom/pkg/skills/tasks"
 	"github.com/teradata-labs/loom/pkg/storage"
 	"github.com/teradata-labs/loom/pkg/task"
+	"github.com/teradata-labs/loom/pkg/taskctx"
 	"github.com/teradata-labs/loom/pkg/types"
 )
 
@@ -77,11 +80,41 @@ type Agent struct {
 	// Permission checker for tool execution
 	permissionChecker *shuttle.PermissionChecker
 
+	// Admission hook chain consulted before every tool body runs
+	admissionChain *shuttle.Chain
+
+	// hitlPark, when non-nil, enables HITL park-and-resume: a batch needing a
+	// human decision ends the turn (TurnParkedError) instead of holding it.
+	hitlPark *hitlParkConfig
+
+	// resourceAwait, when non-nil (WithResourceAwait), enables resource-await
+	// park: a successful tool result carrying AwaitResource ends the turn
+	// parked until the named resource reaches a terminal state. Requires
+	// hitlPark (the same durable-row machinery finishes the turn).
+	resourceAwait ResourceAwaitHandler
+
+	// parkedHandles holds the MCP session-handle collector of each session's
+	// parked turn, so a same-process resume adopts its handles instead of
+	// finding them released. One slot per session; guardParkedTail now
+	// admits a new turn once a park LAPSES, so a second park can overwrite the
+	// slot — abandonParkedRequest releases before closing a dead turn's row. Pooled embedders — a fresh Agent per call, where
+	// adoption can never happen — drain the slot explicitly at each park via
+	// ReleaseParkedHandles, keeping call-scoped semantics with no leak.
+	// sessionLocks serializes resumes per session inside this process, so two
+	// deliveries of one decision cannot both execute its batch.
+	sessionLocksMu sync.Mutex
+	sessionLocks   map[string]*sync.Mutex
+
+	parkedHandlesMu sync.Mutex
+	parkedHandles   map[string]*mcpadapter.HandleCollector
+
+	// Resolves the caller identity (AdmissionRequest.UserID) from the call
+	// context; injected here because pkg/shuttle cannot import the storage
+	// layer that owns the user-id context key without a cycle
+	identityResolver func(context.Context) string
+
 	// Memory manager for conversation history
 	memory *Memory
-
-	// Error store for tool execution errors (supports error submission channel pattern)
-	errorStore ErrorStore
 
 	// LLM provider for generating responses
 	llm LLMProvider
@@ -108,21 +141,20 @@ type Agent struct {
 	// Pattern orchestration
 	orchestrator *patterns.Orchestrator
 
-	// Skill orchestration. The skillOrchestrator manages activation lifecycle
-	// and prompt injection. The discovery component (when present) is the
-	// new entry point introduced by the skills overhaul: it composes
-	// binding resolution, the hierarchical PageIndex router, and the FTS5
-	// fallback. When discovery is nil, runConversationLoop falls back to
-	// the legacy MatchSkills filter path for backward compatibility.
+	// Skill orchestration. The skillOrchestrator owns the activation lifecycle;
+	// skills enter the conversation only through manage_skills, never by prompt
+	// injection. The discovery component (when present) composes binding
+	// resolution, the hierarchical PageIndex router and the FTS5 fallback for
+	// callers that drive it directly — the conversation loop does not.
 	skillOrchestrator *skills.Orchestrator
 	skillDiscovery    *discovery.Discovery
 	// skillTaskEmitter materializes tasks for newly-activated skills onto
-	// the agent's task board. nil means skill activations do not emit tasks
-	// (legacy behavior).
+	// the agent's task board. nil means skill activations do not emit tasks.
+	// Driven from the manage_skills load path via Agent.emitSkillTasksAsync.
 	skillTaskEmitter *skilltasks.Emitter
-	// skillsTurnState tracks which skills were activated in the current
-	// turn so phase D can emit tasks only for the newly-activated set.
-	skillsTurnState map[string]map[string]bool // sessionID -> skillName -> activated-this-turn
+	// skillTaskEmits counts the detached emit goroutines still in flight, so
+	// they can be joined without polling. See Agent.emitSkillTasksAsync.
+	skillTaskEmits sync.WaitGroup
 
 	// End-of-turn hygiene enforcement for skill-emitted tasks. Constructed
 	// when both skillOrchestrator and taskManager are present; runs at the
@@ -139,32 +171,29 @@ type Agent struct {
 	// MCP client tracking for cleanup (lazy initialized)
 	mcpClients map[string]MCPClientRef
 
+	// Server-level usage guidance from MCP servers whose tools this agent
+	// registered (InitializeResult.instructions), keyed by server name.
+	// Rendered into the system prompt by mcpInstructionsPromptSupplement.
+	mcpServerInstructions map[string]string
+
 	// Dynamic tool discovery for MCP servers (lazy tool loading)
 	dynamicDiscovery *DynamicToolDiscovery
 
 	// Shared memory store for large tool results (prevents context overflow)
 	sharedMemory *storage.SharedMemoryStore
 
-	// Reference tracker for automatic cleanup of shared memory references when sessions end
-	refTracker *storage.SessionReferenceTracker
-
-	// SQL result store for queryable large SQL results
-	sqlResultStore storage.ResultStore
-
 	// Configurable shared memory threshold for large tool results.
 	// -1 = use storage.DefaultSharedMemoryThreshold; 0 = always reference; >0 = byte threshold
 	sharedMemoryThreshold int64
 
-	// Maximum tool results to keep in conversation kernel. 0 = use default (5).
-	maxToolResults int
-
 	// Token counter for accurate token estimation
 	tokenCounter *TokenCounter
 
-	// Automatic finding extraction
-	enableFindingExtraction       bool // Whether automatic extraction is enabled
-	extractionCadence             int  // Number of tool executions between extractions
-	toolExecutionsSinceExtraction int  // Counter for tool executions since last extraction
+	// In-turn SQLite databases backing query_tool_result's sql mode (HLD §7.1):
+	// per (session, message), lazily built, dropped at turn end. Guarded by
+	// inTurnSQLMu.
+	inTurnSQL   map[inTurnSQLKey]*sql.DB
+	inTurnSQLMu sync.Mutex
 
 	// Workflow communication context (injected dynamically for workflow agents)
 	workflowCommContext *WorkflowCommunicationContext
@@ -178,16 +207,40 @@ type Agent struct {
 	// Guarded by a.mu.
 	lazyToolSets []lazyToolSet
 
-	// suppressedBuiltinTools blocks agent-internal progressive-disclosure
-	// registrations (graph_memory, task_board, conversation_memory,
-	// session_memory) and runtime registrations (get_error_details,
-	// query_tool_result) from surfacing those tools to the LLM. Subsystems
-	// themselves (extractor, task manager, error store) keep running.
+	// suppressedBuiltinTools blocks agent-internal registrations (graph_memory,
+	// task_board, manage_skills, load_pattern) and the retrieval tools
+	// (query_tool_result, recall) from surfacing to the LLM. Subsystems
+	// themselves (extractor, task manager) keep running.
 	//
 	// Populated by WithoutBuiltinTool options. The server (cmd/looms) is
 	// the single source of truth for which tools should be surfaced —
 	// agent code only consults this map.
 	suppressedBuiltinTools map[string]bool
+
+	// Per-session advertised-tool projection. The shared tools Registry is the
+	// definition store (what CAN exist); advertisement is scoped per session so
+	// one session's event never changes another's tool list.
+	//
+	// sessionToolLedger maps a session ID to the set of tool names THIS
+	// session's own events registered (skill required_tools, progressive-
+	// disclosure error/query tools). scopedToolNames is the union of every
+	// session-scoped name across all sessions: a name in this set is advertised
+	// to a session ONLY when that session's ledger holds it. baseToolNames is
+	// the always-advertised set captured once, before any event-driven
+	// registration, so a base tool a skill happens to require is not mistaken
+	// for a session-scoped tool. Base tools never enter scopedToolNames, so the
+	// projection can never drop one. Guarded by a.mu.
+	sessionToolLedger map[string]map[string]bool
+	scopedToolNames   map[string]bool
+	baseToolNames     map[string]bool
+	baseToolsOnce     sync.Once
+
+	// Per-session resource-lease ledger: the scarce backend resources each
+	// session's conversation currently holds, tracked from backend-declared
+	// lease events on tool results and mirrored onto the LLM slot scheduler's
+	// RESOURCE_HOLDER class. Self-guarded (own mutex); zero value ready.
+	// Retired with the session, like sessionToolLedger. See lease_ledger.go.
+	leases leaseLedger
 
 	// Graph-backed episodic memory (optional).
 	graphMemoryStore  memory.GraphMemoryStore
@@ -199,6 +252,15 @@ type Agent struct {
 	taskDecomposer  *task.Decomposer
 	taskBoardConfig *loomv1.TaskBoardConfig
 
+	// implicitTasks records a task per working turn, deterministically, without
+	// the model electing to call task_board. Nil disables implicit recording.
+	//
+	// Separate from taskBoardConfig on purpose: that flag governs whether the
+	// AGENT sees the board, this governs whether the RUNTIME records one. A
+	// board that only fills when a model remembers to ask is a board users
+	// cannot rely on.
+	implicitTasks *task.ImplicitEmitter
+
 	// Graph memory automatic extraction (mirrors finding extraction pattern).
 	enableGraphMemoryExtraction        bool
 	graphExtractionCadence             int
@@ -208,6 +270,17 @@ type Agent struct {
 	// Conversation-turn-based graph extraction (fires on LLM responses, not tool use).
 	graphConversationExtractionCadence int // 0 = disabled
 	graphTurnsSinceExtraction          int
+
+	// Debug context-dump sink. Lazily constructed on the first provider call
+	// that has dumping enabled; stays nil on the production path. See
+	// context_dump.go.
+	contextDump     *contextDumper
+	contextDumpOnce sync.Once
+
+	// Per-mutation debug carrier injected into the memory and skill components.
+	// Shares the context-dump switch; a no-op on the production path. See
+	// context_debug.go.
+	ctxDebug *contextDebug
 }
 
 // WorkflowCommunicationContext contains dynamic workflow communication info injected into prompts
@@ -272,6 +345,11 @@ type Config struct {
 	// ReservedOutputTokens is the number of tokens reserved for model output (0 = use defaults, typically 10%)
 	ReservedOutputTokens int
 
+	// ProtectedRecentTurns is K (HLD §5.1): the top rung of relief's halving
+	// ladder — the newest turns relief tries hardest to keep, though the ladder
+	// walks toward T−1 when shedding at K is not enough. 0 = default (16).
+	ProtectedRecentTurns int
+
 	// PatternConfig controls pattern injection (nil = use defaults)
 	PatternConfig *PatternConfig
 
@@ -295,6 +373,20 @@ type Config struct {
 	// RecoveryConfig holds tunables for the self-healing orchestrator.
 	// Nil uses DefaultRecoveryConfig().
 	RecoveryConfig *RecoveryConfig
+
+	// Debug holds opt-in diagnostic switches, all off by default.
+	Debug DebugConfig
+}
+
+// DebugConfig holds opt-in diagnostic switches. Every field defaults to its
+// zero value (off) so the production path stays untouched unless a switch is
+// explicitly set.
+type DebugConfig struct {
+	// ContextDump enables one un-redacted dump record per provider call,
+	// capturing the compiled (messages, tools) about to be dispatched. Written
+	// only to a local per-run sink, never to zap/Hawk. Off by default; also
+	// enabled via the LOOM_DEBUG_CONTEXT_DUMP environment variable.
+	ContextDump bool
 }
 
 // PatternConfig holds pattern injection configuration
@@ -384,6 +476,7 @@ func ValidatePatternConfig(cfg *PatternConfig) error {
 // Type aliases for backward compatibility with code that imports pkg/agent.
 // These types are now defined in pkg/types to break import cycles.
 type Message = types.Message
+type ContentBlock = types.ContentBlock
 type ToolCall = types.ToolCall
 type Usage = types.Usage
 type LLMResponse = types.LLMResponse
@@ -415,6 +508,16 @@ type agentContext struct {
 	session          *Session
 	tracer           observability.Tracer
 	progressCallback ProgressCallback
+
+	// taskBinding is this turn's lazily-filled task attribution slot. Nil when
+	// implicit task recording is off or no store is wired.
+	taskBinding *taskctx.Binding
+	// turnIndex is the session turn this conversation belongs to, taken from
+	// the turn the store derived for the opening user message.
+	turnIndex int64
+	// userMessage seeds an implicit task's title, so a board reads as work
+	// rather than as a numbered log.
+	userMessage string
 }
 
 func (c *agentContext) Session() *Session {
@@ -428,3 +531,12 @@ func (c *agentContext) Tracer() observability.Tracer {
 func (c *agentContext) ProgressCallback() ProgressCallback {
 	return c.progressCallback
 }
+
+// TaskBinding returns this turn's lazily-filled task attribution slot.
+func (c *agentContext) TaskBinding() *taskctx.Binding { return c.taskBinding }
+
+// TurnIndex returns the session turn this conversation belongs to.
+func (c *agentContext) TurnIndex() int64 { return c.turnIndex }
+
+// UserMessage returns the turn's opening user message.
+func (c *agentContext) UserMessage() string { return c.userMessage }

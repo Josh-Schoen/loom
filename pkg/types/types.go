@@ -129,6 +129,31 @@ type Message struct {
 	// Defaults to "default-user" for SQLite backends.
 	UserID string
 
+	// Turn is the session turn this message belongs to. Derived at insert,
+	// exactly like the seq — no counter, no session state (HLD §4.5): the
+	// Chat()-entry persist site is the only turn-incrementing event.
+	Turn int64
+
+	// Evicted marks a tool row whose payload was shed under context pressure.
+	// Write-once true, set only inside releasePressure; no code path clears it.
+	Evicted bool
+
+	// Folded marks a row folded into the session summary. Write-once true, set
+	// only inside releasePressure; folded rows are filtered at the database read.
+	Folded bool
+
+	// CacheBreakpoint marks a compiled message where a provider prompt-cache
+	// breakpoint (cache_control) should be placed. Transient — set only by
+	// compileLocked at render time, never persisted. The compile decides the
+	// "perfect place" (ROM, summary, and the last message before any current-turn
+	// offload stub); each provider client honors it.
+	CacheBreakpoint bool
+	// TaskID attributes this message to the task that was claimed when it was
+	// written. Empty is the normal case — not every turn runs under a task —
+	// and is persisted as NULL. Stamped from the ambient task attribution on
+	// the context; see pkg/task.Attribution.
+	TaskID string
+
 	// Timestamp when the message was created
 	Timestamp time.Time
 
@@ -140,6 +165,28 @@ type Message struct {
 }
 
 // Usage tracks LLM token usage and costs.
+//
+// Token buckets are disjoint wherever loom parses the provider's cache fields:
+// InputTokens then counts only prompt tokens that were neither read from nor
+// written to the prompt cache, and the cache buckets are reported separately,
+// so the full prompt is InputTokens + CacheReadInputTokens +
+// CacheCreationInputTokens. This is the Anthropic/Bedrock convention; the
+// OpenAI-compatible (litellm, Mistral, HuggingFace) and Gemini clients subtract
+// the cache buckets out of their cache-inclusive prompt counts to match. Azure
+// OpenAI and Ollama parse no cache fields and report the provider's prompt count.
+//
+// TotalTokens is InputTokens + OutputTokens where that sum is exact: the
+// Anthropic, Bedrock InvokeModel/SDK and Ollama clients add the two, and the
+// OpenAI-compatible clients take the provider's total minus the cache buckets,
+// which reduces to the same sum. Gemini computes total minus cache the same
+// way, but its total can exceed InputTokens + OutputTokens by tokens loom does
+// not break out (thinking tokens on thinking models, tool-use prompt tokens).
+// Two clients pass the provider's total through unchanged: Azure OpenAI
+// (cache-inclusive, consistent with its InputTokens) and Bedrock Converse,
+// whose AWS totalTokens is not documented as including or excluding the cache
+// buckets.
+//
+// Throughput limits are a separate question: see RateLimitTokens.
 type Usage struct {
 	InputTokens  int
 	OutputTokens int
@@ -150,6 +197,27 @@ type Usage struct {
 	CacheReadInputTokens int
 	// CacheCreationInputTokens: tokens written to prompt cache (billed at 1.25x for Anthropic).
 	CacheCreationInputTokens int
+	// RateLimitTokens is the figure capacity accounting charges for this call
+	// when it differs from TotalTokens. The OpenAI-compatible and Gemini clients
+	// set it to the provider's raw, cache-inclusive total. OpenAI and Gemini
+	// count cached prompt tokens toward TPM; behind a gateway it depends on the
+	// upstream (Bedrock, for one, does not deduct cache hits from its limits),
+	// so the raw total is the conservative choice, and it is what capacity
+	// accounting charged before cache tokens were split out of InputTokens.
+	// Zero means TotalTokens is the charged figure. Read it through
+	// ThroughputTokens.
+	RateLimitTokens int
+}
+
+// ThroughputTokens returns the tokens the provider metered against its
+// throughput limit for this usage: RateLimitTokens when set, else TotalTokens.
+// Capacity accounting (the slot scheduler's TPM window) must use this, never
+// TotalTokens directly.
+func (u Usage) ThroughputTokens() int {
+	if u.RateLimitTokens > 0 {
+		return u.RateLimitTokens
+	}
+	return u.TotalTokens
 }
 
 // LLMResponse represents a response from the LLM.
@@ -255,6 +323,18 @@ type Session struct {
 	// Defaults to "default-user" for SQLite backends.
 	UserID string
 
+	// Incarnation distinguishes INCARNATIONS of a session id across its
+	// durable lifetime: a nanosecond-resolution nonce stamped once at
+	// creation and persisted verbatim, never updated. It exists because
+	// CreatedAt persists at SECOND resolution — in memory the implicit-task
+	// epoch used CreatedAt.UnixNano(), but a store round trip truncated it,
+	// so after a restart a same-second delete-and-recreate of a session id
+	// re-derived the previous incarnation's idempotency key and the new
+	// conversation's first turn was declined against the dead task's spent
+	// key. Zero means "no persisted incarnation" (a legacy row, or a
+	// backend that does not store it) and readers fall back to CreatedAt.
+	Incarnation int64
+
 	// Messages is the conversation history (flat, for backward compatibility)
 	Messages []Message
 
@@ -333,48 +413,6 @@ func (s *Session) GetMessages() []Message {
 	return messages
 }
 
-// TrimLastN removes the last n messages from the flat Messages list.
-// If n is 0, it syncs the flat list to match the segmented memory length
-// (used after AggressiveTrim where segmented memory was already trimmed).
-// Respects tool_use/tool_result pair boundaries.
-func (s *Session) TrimLastN(n int) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if len(s.Messages) == 0 {
-		return
-	}
-
-	if n == 0 {
-		// Sync mode: trim flat list to match segmented memory message count.
-		if s.SegmentedMem != nil {
-			if segMem, ok := s.SegmentedMem.(SegmentedMemoryInterface); ok {
-				targetLen := len(segMem.GetMessagesForLLM())
-				if targetLen < len(s.Messages) {
-					s.Messages = s.Messages[:targetLen]
-				}
-			}
-		}
-		s.UpdatedAt = time.Now()
-		return
-	}
-
-	if n >= len(s.Messages) {
-		s.Messages = s.Messages[:0]
-		s.UpdatedAt = time.Now()
-		return
-	}
-
-	cutIdx := len(s.Messages) - n
-	// Expand backward to not orphan tool results.
-	for cutIdx > 0 && s.Messages[cutIdx].Role == "tool" {
-		cutIdx--
-	}
-
-	s.Messages = s.Messages[:cutIdx]
-	s.UpdatedAt = time.Now()
-}
-
 // MessageCount returns the total number of messages in the session.
 // Thread-safe via RLock.
 // Returns int32 capped at MaxInt32 to prevent overflow when used in proto messages.
@@ -419,8 +457,27 @@ type HITLRequestInfo struct {
 	// Priority is the request priority (low, normal, high, critical)
 	Priority string
 
+	// Kind classifies the request at origin: "approval" (hook-held) or
+	// "question" (contact_human). Empty is treated as "question" by consumers.
+	Kind string
+
+	// Summary is the display digest of the stored request: tool+args for an
+	// approval, the question text for a question.
+	Summary string
+
+	// Params mirrors the stored request's parameter map: the held call's full
+	// parameters for an approval, empty for a question.
+	Params map[string]interface{}
+
+	// ParamsTruncated mirrors the stored request's flag: true when the size
+	// bound cut whole pairs out of Params.
+	ParamsTruncated bool
+
 	// Timeout is how long to wait for human response
 	Timeout time.Duration
+
+	// ExpiresAt is when the request expires, mirroring the stored request.
+	ExpiresAt time.Time
 
 	// Context provides additional context for the request
 	Context map[string]interface{}
@@ -446,6 +503,18 @@ type ProgressEvent struct {
 	// HITLRequest contains HITL request details (only when Stage == StageHumanInTheLoop)
 	HITLRequest *HITLRequestInfo
 
+	// Droppable marks an event whose ONLY purpose is to produce traffic — a
+	// HITL hold heartbeat. A transport under backpressure may discard it
+	// rather than block the emitting goroutine: losing one is harmless,
+	// unlike a card, a token chunk, or a tool lifecycle event, all of which
+	// carry state the consumer cannot reconstruct.
+	//
+	// This is what keeps a heartbeat from deepening the very hang it exists to
+	// prevent. A hold emits from the turn goroutine, so a blocking send on a
+	// wedged consumer stalls the poll loop that would otherwise see the human's
+	// decision. Never set this on an event carrying state.
+	Droppable bool
+
 	// Token streaming fields (for real-time LLM response rendering)
 
 	// PartialContent is the accumulated content so far during streaming
@@ -453,6 +522,12 @@ type ProgressEvent struct {
 
 	// IsTokenStream indicates if this event is a token streaming update
 	IsTokenStream bool
+
+	// IsToolInputStream indicates the provider is streaming tool-input
+	// (function-call argument) bytes. It carries no content — tool input is
+	// never rendered as partial text — and exists so a long tool-argument
+	// generation registers as activity instead of silence. Always Droppable.
+	IsToolInputStream bool
 
 	// TokenCount is the running count of tokens received
 	TokenCount int32
@@ -518,7 +593,8 @@ type Context interface {
 
 // SafeInt32 converts an int to int32, capping at MaxInt32/MinInt32 to prevent overflow.
 // This prevents gosec G115 integer overflow warnings when converting to proto int32 fields.
-// Use this when converting Go int (which may be int64) to proto int32 fields.
+// Use this when converting Go int (which may be int64) to proto int32 fields
+// (for example ListSessionsResponse.total_count when the filtered session count exceeds MaxInt32).
 func SafeInt32(n int) int32 {
 	const maxInt32 = 2147483647  // math.MaxInt32
 	const minInt32 = -2147483648 // math.MinInt32

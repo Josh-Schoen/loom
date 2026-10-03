@@ -24,10 +24,10 @@ import (
 	"net/url"
 	"os"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/teradata-labs/loom/pkg/llm"
+	"github.com/teradata-labs/loom/pkg/llm/catalog"
 	llmtypes "github.com/teradata-labs/loom/pkg/llm/types"
 	"github.com/teradata-labs/loom/pkg/shuttle"
 )
@@ -45,12 +45,6 @@ const (
 	DefaultTemperature = 1.0
 	// DefaultTimeout is the default HTTP timeout
 	DefaultTimeout = 60 * time.Second
-)
-
-// Global singleton rate limiter shared across all Anthropic clients
-var (
-	globalRateLimiter     *llm.RateLimiter
-	globalRateLimiterOnce sync.Once
 )
 
 // DefaultAnthropicRateLimiterConfig returns safe defaults for Anthropic's API.
@@ -133,7 +127,7 @@ func NewClient(config Config) *Client {
 	// Initialize rate limiter if enabled
 	var rateLimiter *llm.RateLimiter
 	if config.RateLimiterConfig.Enabled {
-		rateLimiter = getOrCreateGlobalRateLimiter(config.RateLimiterConfig)
+		rateLimiter = llm.SharedRateLimiter("anthropic|"+llm.CredentialScope(config.APIKey)+"|"+config.Model, mergedRateLimiterConfig(config.RateLimiterConfig))
 	}
 
 	return &Client{
@@ -149,42 +143,38 @@ func NewClient(config Config) *Client {
 	}
 }
 
-// getOrCreateGlobalRateLimiter returns the global rate limiter, creating it if necessary.
-// Caller-supplied non-zero fields override DefaultAnthropicRateLimiterConfig values.
-func getOrCreateGlobalRateLimiter(config llm.RateLimiterConfig) *llm.RateLimiter {
-	globalRateLimiterOnce.Do(func() {
-		// Start from Anthropic-specific defaults, then apply caller overrides.
-		// This ensures we don't blindly fall through to DefaultRateLimiterConfig()
-		// (which is tuned for Bedrock and allows 2 RPS — exceeding Anthropic Tier 1).
-		merged := DefaultAnthropicRateLimiterConfig()
-		merged.Enabled = config.Enabled
-		if config.Logger != nil {
-			merged.Logger = config.Logger
-		}
-		if config.RequestsPerSecond > 0 {
-			merged.RequestsPerSecond = config.RequestsPerSecond
-		}
-		if config.TokensPerMinute > 0 {
-			merged.TokensPerMinute = config.TokensPerMinute
-		}
-		if config.BurstCapacity > 0 {
-			merged.BurstCapacity = config.BurstCapacity
-		}
-		if config.MinDelay > 0 {
-			merged.MinDelay = config.MinDelay
-		}
-		if config.MaxRetries > 0 {
-			merged.MaxRetries = config.MaxRetries
-		}
-		if config.RetryBackoff > 0 {
-			merged.RetryBackoff = config.RetryBackoff
-		}
-		if config.QueueTimeout > 0 {
-			merged.QueueTimeout = config.QueueTimeout
-		}
-		globalRateLimiter = llm.NewRateLimiter(merged)
-	})
-	return globalRateLimiter
+// mergedRateLimiterConfig starts from Anthropic-specific defaults, then
+// applies caller overrides. This ensures we don't blindly fall through to
+// llm.DefaultRateLimiterConfig() (which is tuned for Bedrock and allows
+// 2 RPS — exceeding Anthropic Tier 1).
+func mergedRateLimiterConfig(config llm.RateLimiterConfig) llm.RateLimiterConfig {
+	merged := DefaultAnthropicRateLimiterConfig()
+	merged.Enabled = config.Enabled
+	if config.Logger != nil {
+		merged.Logger = config.Logger
+	}
+	if config.RequestsPerSecond > 0 {
+		merged.RequestsPerSecond = config.RequestsPerSecond
+	}
+	if config.TokensPerMinute > 0 {
+		merged.TokensPerMinute = config.TokensPerMinute
+	}
+	if config.BurstCapacity > 0 {
+		merged.BurstCapacity = config.BurstCapacity
+	}
+	if config.MinDelay > 0 {
+		merged.MinDelay = config.MinDelay
+	}
+	if config.MaxRetries > 0 {
+		merged.MaxRetries = config.MaxRetries
+	}
+	if config.RetryBackoff > 0 {
+		merged.RetryBackoff = config.RetryBackoff
+	}
+	if config.QueueTimeout > 0 {
+		merged.QueueTimeout = config.QueueTimeout
+	}
+	return merged
 }
 
 // Name returns the provider name.
@@ -234,19 +224,40 @@ func (c *Client) Chat(ctx context.Context, messages []llmtypes.Message, tools []
 }
 
 // convertMessages converts agent messages to Anthropic format.
-// Returns the system prompt blocks (with cache_control on the last block) and the API messages.
-// System messages are extracted and combined, as Anthropic Messages API requires
-// them to be sent as a separate "system" field, not in the messages array.
+// Returns the system prompt blocks and the API messages. System messages are
+// extracted into the separate "system" field the Messages API requires — one
+// block per source message, so ROM and the summary keep their own compile-set
+// cache breakpoints: a fold rewrites the summary block and leaves ROM's cached
+// prefix intact.
+//
+// Cache breakpoints are the compile's decision (HLD §5.2 step 8): a message
+// with CacheBreakpoint=true gets cache_control on its last content block. The
+// client only translates the marker — it derives nothing itself.
 func (c *Client) convertMessages(messages []llmtypes.Message) ([]TextBlockParam, []Message) {
-	var systemPrompts []string
+	var systemBlocks []TextBlockParam
 	var apiMessages []Message
+
+	markLast := func() {
+		if n := len(apiMessages); n > 0 {
+			blocks := apiMessages[n-1].Content
+			if len(blocks) > 0 {
+				blocks[len(blocks)-1].CacheControl = &CacheControl{Type: "ephemeral"}
+			}
+		}
+	}
 
 	for _, msg := range messages {
 		switch msg.Role {
 		case "system":
-			// Extract system messages - they'll be combined and sent separately
+			// Extract system messages — each becomes its own system block,
+			// carrying the compile's cache breakpoint when marked. Cached
+			// tokens don't count against the ITPM rate limit.
 			if msg.Content != "" {
-				systemPrompts = append(systemPrompts, msg.Content)
+				block := TextBlockParam{Type: "text", Text: msg.Content}
+				if msg.CacheBreakpoint {
+					block.CacheControl = &CacheControl{Type: "ephemeral"}
+				}
+				systemBlocks = append(systemBlocks, block)
 			}
 
 		case "user":
@@ -275,17 +286,11 @@ func (c *Client) convertMessages(messages []llmtypes.Message) ([]TextBlockParam,
 						}
 					}
 				}
-				apiMessages = append(apiMessages, Message{
-					Role:    "user",
-					Content: content,
-				})
+				apiMessages = appendUserOrCoalesce(apiMessages, content)
 			} else {
 				// Fallback to plain text (backward compatible)
-				apiMessages = append(apiMessages, Message{
-					Role: "user",
-					Content: []ContentBlock{
-						{Type: "text", Text: msg.Content},
-					},
+				apiMessages = appendUserOrCoalesce(apiMessages, []ContentBlock{
+					{Type: "text", Text: msg.Content},
 				})
 			}
 
@@ -322,35 +327,53 @@ func (c *Client) convertMessages(messages []llmtypes.Message) ([]TextBlockParam,
 			}
 
 		case "tool":
-			// Tool results
-			apiMessages = append(apiMessages, Message{
-				Role: "user",
-				Content: []ContentBlock{
-					{
-						Type:      "tool_result",
-						ToolUseID: msg.ToolUseID,
-						Content:   msg.Content,
-					},
+			// Tool results — go under user role; coalesce with any adjacent
+			// user message so we never emit two consecutive user wire messages
+			// (Anthropic 400: "roles must alternate"). This also lets a
+			// tool_result and a following text sidecar (e.g. manage_skills's
+			// skill body) ride in one wire message with mixed content blocks.
+			apiMessages = appendUserOrCoalesce(apiMessages, []ContentBlock{
+				{
+					Type:      "tool_result",
+					ToolUseID: msg.ToolUseID,
+					Content:   msg.Content,
 				},
 			})
 		}
+
+		// The message cache breakpoint: compile marks the last stable message
+		// before any current-turn ephemeral content (HLD §5.2 step 8). Marking
+		// anything later — e.g. the tip — buys cache writes that are never
+		// read back, because ephemeral content re-renders next call.
+		if msg.CacheBreakpoint && msg.Role != "system" {
+			markLast()
+		}
 	}
 
-	// Combine all system prompts and wrap in a TextBlockParam with cache_control.
-	// Placing cache_control on the system block caches it for ~5 minutes.
-	// For Anthropic, cached tokens don't count against the ITPM rate limit.
-	if len(systemPrompts) == 0 {
+	if len(systemBlocks) == 0 {
 		return nil, apiMessages
 	}
-	systemText := strings.Join(systemPrompts, "\n\n")
-	systemBlocks := []TextBlockParam{
-		{
-			Type:         "text",
-			Text:         systemText,
-			CacheControl: &CacheControl{Type: "ephemeral"},
-		},
-	}
 	return systemBlocks, apiMessages
+}
+
+// appendUserOrCoalesce appends content blocks to the last user message in the
+// list when that last message is user-role; otherwise it appends a new user
+// message. This is the sole path by which user-role wire messages are produced
+// by the converter, so it guarantees the outgoing message list never contains
+// two consecutive user-role messages — which Anthropic rejects with 400
+// "roles must alternate". It also lets a tool_result and an immediately-
+// following user-role text (e.g. the manage_skills skill-body sidecar) share
+// a single wire user message with mixed content blocks — the Anthropic-native
+// shape for a Skill-tool style load event.
+func appendUserOrCoalesce(msgs []Message, blocks []ContentBlock) []Message {
+	if len(blocks) == 0 {
+		return msgs
+	}
+	if n := len(msgs); n > 0 && msgs[n-1].Role == "user" {
+		msgs[n-1].Content = append(msgs[n-1].Content, blocks...)
+		return msgs
+	}
+	return append(msgs, Message{Role: "user", Content: blocks})
 }
 
 // convertTools converts shuttle tools to Anthropic format.
@@ -482,26 +505,31 @@ func (c *Client) convertResponse(resp *MessagesResponse) *llmtypes.LLMResponse {
 // Pricing varies by model family. Cache pricing derives from input price:
 // cache_write = 1.25x input, cache_read = 0.10x input.
 func (c *Client) calculateCost(inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens int) float64 {
-	// Determine per-million-token pricing based on model.
-	// IMPORTANT: check opus-4-1 BEFORE opus-4 since "opus-4-1" contains "opus-4".
-	var inputPricePerM, outputPricePerM float64
-	switch {
-	case strings.Contains(c.model, "opus-4-1"):
-		// Claude Opus 4.1: $15/$75
-		inputPricePerM = 15.0
-		outputPricePerM = 75.0
-	case strings.Contains(c.model, "opus-4"):
-		// Claude Opus 4.5, 4.6: $5/$25
-		inputPricePerM = 5.0
-		outputPricePerM = 25.0
-	case strings.Contains(c.model, "haiku"):
-		// Claude Haiku 4.5: $1/$5
-		inputPricePerM = 1.0
-		outputPricePerM = 5.0
-	default:
-		// Claude Sonnet 4.5, 4.6 and any unrecognized model: $3/$15
-		inputPricePerM = 3.0
-		outputPricePerM = 15.0
+	// The catalog (pkg/llm/catalog) is the source of truth for the base
+	// per-million-token rates. Fall back to substring matching only for model
+	// ids it does not list.
+	// IMPORTANT: in the fallback, check opus-4-1 BEFORE opus-4 since "opus-4-1"
+	// contains "opus-4".
+	inputPricePerM, outputPricePerM, ok := catalog.LookupPricing("anthropic", c.model)
+	if !ok {
+		switch {
+		case strings.Contains(c.model, "opus-4-1"):
+			// Claude Opus 4.1: $15/$75
+			inputPricePerM = 15.0
+			outputPricePerM = 75.0
+		case strings.Contains(c.model, "opus-4"):
+			// Claude Opus 4.5, 4.6, 4.7: $5/$25
+			inputPricePerM = 5.0
+			outputPricePerM = 25.0
+		case strings.Contains(c.model, "haiku"):
+			// Claude Haiku 4.5: $1/$5
+			inputPricePerM = 1.0
+			outputPricePerM = 5.0
+		default:
+			// Claude Sonnet 4.5, 4.6 and any unrecognized model: $3/$15
+			inputPricePerM = 3.0
+			outputPricePerM = 15.0
+		}
 	}
 
 	inputCost := float64(inputTokens) * inputPricePerM / 1_000_000
@@ -572,11 +600,15 @@ func (c *Client) ChatStream(ctx context.Context, messages []llmtypes.Message,
 			if err != nil {
 				return nil, err
 			}
-			// Convert 429 to a retryable error so the rate limiter backs off and retries.
+			// Convert 429 to a retryable error so the rate limiter backs off and
+			// retries, carrying the server-specified Retry-After so the limiter
+			// waits at least that long.
 			if resp.StatusCode == http.StatusTooManyRequests {
 				respBody, _ := io.ReadAll(resp.Body)
 				_ = resp.Body.Close()
-				return nil, fmt.Errorf("API error (status 429): %s", string(respBody))
+				return nil, llm.NewThrottleError(
+					fmt.Errorf("API error (status 429): %s", string(respBody)),
+					llm.RetryAfterFromHeaders(resp.Header))
 			}
 			return resp, nil
 		})
@@ -599,6 +631,11 @@ func (c *Client) ChatStream(ctx context.Context, messages []llmtypes.Message,
 	// Check status code before streaming
 	if httpResp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(httpResp.Body)
+		// Positive identification of the provider's context-too-long refusal
+		// (HLD §5.2 step 12) — the only relief trigger.
+		if llm.IsAnthropicContextTooLong(httpResp.StatusCode, respBody) {
+			return nil, fmt.Errorf("API error (status %d): %s: %w", httpResp.StatusCode, string(respBody), llm.ErrContextTooLong)
+		}
 		return nil, fmt.Errorf("API error (status %d): %s", httpResp.StatusCode, string(respBody))
 	}
 
@@ -653,7 +690,9 @@ func (c *Client) ChatStream(ctx context.Context, messages []llmtypes.Message,
 						}
 					}
 				case "input_json_delta":
-					// Accumulate tool input JSON fragments
+					// Accumulate tool input JSON fragments. These never reach
+					// tokenCallback (text only), so report them as activity.
+					llmtypes.NotifyStreamActivity(ctx)
 					if buf, exists := toolInputBuffers[event.Index]; exists {
 						buf.WriteString(event.Delta.PartialJSON)
 					}
@@ -795,11 +834,15 @@ func (c *Client) callAPI(ctx context.Context, req *MessagesRequest) (*MessagesRe
 			if err != nil {
 				return nil, err
 			}
-			// Convert 429 to a retryable error so the rate limiter backs off and retries.
+			// Convert 429 to a retryable error so the rate limiter backs off and
+			// retries, carrying the server-specified Retry-After so the limiter
+			// waits at least that long.
 			if resp.StatusCode == http.StatusTooManyRequests {
 				respBody, _ := io.ReadAll(resp.Body)
 				_ = resp.Body.Close()
-				return nil, fmt.Errorf("API error (status 429): %s", string(respBody))
+				return nil, llm.NewThrottleError(
+					fmt.Errorf("API error (status 429): %s", string(respBody)),
+					llm.RetryAfterFromHeaders(resp.Header))
 			}
 			return resp, nil
 		})
@@ -827,6 +870,11 @@ func (c *Client) callAPI(ctx context.Context, req *MessagesRequest) (*MessagesRe
 
 	// Check status code
 	if httpResp.StatusCode != http.StatusOK {
+		// Positive identification of the provider's context-too-long refusal
+		// (HLD §5.2 step 12) — the only relief trigger.
+		if llm.IsAnthropicContextTooLong(httpResp.StatusCode, respBody) {
+			return nil, fmt.Errorf("API error (status %d): %s: %w", httpResp.StatusCode, string(respBody), llm.ErrContextTooLong)
+		}
 		return nil, fmt.Errorf("API error (status %d): %s", httpResp.StatusCode, string(respBody))
 	}
 

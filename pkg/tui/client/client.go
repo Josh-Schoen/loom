@@ -25,9 +25,11 @@ import (
 	"time"
 
 	loomv1 "github.com/teradata-labs/loom/gen/go/loom/v1"
+	"golang.org/x/term"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/metadata"
 )
 
 // Client wraps the gRPC Loom client with surface-friendly methods.
@@ -56,7 +58,31 @@ type Config struct {
 	TLSInsecure   bool   // Skip TLS certificate verification (for self-signed certs)
 	TLSCAFile     string // Path to CA certificate file
 	TLSServerName string // Override TLS server name (for testing)
+
+	// BearerToken, when set, supplies a token attached as "authorization: Bearer"
+	// metadata on every RPC (e.g. a Supabase access token from `loom login`).
+	// It is invoked per request so it can refresh transparently.
+	BearerToken func() (string, error)
 }
+
+// perRPCBearer attaches a bearer token to outgoing gRPC requests.
+type perRPCBearer struct {
+	get        func() (string, error)
+	requireTLS bool
+}
+
+func (b perRPCBearer) GetRequestMetadata(_ context.Context, _ ...string) (map[string]string, error) {
+	token, err := b.get()
+	if err != nil {
+		return nil, err
+	}
+	if token == "" {
+		return nil, nil
+	}
+	return map[string]string{"authorization": "Bearer " + token}, nil
+}
+
+func (b perRPCBearer) RequireTransportSecurity() bool { return b.requireTLS }
 
 // NewClient creates a new Loom client.
 func NewClient(cfg Config) (*Client, error) {
@@ -80,9 +106,16 @@ func NewClient(cfg Config) (*Client, error) {
 	}
 
 	// Connect to server
-	conn, err := grpc.NewClient(cfg.ServerAddr,
-		grpc.WithTransportCredentials(creds),
-	)
+	dialOpts := []grpc.DialOption{grpc.WithTransportCredentials(creds)}
+	if cfg.BearerToken != nil {
+		// Per-RPC credentials require transport security unless the credential
+		// opts out; allow loopback/dev over insecure transport.
+		dialOpts = append(dialOpts, grpc.WithPerRPCCredentials(perRPCBearer{
+			get:        cfg.BearerToken,
+			requireTLS: cfg.TLSEnabled,
+		}))
+	}
+	conn, err := grpc.NewClient(cfg.ServerAddr, dialOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create client for %s: %w", cfg.ServerAddr, err)
 	}
@@ -102,7 +135,7 @@ func createTLSConfig(cfg Config) (*tls.Config, error) {
 
 	// If insecure mode, skip certificate verification
 	if cfg.TLSInsecure {
-		tlsConfig.InsecureSkipVerify = true
+		tlsConfig.InsecureSkipVerify = true //nolint:gosec // user opted in via --tls-insecure for self-signed certs
 		return tlsConfig, nil
 	}
 
@@ -136,13 +169,17 @@ func createTLSConfig(cfg Config) (*tls.Config, error) {
 
 // Wrap builds a Client over a connection the caller already holds.
 //
-// Surfaces that dial Loom themselves — the desktop app keeps its own conn so
-// its generated bindings can share it — would otherwise have to choose between
-// opening a second connection to the same server or reimplementing this
-// package's methods against a raw stub. Neither is worth it.
+// A caller that dials Loom itself — because its own generated bindings share
+// the connection — would otherwise have to choose between opening a second
+// connection to the same server or reimplementing this package's methods
+// against a raw stub. Neither is worth it.
 //
 // The returned Client does not own the connection: Close is a no-op, and
 // closing the conn remains the caller's job.
+//
+// Wrap(nil) returns nil rather than a Client that would panic on first use,
+// so a caller can propagate a missing connection the same way it would
+// propagate a nil Client from anywhere else in this package.
 func Wrap(conn *grpc.ClientConn) *Client {
 	if conn == nil {
 		return nil
@@ -167,8 +204,36 @@ func (c *Client) Close() error {
 	return nil
 }
 
+// SchedulerClient returns an LLM slot-scheduler client on this connection,
+// so callers reach the scheduler's admin surface with the same address, TLS
+// and bearer-token configuration they already dialed with.
+func (c *Client) SchedulerClient() loomv1.LLMSchedulerServiceClient {
+	return loomv1.NewLLMSchedulerServiceClient(c.conn)
+}
+
+// withSlotOrigin reports this turn's LLM scheduling band to the server
+// (gRPC metadata "loom-slot-origin"): "interactive" when a human at a
+// terminal is waiting on the response — stdin and stdout are TTYs, which is
+// always true under the TUI — and "batch" for scripted/piped invocations.
+// Same contract as the one-shot CLI (cmd/loom/chat.go); edge-triggered per
+// turn, the server never remembers it. A caller that already stamped the
+// band (e.g. cmd/loom chat's own TTY check) wins. The origin is
+// client-asserted by design; see SlotOrigin in
+// proto/loom/v1/llm_scheduler.proto for the trust model.
+func withSlotOrigin(ctx context.Context) context.Context {
+	if md, ok := metadata.FromOutgoingContext(ctx); ok && len(md.Get("loom-slot-origin")) > 0 {
+		return ctx
+	}
+	origin := "batch"
+	if term.IsTerminal(int(os.Stdin.Fd())) && term.IsTerminal(int(os.Stdout.Fd())) {
+		origin = "interactive"
+	}
+	return metadata.AppendToOutgoingContext(ctx, "loom-slot-origin", origin)
+}
+
 // Weave sends a query and returns the response.
 func (c *Client) Weave(ctx context.Context, query string, sessionID string, agentID string) (*loomv1.WeaveResponse, error) {
+	ctx = withSlotOrigin(ctx)
 	req := &loomv1.WeaveRequest{
 		Query:     query,
 		SessionId: sessionID,
@@ -181,6 +246,7 @@ func (c *Client) Weave(ctx context.Context, query string, sessionID string, agen
 // StreamWeave sends a query and streams the response.
 // The progressFn is called for each progress update.
 func (c *Client) StreamWeave(ctx context.Context, query string, sessionID string, agentID string, progressFn func(*loomv1.WeaveProgress)) error {
+	ctx = withSlotOrigin(ctx)
 	req := &loomv1.WeaveRequest{
 		Query:     query,
 		SessionId: sessionID,

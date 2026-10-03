@@ -18,7 +18,9 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -26,8 +28,11 @@ import (
 	loomv1 "github.com/teradata-labs/loom/gen/go/loom/v1"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 // RunMode determines how conversation history is processed.
@@ -50,6 +55,19 @@ const (
 	// ModeContextStuffing puts all session history directly into one
 	// Weave call as prompt context. Baseline comparison.
 	ModeContextStuffing RunMode = "context-stuffing"
+
+	// ModeConversation replays every haystack turn, in chronological order,
+	// into ONE continuous agent session — user turns as user messages and the
+	// pre-written assistant turns recorded verbatim (generation-free, via
+	// WeaveRequest.replay_assistant_message) rather than regenerated. Unlike the
+	// blob-per-session ingest modes, this drives the memory pipeline the way a
+	// live conversation would: salience accumulates across turns and context
+	// compression fires as the thread grows. The question is asked in the same
+	// thread, where the earliest turns have compressed out of the live window,
+	// so recall runs through graph memory + conversation_memory. Recording the
+	// original assistant turns (never inventing them) preserves the benchmark's
+	// ground truth for assistant-derived questions.
+	ModeConversation RunMode = "conversation"
 )
 
 // RunConfig holds configuration for a benchmark run.
@@ -60,6 +78,13 @@ type RunConfig struct {
 	Concurrency int
 	Verbose     bool
 	Isolate     bool // create a fresh agent per entry for graph memory isolation
+
+	// UseOccurredAt sends each haystack session's date (and the question date)
+	// as WeaveRequest.occurred_at. Without it, the server anchors temporal
+	// grounding and graph-memory extraction to the arrival time (the run day),
+	// which contradicts the historical dates inside the replayed conversations.
+	// Requires server.allow_time_override: true on the target server.
+	UseOccurredAt bool
 }
 
 // EntryResult holds the result of evaluating a single entry.
@@ -74,7 +99,27 @@ type EntryResult struct {
 	OutputTokens int           `json:"output_tokens"`
 	Sessions     int           `json:"sessions_ingested"`
 	Error        string        `json:"error,omitempty"`
+
+	// grpcCode carries the gRPC status code of a failed Weave call so the
+	// runner can decide whether to abort the whole run. Unexported — never
+	// serialized to results.
+	grpcCode codes.Code
+
+	// replayIgnored records that a successful replay Weave answered with text
+	// other than the scripted assistant turn: the server ignored
+	// replay_assistant_message and generated instead. Like a refused
+	// override, it invalidates the whole run, so Runner.Run aborts on it.
+	// Unexported — never serialized to results.
+	replayIgnored bool
 }
+
+// errReplayIgnored reports that a server accepted a replay turn but did not
+// honor replay_assistant_message. A server that predates the field (e.g. a
+// released v1.4.0 looms) decodes it as an unknown proto3 field, drops it, and
+// generates a fresh assistant turn — so the Weave succeeds and only the
+// response text reveals that the dataset's assistant turn was replaced.
+var errReplayIgnored = errors.New("server ignored replay_assistant_message " +
+	"(it predates generation-free replay); upgrade looms or use another --mode")
 
 // Runner orchestrates the benchmark execution against a running Loom server.
 type Runner struct {
@@ -157,10 +202,17 @@ func (r *Runner) Run(ctx context.Context, entries []Entry, resultCh chan<- Entry
 	var completed atomic.Int64
 	total := len(entries)
 
+	// A server without allow_time_override rejects EVERY entry identically:
+	// abort the run on the first such rejection instead of burning one futile
+	// temp-agent create/weave/delete cycle per entry (500 on a full set).
+	runCtx, abort := context.WithCancel(ctx)
+	defer abort()
+	var abortErr atomic.Pointer[string]
+
 loop:
 	for i, entry := range entries {
 		select {
-		case <-ctx.Done():
+		case <-runCtx.Done():
 			break loop
 		case sem <- struct{}{}:
 		}
@@ -170,7 +222,13 @@ loop:
 			defer wg.Done()
 			defer func() { <-sem }()
 
-			result := r.runEntry(ctx, e)
+			result := r.runEntry(runCtx, e)
+			if msg, rejected := overrideRejection(result); rejected {
+				if abortErr.CompareAndSwap(nil, &msg) {
+					r.logger.Error(msg, zap.String("first_failed_entry", e.QuestionID))
+					abort()
+				}
+			}
 			done := completed.Add(1)
 			r.logger.Info("entry completed",
 				zap.String("question_id", e.QuestionID),
@@ -189,7 +247,49 @@ loop:
 	}
 
 	wg.Wait()
+	if msg := abortErr.Load(); msg != nil {
+		return errors.New(*msg)
+	}
 	return ctx.Err()
+}
+
+// overrideRejection reports whether an entry failed because the server
+// refuses a request override this run depends on, and returns the message
+// naming the flag the operator has to change. The primary signal is the gRPC
+// FailedPrecondition code from the Weave call paired with the field name; the
+// bare flag-name substring is kept as a fallback for servers whose status
+// code was lost in transit.
+//
+// This has to cover EVERY override the run needs, not just occurred_at: a
+// refused override does not degrade the benchmark, it invalidates it. Every
+// remaining entry fails the same way, so without an abort the run writes a
+// file of error rows and exits zero — handing automation something that
+// looks like a result.
+func overrideRejection(result EntryResult) (string, bool) {
+	// A server that silently ignored the replay override is as fatal as one
+	// that refused it: every remaining replay turn would be generated, and
+	// the run would exit zero with a generative-replay result labelled as
+	// --mode conversation.
+	if result.replayIgnored {
+		return errReplayIgnored.Error() + "; aborting the run — it answered a replay turn " +
+			"with generated text instead of the scripted assistant turn", true
+	}
+
+	precondition := result.grpcCode == codes.FailedPrecondition
+
+	if (precondition && strings.Contains(result.Error, "replay_assistant_message")) ||
+		strings.Contains(result.Error, "allow_assistant_override") {
+		return "server rejects replay_assistant_message (server.allow_assistant_override is not enabled); " +
+			"aborting the run — enable it in looms.yaml, or use a mode other than --mode conversation", true
+	}
+
+	if (precondition && strings.Contains(result.Error, "occurred_at")) ||
+		strings.Contains(result.Error, "allow_time_override") {
+		return "server rejects occurred_at (server.allow_time_override is not enabled); " +
+			"aborting the run — enable it in looms.yaml or pass --occurred-at=false", true
+	}
+
+	return "", false
 }
 
 // runEntry evaluates a single LongMemEval entry.
@@ -221,7 +321,14 @@ func (r *Runner) runEntry(ctx context.Context, entry Entry) EntryResult {
 			return result
 		}
 		tempAgentID = id
-		defer r.deleteTempAgent(ctx, tempAgentID)
+		defer func() {
+			// Cleanup must survive cancellation of the run context —
+			// otherwise an abort strands the sibling goroutines' temp
+			// agents (and their graph-memory stores) server-side.
+			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+			defer cancel()
+			r.deleteTempAgent(cleanupCtx, tempAgentID)
+		}()
 	}
 
 	// Use temp agent if available, otherwise the configured agent.
@@ -230,13 +337,28 @@ func (r *Runner) runEntry(ctx context.Context, entry Entry) EntryResult {
 		agentID = tempAgentID
 	}
 
+	// The question turn anchors at the entry's question date, matching the
+	// "Current date:" line in the prompt.
+	var questionAt time.Time
+	if r.occurredAtEnabled() {
+		t, err := ParseDate(entry.QuestionDate)
+		if err != nil {
+			result.Error = fmt.Sprintf("parse question date %q: %v", entry.QuestionDate, err)
+			result.Duration = time.Since(start)
+			return result
+		}
+		questionAt = t
+	}
+
 	switch r.config.Mode {
 	case ModeIngest:
-		result = r.runIngestWith(ctx, entry, sessions, result, agentID)
+		result = r.runIngestWith(ctx, entry, sessions, result, agentID, questionAt)
 	case ModeMultiSession:
-		result = r.runMultiSessionWith(ctx, entry, sessions, result, agentID)
+		result = r.runMultiSessionWith(ctx, entry, sessions, result, agentID, questionAt)
 	case ModeContextStuffing:
-		result = r.runContextStuffingWith(ctx, entry, sessions, result, agentID)
+		result = r.runContextStuffingWith(ctx, entry, sessions, result, agentID, questionAt)
+	case ModeConversation:
+		result = r.runConversationWith(ctx, entry, sessions, result, agentID, questionAt)
 	default:
 		result.Error = fmt.Sprintf("unknown mode: %s", r.config.Mode)
 	}
@@ -275,17 +397,44 @@ func (r *Runner) deleteTempAgent(ctx context.Context, agentID string) {
 	}
 }
 
-// weave sends a Weave RPC and accumulates token usage into result.
-func (r *Runner) weave(ctx context.Context, sessionID, query, agentID string, result *EntryResult) (*loomv1.WeaveResponse, error) {
+// buildWeaveRequest constructs a Weave request, attaching occurred_at when
+// a non-zero time is given so replayed turns anchor at their historical date.
+func buildWeaveRequest(sessionID, query, agentID string, occurredAt time.Time) *loomv1.WeaveRequest {
 	req := &loomv1.WeaveRequest{
 		Query:          query,
 		SessionId:      sessionID,
 		TimeoutSeconds: 120,
 		AgentId:        agentID,
 	}
+	if !occurredAt.IsZero() {
+		req.OccurredAt = timestamppb.New(occurredAt)
+	}
+	return req
+}
+
+// occurredAtEnabled reports whether occurred_at overrides should be sent.
+// Context-stuffing is the no-memory baseline and must run unchanged against
+// a stock server (allow_time_override off), so it never sends occurred_at.
+func (r *Runner) occurredAtEnabled() bool {
+	return r.config.UseOccurredAt && r.config.Mode != ModeContextStuffing
+}
+
+// sessionOccurredAt returns the haystack session's date as the occurred_at
+// override, or the zero time when the override is disabled.
+func (r *Runner) sessionOccurredAt(s SessionWithDate) time.Time {
+	if r.occurredAtEnabled() {
+		return s.ParsedAt
+	}
+	return time.Time{}
+}
+
+// weave sends a Weave RPC and accumulates token usage into result.
+func (r *Runner) weave(ctx context.Context, sessionID, query, agentID string, occurredAt time.Time, result *EntryResult) (*loomv1.WeaveResponse, error) {
+	req := buildWeaveRequest(sessionID, query, agentID, occurredAt)
 
 	resp, err := r.client.Weave(ctx, req)
 	if err != nil {
+		result.grpcCode = status.Code(err)
 		return nil, err
 	}
 
@@ -295,6 +444,43 @@ func (r *Runner) weave(ctx context.Context, sessionID, query, agentID string, re
 	}
 
 	return resp, nil
+}
+
+// replayTurn records a pre-written (user, assistant) exchange generation-free:
+// the server substitutes the scripted assistant text for the LLM call
+// (WeaveRequest.replay_assistant_message) while still running the full memory
+// pipeline. Anchors both rows at occurredAt. Requires
+// server.allow_assistant_override (replay) and server.allow_time_override
+// (anchoring) on the target server.
+func (r *Runner) replayTurn(ctx context.Context, sessionID, userContent, assistantContent, agentID string, occurredAt time.Time, result *EntryResult) error {
+	req := buildWeaveRequest(sessionID, userContent, agentID, occurredAt)
+	req.ReplayAssistantMessage = assistantContent
+
+	resp, err := r.client.Weave(ctx, req)
+	if err != nil {
+		// Record the status, as weave does: without it a server that
+		// rejects the replay override is indistinguishable from a transient
+		// per-entry failure, and the run does not abort.
+		result.grpcCode = status.Code(err)
+		return err
+	}
+
+	if resp.Cost != nil && resp.Cost.LlmCost != nil {
+		result.InputTokens += int(resp.Cost.LlmCost.InputTokens)
+		result.OutputTokens += int(resp.Cost.LlmCost.OutputTokens)
+	}
+
+	// A server that honors replay_assistant_message answers with the scripted
+	// text verbatim (the conversation loop substitutes it for the provider
+	// call). Anything else means the field was ignored — a server that
+	// predates it decodes it as an unknown field and generates — so a
+	// successful Weave alone is not proof the turn was replayed.
+	if resp.GetText() != assistantContent {
+		result.replayIgnored = true
+		return errReplayIgnored
+	}
+
+	return nil
 }
 
 // createSession creates a session and returns its ID.
@@ -321,7 +507,7 @@ func (r *Runner) deleteSession(ctx context.Context, sessionID string) {
 // runIngestWith processes an entry by feeding sessions through Weave, then querying.
 // All turns happen in a single session so the conversation history accumulates,
 // compression triggers, and the agent can search back through everything.
-func (r *Runner) runIngestWith(ctx context.Context, entry Entry, sessions []SessionWithDate, result EntryResult, agentID string) EntryResult {
+func (r *Runner) runIngestWith(ctx context.Context, entry Entry, sessions []SessionWithDate, result EntryResult, agentID string, questionAt time.Time) EntryResult {
 	sessionID, err := r.createSession(ctx, fmt.Sprintf("lme-%s", entry.QuestionID), agentID)
 	if err != nil {
 		result.Error = fmt.Sprintf("create session: %v", err)
@@ -337,7 +523,7 @@ func (r *Runner) runIngestWith(ctx context.Context, entry Entry, sessions []Sess
 			i+1, sess.Date, FormatSession(sess),
 		)
 
-		_, err = r.weave(ctx, sessionID, ingestMsg, agentID, &result)
+		_, err = r.weave(ctx, sessionID, ingestMsg, agentID, r.sessionOccurredAt(sess), &result)
 		if err != nil {
 			result.Error = fmt.Sprintf("ingest session %d: %v", i, err)
 			return result
@@ -354,7 +540,7 @@ func (r *Runner) runIngestWith(ctx context.Context, entry Entry, sessions []Sess
 		entry.QuestionDate, entry.Question,
 	)
 
-	resp, err := r.weave(ctx, sessionID, questionMsg, agentID, &result)
+	resp, err := r.weave(ctx, sessionID, questionMsg, agentID, questionAt, &result)
 	if err != nil {
 		result.Error = fmt.Sprintf("ask question: %v", err)
 		return result
@@ -368,7 +554,7 @@ func (r *Runner) runIngestWith(ctx context.Context, entry Entry, sessions []Sess
 // haystack session. Each session is ingested, then ended so its messages are
 // persisted to the DB and become FTS5-searchable. The question is asked in a
 // fresh session — the agent must use graph_memory + conversation_memory to recall.
-func (r *Runner) runMultiSessionWith(ctx context.Context, entry Entry, sessions []SessionWithDate, result EntryResult, agentID string) EntryResult {
+func (r *Runner) runMultiSessionWith(ctx context.Context, entry Entry, sessions []SessionWithDate, result EntryResult, agentID string, questionAt time.Time) EntryResult {
 	// Phase 1: Ingest each haystack session in its own agent session.
 	for i, sess := range sessions {
 		sessName := fmt.Sprintf("lme-%s-s%d", entry.QuestionID, i+1)
@@ -386,7 +572,7 @@ func (r *Runner) runMultiSessionWith(ctx context.Context, entry Entry, sessions 
 			sess.Date, FormatSession(sess),
 		)
 
-		_, err = r.weave(ctx, sessionID, ingestMsg, agentID, &result)
+		_, err = r.weave(ctx, sessionID, ingestMsg, agentID, r.sessionOccurredAt(sess), &result)
 		if err != nil {
 			result.Error = fmt.Sprintf("ingest session %d: %v", i, err)
 			return result
@@ -412,7 +598,7 @@ func (r *Runner) runMultiSessionWith(ctx context.Context, entry Entry, sessions 
 		entry.QuestionDate, entry.Question,
 	)
 
-	resp, err := r.weave(ctx, questionSessionID, questionMsg, agentID, &result)
+	resp, err := r.weave(ctx, questionSessionID, questionMsg, agentID, questionAt, &result)
 	if err != nil {
 		result.Error = fmt.Sprintf("ask question: %v", err)
 		return result
@@ -423,7 +609,7 @@ func (r *Runner) runMultiSessionWith(ctx context.Context, entry Entry, sessions 
 }
 
 // runContextStuffingWith processes an entry by stuffing all sessions into one Weave call.
-func (r *Runner) runContextStuffingWith(ctx context.Context, entry Entry, sessions []SessionWithDate, result EntryResult, agentID string) EntryResult {
+func (r *Runner) runContextStuffingWith(ctx context.Context, entry Entry, sessions []SessionWithDate, result EntryResult, agentID string, questionAt time.Time) EntryResult {
 	sessionID, err := r.createSession(ctx, fmt.Sprintf("lme-%s-cs", entry.QuestionID), agentID)
 	if err != nil {
 		result.Error = fmt.Sprintf("create session: %v", err)
@@ -443,7 +629,85 @@ func (r *Runner) runContextStuffingWith(ctx context.Context, entry Entry, sessio
 		allSessions, entry.QuestionDate, entry.Question,
 	)
 
-	resp, err := r.weave(ctx, sessionID, prompt, agentID, &result)
+	resp, err := r.weave(ctx, sessionID, prompt, agentID, questionAt, &result)
+	if err != nil {
+		result.Error = fmt.Sprintf("ask question: %v", err)
+		return result
+	}
+	result.Hypothesis = resp.Text
+
+	return result
+}
+
+// runConversationWith replays the whole haystack turn-by-turn into ONE
+// continuous agent session, then asks the question in that same thread. Each
+// pre-written (user, assistant) pair is replayed generation-free so the
+// assistant's original words are preserved (ground truth) while the memory
+// pipeline runs as it would live — salience accumulating across turns and
+// compression firing as the thread grows. See ModeConversation.
+func (r *Runner) runConversationWith(ctx context.Context, entry Entry, sessions []SessionWithDate, result EntryResult, agentID string, questionAt time.Time) EntryResult {
+	sessionID, err := r.createSession(ctx, fmt.Sprintf("lme-%s-conv", entry.QuestionID), agentID)
+	if err != nil {
+		result.Error = fmt.Sprintf("create session: %v", err)
+		return result
+	}
+
+	// Phase 1: replay every turn in chronological order as one thread.
+	// LongMemEval sessions alternate user/assistant; pair each user turn with
+	// the assistant turn that answered it and replay them generation-free.
+	for si, sess := range sessions {
+		occurredAt := r.sessionOccurredAt(sess)
+		turns := sess.Turns
+		i := 0
+		for i < len(turns) {
+			// Skip an anomalous leading assistant turn — a turn without a
+			// preceding user turn cannot be replayed (query is required).
+			if turns[i].Role != "user" {
+				i++
+				continue
+			}
+			user := turns[i]
+			hasReply := i+1 < len(turns) && turns[i+1].Role == "assistant"
+			if hasReply && strings.TrimSpace(turns[i+1].Content) != "" {
+				// The common case: a (user, assistant) pair replayed verbatim.
+				if err := r.replayTurn(ctx, sessionID, user.Content, turns[i+1].Content, agentID, occurredAt, &result); err != nil {
+					result.Error = fmt.Sprintf("replay session %d turn %d: %v", si, i, err)
+					return result
+				}
+				i += 2
+				continue
+			}
+			// A user turn with no assistant reply (rare): trailing, or answered
+			// by a blank assistant turn (the S set has a few). There is no
+			// ground-truth assistant content to preserve — and a server cannot
+			// replay blank text (an empty override is indistinguishable from
+			// none) — so let the agent generate one; the user content still
+			// enters memory. A blank reply is consumed with its user turn.
+			if _, err := r.weave(ctx, sessionID, user.Content, agentID, occurredAt, &result); err != nil {
+				result.Error = fmt.Sprintf("replay session %d unanswered user turn %d: %v", si, i, err)
+				return result
+			}
+			if hasReply {
+				i += 2
+			} else {
+				i++
+			}
+		}
+	}
+
+	// Phase 2: ask the question in the same thread (real generation). By now the
+	// earliest turns have compressed out of the live window, so the answer must
+	// come from graph memory + conversation_memory recall.
+	questionMsg := fmt.Sprintf(
+		"Current date: %s\n\n"+
+			"Based on everything from our conversation so far, answer the following "+
+			"question. Be specific and concise. If you don't have enough "+
+			"information to answer, say \"I don't know.\"\n\n"+
+			"Question: %s",
+		entry.QuestionDate, entry.Question,
+	)
+
+	resp, err := r.weave(ctx, sessionID, questionMsg, agentID, questionAt, &result)
 	if err != nil {
 		result.Error = fmt.Sprintf("ask question: %v", err)
 		return result

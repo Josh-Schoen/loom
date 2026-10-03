@@ -167,9 +167,9 @@ func (e *Emitter) EmitForActivation(ctx context.Context, req EmitRequest) (*Emit
 	// Ensure the referenced board exists before any CreateTask. The tasks
 	// table FK-references task_boards(id); a non-empty BoardID that does
 	// not exist in storage triggers `FOREIGN KEY constraint failed` on
-	// every step, silently turning Phase D into a no-op (failures landed
-	// in zap.L() warns that, until cmd_serve.go wired ReplaceGlobals,
-	// went to a Nop logger). Empty BoardID is fine and skips the ensure.
+	// every step, silently turning emission into a no-op (failures land in
+	// zap.L() warns that, until cmd_serve.go wired ReplaceGlobals, went to a
+	// Nop logger). Empty BoardID is fine and skips the ensure.
 	if err := e.ensureBoard(ctx, req.BoardID, req.Skill.Name); err != nil {
 		return nil, fmt.Errorf("emitter: ensure board: %w", err)
 	}
@@ -213,10 +213,11 @@ func (e *Emitter) emitTemplate(ctx context.Context, req EmitRequest) (*EmitResul
 			EstimatedEffort:     step.EstimatedEffort,
 			SkillIdempotencyKey: key,
 			Metadata: map[string]string{
-				"skill_name":     req.Skill.Name,
-				"skill_session":  req.SessionID,
-				"skill_step":     fmt.Sprintf("%d", i),
-				"skill_emit_via": "template",
+				"skill_name":                     req.Skill.Name,
+				"skill_session":                  req.SessionID,
+				"skill_step":                     fmt.Sprintf("%d", i),
+				"skill_emit_via":                 "template",
+				task.CreatedBySessionMetadataKey: req.SessionID,
 			},
 		}
 		out, isNew, err := e.manager.CreateTaskIdempotent(ctx, t)
@@ -299,12 +300,13 @@ func (e *Emitter) emitDecomposed(ctx context.Context, req EmitRequest) (*EmitRes
 	}
 
 	dreq := &task.DecomposeRequest{
-		Goal:     buildDecomposeGoal(req.Skill),
-		Context:  req.Skill.Description,
-		BoardID:  req.BoardID,
-		AgentID:  req.AgentID,
-		MaxDepth: 2,
-		Strategy: loomv1.DecomposeStrategy_DECOMPOSE_STRATEGY_FORWARD,
+		Goal:      buildDecomposeGoal(req.Skill),
+		Context:   req.Skill.Description,
+		BoardID:   req.BoardID,
+		AgentID:   req.AgentID,
+		MaxDepth:  2,
+		Strategy:  loomv1.DecomposeStrategy_DECOMPOSE_STRATEGY_FORWARD,
+		SessionID: req.SessionID,
 	}
 	resp, err := e.decomposer.Decompose(ctx, req.LLM, dreq)
 	if err != nil {
@@ -337,6 +339,7 @@ func (e *Emitter) emitDecomposed(ctx context.Context, req EmitRequest) (*EmitRes
 		t.Metadata["skill_session"] = req.SessionID
 		t.Metadata["skill_step"] = fmt.Sprintf("%d", i)
 		t.Metadata["skill_emit_via"] = "decomposer"
+		t.Metadata[task.CreatedBySessionMetadataKey] = req.SessionID
 		t.SkillIdempotencyKey = key
 		if _, err := e.manager.UpdateTask(ctx, t, []string{"metadata", "skill_idempotency_key"}); err != nil {
 			e.logger.Warn("emitter: failed to stamp decomposer output",
@@ -358,10 +361,11 @@ func (e *Emitter) emitDecomposed(ctx context.Context, req EmitRequest) (*EmitRes
 		BoardID:             req.BoardID,
 		SkillIdempotencyKey: probeKey,
 		Metadata: map[string]string{
-			"skill_name":     req.Skill.Name,
-			"skill_session":  req.SessionID,
-			"skill_emit_via": "decomposer-marker",
-			"hidden":         "true",
+			"skill_name":                     req.Skill.Name,
+			"skill_session":                  req.SessionID,
+			"skill_emit_via":                 "decomposer-marker",
+			"hidden":                         "true",
+			task.CreatedBySessionMetadataKey: req.SessionID,
 		},
 	}
 	if _, _, err := e.manager.CreateTaskIdempotent(ctx, marker); err != nil {
@@ -385,13 +389,14 @@ func (e *Emitter) emitDecomposed(ctx context.Context, req EmitRequest) (*EmitRes
 // GetBoard; if the board is missing (or the probe fails for any reason) we
 // attempt to create it. A concurrent racing emitter that beats us to the
 // create is handled by a second GetBoard probe so we don't surface the
-// duplicate-key error as a Phase D failure.
+// duplicate-key error as an emission failure.
 //
 // The auto-created board carries a generated name pointing at the skill that
 // triggered creation, so operators inspecting `task_boards` can see where
-// the row came from. Callers (agent.go Phase D) may pre-create the board
-// with a curated name to override this default — the ensure is a safety net,
-// not the documented public API for board provisioning.
+// the row came from. Callers (the agent's manage_skills load path, via
+// Agent.emitSkillTasksAsync) may pre-create the board with a curated name to
+// override this default — the ensure is a safety net, not the documented
+// public API for board provisioning.
 func (e *Emitter) ensureBoard(ctx context.Context, boardID, skillName string) error {
 	if boardID == "" {
 		return nil

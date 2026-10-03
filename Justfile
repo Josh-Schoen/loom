@@ -17,8 +17,23 @@ proto:
     buf generate
 
 # Lint proto files
-proto-lint:
+proto-lint: proto-pin-check
     buf lint
+
+# Verify every remote plugin in buf.gen.yaml is version-pinned. Unpinned
+# plugins float on upstream "latest": a new plugin release changes codegen
+# output and turns every branch's proto-drift check red with no code change
+# (grpc-gateway v2.30.0, 2026-08-06).
+proto-pin-check:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    unpinned=$(grep -E '^[[:space:]]*-?[[:space:]]*remote:' buf.gen.yaml | grep -vE 'remote:[[:space:]]*[^:[:space:]]+/[^:[:space:]]+/[^:[:space:]]+:v[0-9]' || true)
+    if [ -n "$unpinned" ]; then
+        echo "::error::Unpinned remote plugin(s) in buf.gen.yaml — pin each to a version (plugin:vX.Y.Z):"
+        echo "$unpinned"
+        exit 1
+    fi
+    echo "✅ All remote plugins in buf.gen.yaml are version-pinned"
 
 # Breaking change detection
 proto-breaking:
@@ -230,6 +245,11 @@ build-mcp: proto
     GOWORK=off go build -tags fts5 -o bin/loom-mcp ./cmd/loom-mcp
     @echo "✅ MCP binary: bin/loom-mcp"
 
+# Probe a real MCP server with Loom's client (negotiation, tools, MRTR, subscriptions)
+[positional-arguments]
+mcp-probe *ARGS:
+    GOWORK=off go run -tags fts5 ./cmd/loom-mcp-probe "$@"
+
 # Build all variants (server, tui, standalone, mcp)
 build-all: build-server build-tui build-standalone build-mcp
     @echo "✅ All build variants complete!"
@@ -381,7 +401,13 @@ dev-full: build-server
 # generate-weaver must run before vet/lint/test — CI generates embedded/weaver.yaml
 # from the .tmpl at the start of every job, and our //go:embed weaver.yaml
 # directive will otherwise fail on a clean workspace.
-check: proto-lint proto-format-check proto-gen-check generate-weaver fmt-check vet lint test build security
+# Run the MCP SDK interop suite (Phase 8): the official Go SDK as the
+# counterpart peer in both directions. Separate tag so the core suite never
+# depends on SDK behavior.
+interop:
+    go test -tags "fts5 interop" -race -run Interop ./pkg/mcp/conformance/
+
+check: proto-lint proto-format-check proto-gen-check generate-weaver fmt-check vet lint test build security interop
     @echo "✅ All checks passed! (matches GitHub CI)"
 
 # Watch for changes and run tests
@@ -583,6 +609,38 @@ backup:
             exit 1
         fi
     fi
+
+# =============================================================================
+# Runtime Image (teradata/loom-runtime)
+# =============================================================================
+
+# Build the loom-runtime Docker image for the local platform (single-arch, fast).
+# For multi-arch CI builds use `just build-runtime-multiarch`.
+build-runtime tag=`cat VERSION`:
+    docker build \
+        --build-arg VERSION=$(cat VERSION) \
+        -t teradata/loom-runtime:{{tag}} \
+        -f docker/Dockerfile.runtime \
+        .
+
+# Build multi-arch loom-runtime image (linux/amd64 + linux/arm64) via Docker Buildx.
+# Requires a buildx builder with QEMU support. The multi-platform image is written
+# to an OCI archive because the Docker image store cannot load a manifest list.
+build-runtime-multiarch tag=`cat VERSION`:
+    docker buildx build \
+        --platform linux/amd64,linux/arm64 \
+        --build-arg VERSION=$(cat VERSION) \
+        -t teradata/loom-runtime:{{tag}} \
+        -f docker/Dockerfile.runtime \
+        --output type=oci,dest=loom-runtime-{{tag}}.tar \
+        .
+
+# Build and load loom-runtime image into ALL nodes of a minikube cluster.
+# Uses docker build + minikube image load (vs minikube image build) so the image
+# is distributed to every node — required for multi-node clusters.
+build-runtime-minikube tag=`cat VERSION` profile="agentops-cluster":
+    just build-runtime {{tag}}
+    minikube image load teradata/loom-runtime:{{tag}} -p {{profile}}
 
 # =============================================================================
 # Benchmark (AKS publication-grade)

@@ -812,29 +812,39 @@ func TestAgent_ToolRegistration(t *testing.T) {
 
 	ag := NewAgent(mockBackend, mockLLM, WithConfig(cfg))
 
-	// Initially has 0 built-in tools (shell_execute no longer auto-registered)
-	// Note: query_tool_result uses progressive disclosure (registered after first large result)
-	// Note: get_error_details uses progressive disclosure (registered after first error)
-	// Note: get_tool_result removed - inline metadata makes it unnecessary
-	// Note: recall_conversation, search_conversation, clear_recalled_context removed for scratchpad experiment
-	// Note: record_finding removed - replaced by automatic extraction
+	// Base tools at construction: load_pattern (a pattern library is always
+	// configured), plus query_tool_result and recall — registered always (HLD
+	// §6/§7.1: their doors are printed by the offload stub and the summary's
+	// citations). shell_execute is not auto-registered; get_tool_result,
+	// get_error_details and record_finding are removed.
 	tools := ag.RegisteredTools()
-	if len(tools) != 0 {
-		t.Errorf("Expected 0 tools initially (shell_execute no longer auto-registered), got: %d", len(tools))
+	names := make([]string, len(tools))
+	for i, tl := range tools {
+		names[i] = tl.Name()
 	}
+	expected := map[string]bool{"load_pattern": true, "query_tool_result": true, "recall": true}
+	if len(tools) != len(expected) {
+		t.Fatalf("Expected the three base tools at construction, got: %v", names)
+	}
+	for _, n := range names {
+		if !expected[n] {
+			t.Fatalf("Unexpected base tool %q at construction (got %v)", n, names)
+		}
+	}
+	base := len(tools)
 
 	// Register single tool
 	ag.RegisterTool(&mockCalculatorTool{})
 	tools = ag.RegisteredTools()
-	if len(tools) != 1 {
-		t.Errorf("Expected 1 tool, got: %d", len(tools))
+	if len(tools) != base+1 {
+		t.Errorf("Expected %d tools, got: %d", base+1, len(tools))
 	}
 
 	// Register multiple tools at once
 	ag.RegisterTools(&mockSearchTool{}, &mockWeatherTool{})
 	tools = ag.RegisteredTools()
-	if len(tools) != 3 {
-		t.Errorf("Expected 3 tools, got: %d", len(tools))
+	if len(tools) != base+3 {
+		t.Errorf("Expected %d tools, got: %d", base+3, len(tools))
 	}
 }
 

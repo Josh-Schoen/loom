@@ -28,6 +28,7 @@ import (
 	loomv1 "github.com/teradata-labs/loom/gen/go/loom/v1"
 	"github.com/teradata-labs/loom/internal/version"
 	"github.com/teradata-labs/loom/pkg/agent"
+	"github.com/teradata-labs/loom/pkg/artifacts"
 	"github.com/teradata-labs/loom/pkg/evals"
 	"github.com/teradata-labs/loom/pkg/evals/judges"
 	"github.com/teradata-labs/loom/pkg/llm/factory"
@@ -60,6 +61,32 @@ type Server struct {
 	activeProviderName string                       // currently active pool provider
 	evalStore          *evals.Store                 // optional; nil means no persistence
 	judgeServer        *JudgeServer                 // optional; nil means use hardcoded judge
+
+	// allowTimeOverride accepts WeaveRequest.occurred_at (replay/import arrival
+	// times). Default false: client-supplied timestamps can poison temporal
+	// grounding, so honoring them is an explicit operator decision
+	// (server.allow_time_override). Set via SetAllowTimeOverride.
+	allowTimeOverride bool
+
+	// allowAssistantOverride accepts WeaveRequest.replay_assistant_message
+	// (generation-free conversation replay — the caller supplies the
+	// assistant's turn verbatim). Default false (server.allow_assistant_override).
+	// Set via SetAllowAssistantOverride.
+	allowAssistantOverride bool
+}
+
+// SetAllowTimeOverride configures whether WeaveRequest.occurred_at is honored
+// (server.allow_time_override). See applyOccurredAt for the gate semantics.
+func (s *Server) SetAllowTimeOverride(allow bool) {
+	s.allowTimeOverride = allow
+}
+
+// SetAllowAssistantOverride configures whether
+// WeaveRequest.replay_assistant_message is honored
+// (server.allow_assistant_override). See applyReplayAssistant for the gate
+// semantics.
+func (s *Server) SetAllowAssistantOverride(allow bool) {
+	s.allowAssistantOverride = allow
 }
 
 // SetJudgeServer wires an in-memory JudgeServer so that ABTest can resolve req.JudgeId.
@@ -109,11 +136,39 @@ func (s *Server) Weave(ctx context.Context, req *loomv1.WeaveRequest) (*loomv1.W
 		return nil, status.Error(codes.InvalidArgument, "query is required")
 	}
 
+	// Replay/import support: validate occurred_at and thread it through the
+	// context so persisted rows anchor at the conversation's historical time.
+	ctx, err := applyOccurredAt(ctx, req, s.allowTimeOverride)
+	if err != nil {
+		return nil, err
+	}
+	// Generation-free replay: a scripted assistant turn substitutes for the LLM
+	// call while the memory pipeline still runs (see applyReplayAssistant).
+	ctx, err = applyReplayAssistant(ctx, req, s.allowAssistantOverride)
+	if err != nil {
+		return nil, err
+	}
+
 	// Get or create session
 	sessionID := req.SessionId
 	if sessionID == "" {
 		sessionID = GenerateSessionID()
 	}
+
+	// Slot scheduling: install this turn's SlotInfo (origin from the
+	// client's own report — gRPC metadata "loom-slot-origin"; a session that
+	// already has history classifies IN_FLIGHT from its first call).
+	// Installed on every turn-executing entry point, unary and streaming.
+	_, sessionResumed := s.agent.GetSession(sessionID)
+	ctx = installTurnSlotInfo(ctx, sessionResumed, sessionID, s.agent.GetID())
+
+	// Door admission (see enterTurnDoor): batch turns queue at the front
+	// door when the active ceiling is reached; interactive turns bypass.
+	releaseDoor, doorErr := enterTurnDoor(ctx, nil)
+	if doorErr != nil {
+		return nil, doorErr
+	}
+	defer releaseDoor()
 
 	// Reset context window if requested (before processing the message)
 	if req.ResetContext {
@@ -123,7 +178,7 @@ func (s *Server) Weave(ctx context.Context, req *loomv1.WeaveRequest) (*loomv1.W
 	// Execute agent chat
 	resp, err := s.agent.Chat(ctx, sessionID, req.Query)
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "agent execution failed: %v", err)
+		return nil, wrapAgentError(err)
 	}
 
 	// Build context state snapshot (after response, reflects post-conversation state)
@@ -166,11 +221,37 @@ func (s *Server) StreamWeave(req *loomv1.WeaveRequest, stream loomv1.LoomService
 		return status.Error(codes.InvalidArgument, "query cannot be empty")
 	}
 
+	// Replay/import support: validate occurred_at and thread it through the
+	// context used for the agent call (see applyOccurredAt).
+	ctx, err := applyOccurredAt(stream.Context(), req, s.allowTimeOverride)
+	if err != nil {
+		return err
+	}
+	// Generation-free replay: a scripted assistant turn substitutes for the LLM
+	// call while the memory pipeline still runs (see applyReplayAssistant).
+	ctx, err = applyReplayAssistant(ctx, req, s.allowAssistantOverride)
+	if err != nil {
+		return err
+	}
+
 	// Generate session ID if not provided
 	sessionID := req.SessionId
 	if sessionID == "" {
 		sessionID = GenerateSessionID()
 	}
+
+	// Slot scheduling: install this turn's SlotInfo (see Weave — every
+	// turn-executing entry point installs it).
+	_, sessionResumed := s.agent.GetSession(sessionID)
+	ctx = installTurnSlotInfo(ctx, sessionResumed, sessionID, s.agent.GetID())
+
+	// Door admission (see enterTurnDoor): batch turns queue at the front
+	// door when the active ceiling is reached; interactive turns bypass.
+	releaseDoor, doorErr := enterTurnDoor(ctx, nil)
+	if doorErr != nil {
+		return doorErr
+	}
+	defer releaseDoor()
 
 	// Reset context window if requested (before processing the message)
 	if req.ResetContext {
@@ -188,17 +269,11 @@ func (s *Server) StreamWeave(req *loomv1.WeaveRequest, stream loomv1.LoomService
 	progressChan := make(chan agent.ProgressEvent, DefaultProgressBufferSize)
 
 	// Create progress callback that sends events to channel
-	progressCallback := func(event agent.ProgressEvent) {
-		select {
-		case progressChan <- event:
-		case <-stream.Context().Done():
-			// Context cancelled, stop sending
-		}
-	}
+	progressCallback := newProgressSender(progressChan, stream.Context().Done())
 
 	// Execute agent with progress callback
 	go func() {
-		resp, err := s.agent.ChatWithProgress(stream.Context(), sessionID, req.Query, progressCallback)
+		resp, err := s.agent.ChatWithProgress(ctx, sessionID, req.Query, progressCallback)
 		resultChan <- agentResult{resp: resp, err: err}
 		close(progressChan) // Signal no more progress events
 	}()
@@ -434,18 +509,28 @@ func (s *Server) GetSession(ctx context.Context, req *loomv1.GetSessionRequest) 
 // exist only in the persistent store, newest-updated first. Live entries win on
 // ID collision. See mergePersistedSessions for the merge rules and its limits.
 func (s *Server) ListSessions(ctx context.Context, req *loomv1.ListSessionsRequest) (*loomv1.ListSessionsResponse, error) {
+	if err := validateListSessionsRequest(req); err != nil {
+		return nil, err
+	}
+
 	sessions := s.agent.ListSessions()
 
-	protoSessions := make([]*loomv1.Session, len(sessions))
-	for i, sess := range sessions {
-		protoSessions[i] = ConvertSession(sess)
+	enrichDisk := listSessionsNeedsArtifactDisk(req)
+	protoSessions := make([]*loomv1.Session, 0, len(sessions))
+	for _, sess := range sessions {
+		protoSessions = append(protoSessions, convertSession(sess, enrichDisk))
 	}
 
 	protoSessions = mergePersistedSessions(ctx, s.sessionStore, protoSessions,
 		postgres.UserIDFromContext(ctx), zap.L())
 
+	filtered := filterListSessions(protoSessions, req)
+	total := types.SafeInt32(len(filtered))
+	paged := pageProtoSessions(filtered, req.GetOffset(), req.GetLimit())
+
 	return &loomv1.ListSessionsResponse{
-		Sessions: protoSessions,
+		Sessions:   paged,
+		TotalCount: total,
 	}, nil
 }
 
@@ -455,7 +540,29 @@ func (s *Server) DeleteSession(ctx context.Context, req *loomv1.DeleteSessionReq
 		return nil, status.Error(codes.InvalidArgument, "session_id is required")
 	}
 
-	s.agent.DeleteSession(req.SessionId)
+	_, inMemory := s.agent.GetSession(req.SessionId)
+	// Only consult the persistent store when the session is not already in
+	// memory. Otherwise we'd add a store round-trip (and on Postgres, pull the
+	// session row and its messages) to every delete on the happy path.
+	inStore := false
+	if !inMemory && s.sessionStore != nil {
+		if loaded, err := s.sessionStore.LoadSession(ctx, req.SessionId); err == nil && loaded != nil {
+			inStore = true
+		}
+	}
+	if !inMemory && !inStore {
+		return nil, status.Error(codes.NotFound, "session not found")
+	}
+
+	if err := artifacts.CompleteSessionArtifactMetadata(req.SessionId); err != nil {
+		zap.L().Warn("session artifact metadata completion failed",
+			zap.String("session_id", req.SessionId),
+			zap.Error(err))
+	}
+
+	if inMemory {
+		s.agent.DeleteSession(req.SessionId)
+	}
 
 	// Also delete from persistent store
 	if s.sessionStore != nil {
@@ -543,7 +650,10 @@ func (s *Server) GetTrace(ctx context.Context, req *loomv1.GetTraceRequest) (*lo
 	return nil, status.Error(codes.Unimplemented, "trace retrieval not yet implemented")
 }
 
-// GetHealth performs a health check by pinging each configured LLM provider.
+// GetHealth performs a health check against each configured LLM provider,
+// preferring each provider's lightweight HealthCheck (see pingProvider in
+// health.go) over a real chat completion so transient LLM latency/rate
+// limits don't falsely report a live agent as unhealthy.
 // Returns per-component status in the components map with keys like "llm.agent", "llm.judge", etc.
 // Overall status is "healthy" if all pass, "degraded" if some fail, "unhealthy" if all fail.
 func (s *Server) GetHealth(ctx context.Context, req *loomv1.GetHealthRequest) (*loomv1.HealthStatus, error) {
@@ -558,9 +668,7 @@ func (s *Server) GetHealth(ctx context.Context, req *loomv1.GetHealthRequest) (*
 
 		// Send minimal health check with short timeout
 		checkCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		_, err := llmProvider.Chat(checkCtx, []types.Message{
-			{Role: "user", Content: "ping"},
-		}, nil)
+		err := pingProvider(checkCtx, llmProvider)
 		cancel()
 
 		latency := time.Since(start).Milliseconds()
@@ -1374,17 +1482,42 @@ func (s *Server) RequestToolPermission(ctx context.Context, req *loomv1.ToolPerm
 
 // Helper functions
 
-// ConvertSession converts an agent.Session to proto format.
+// ConvertSession converts an agent.Session to proto format, merging artifacts/sessions/<id>/metadata.json when present.
 func ConvertSession(s *agent.Session) *loomv1.Session {
-	return &loomv1.Session{
+	return convertSession(s, true)
+}
+
+// convertSession optionally skips disk metadata reads (used for ListSessions to avoid O(n) I/O).
+func convertSession(s *agent.Session, enrichFromArtifactDisk bool) *loomv1.Session {
+	if s == nil {
+		return nil
+	}
+	md := sessionMetadataFromContext(s)
+	backend := ""
+	if md != nil {
+		backend = md["backend"]
+	}
+	p := &loomv1.Session{
 		Id:                s.ID,
 		Name:              s.Name,
+		Backend:           backend,
 		CreatedAt:         s.CreatedAt.Unix(),
 		UpdatedAt:         s.UpdatedAt.Unix(),
 		State:             "active",
 		TotalCostUsd:      s.TotalCostUSD,
 		ConversationCount: s.MessageCount(),
+		Metadata:          md,
+		AgentId:           s.AgentID,
+		AgentName:         artifacts.AgentNameFromSession(s),
+		StartedAt:         s.CreatedAt.UTC().Format(time.RFC3339),
 	}
+	if enrichFromArtifactDisk && artifacts.SessionMetadataEnabled() {
+		mergeArtifactMetadataIntoProto(p, s.ID)
+	}
+	if artifacts.SessionMetadataEnabled() && enrichFromArtifactDisk && p.MetadataStatus == "" {
+		p.MetadataStatus = "active"
+	}
+	return p
 }
 
 // ConvertMessage converts an agent.Message to proto format.

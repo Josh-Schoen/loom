@@ -318,7 +318,7 @@ func TestServer_GetConversationHistory_EmptyID(t *testing.T) {
 	}
 }
 
-func TestServer_ListTools_Empty(t *testing.T) {
+func TestServer_ListTools_OnlyLoadPatternBaseTool(t *testing.T) {
 	ag := createTestAgent()
 	srv := NewServer(ag, nil)
 
@@ -329,21 +329,27 @@ func TestServer_ListTools_Empty(t *testing.T) {
 		t.Fatalf("ListTools failed: %v", err)
 	}
 
-	// Agent has NO built-in tools auto-registered (zero-tools policy)
-	// Note: shell_execute auto-registration removed in Azure 11-tool bug fix
-	// Note: Tools must be explicitly configured in agent config
-	// Note: query_tool_result uses progressive disclosure (registered after first large result)
-	// Note: get_error_details uses progressive disclosure (registered after first error)
-	// Note: get_tool_result removed - inline metadata makes it unnecessary
-	// Note: recall_conversation, clear_recalled_context, search_conversation removed in scratchpad experiment
-	// Note: record_finding removed - replaced by automatic extraction
-	if len(resp.Tools) != 0 {
-		t.Errorf("Expected 0 built-in tools (zero-tools policy), got: %d", len(resp.Tools))
+	// The always-present base tools: load_pattern (pattern library configured
+	// from construction), plus query_tool_result and recall — registered
+	// always (HLD §6/§7.1). No other builtin auto-registers.
+	expected := map[string]bool{"load_pattern": true, "query_tool_result": true, "recall": true}
+	names := make([]string, len(resp.Tools))
+	for i, tl := range resp.Tools {
+		names[i] = tl.Name
+	}
+	if len(names) != len(expected) {
+		t.Errorf("Expected the three base tools, got: %v", names)
+	}
+	for _, n := range names {
+		if !expected[n] {
+			t.Errorf("Unexpected base tool %q, got: %v", n, names)
+		}
 	}
 }
 
 // Note: TestServer_ListTools_Multiple removed - would require mockTool implementation
-// which is already in server_test.go. ListTools is tested by TestServer_ListTools_Empty.
+// which is already in server_test.go. ListTools is tested by
+// TestServer_ListTools_OnlyLoadPatternBaseTool.
 
 func TestServer_GetHealth_Success(t *testing.T) {
 	ag := createTestAgent()
@@ -1012,11 +1018,9 @@ func TestServer_StreamWeave_RealProgressEvents(t *testing.T) {
 	}
 
 	// Real agent progress should include these stages:
-	// 1. PATTERN_SELECTION (emitted at start of conversation loop)
-	// 2. LLM_GENERATION (emitted for each LLM call)
-	// 3. COMPLETED (emitted at end)
+	// 1. LLM_GENERATION (emitted for each LLM call)
+	// 2. COMPLETED (emitted at end)
 
-	foundPatternSelection := false
 	foundLLMGeneration := false
 	foundCompletion := false
 
@@ -1032,13 +1036,6 @@ func TestServer_StreamWeave_RealProgressEvents(t *testing.T) {
 		}
 
 		switch msg.Stage {
-		case loomv1.ExecutionStage_EXECUTION_STAGE_PATTERN_SELECTION:
-			foundPatternSelection = true
-			// Progress should be low at start
-			if msg.Progress > 20 {
-				t.Errorf("Pattern selection progress too high: %d", msg.Progress)
-			}
-
 		case loomv1.ExecutionStage_EXECUTION_STAGE_LLM_GENERATION:
 			foundLLMGeneration = true
 			// Progress should be mid-range
@@ -1060,9 +1057,6 @@ func TestServer_StreamWeave_RealProgressEvents(t *testing.T) {
 	}
 
 	// Verify all expected stages were present
-	if !foundPatternSelection {
-		t.Error("Expected PATTERN_SELECTION stage from real agent progress")
-	}
 	if !foundLLMGeneration {
 		t.Error("Expected LLM_GENERATION stage from real agent progress")
 	}

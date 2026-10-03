@@ -20,6 +20,7 @@ import (
 	"fmt"
 
 	loomv1 "github.com/teradata-labs/loom/gen/go/loom/v1"
+	"github.com/teradata-labs/loom/internal/sqlitedriver"
 	"github.com/teradata-labs/loom/pkg/agent"
 	"github.com/teradata-labs/loom/pkg/artifacts"
 	"github.com/teradata-labs/loom/pkg/memory"
@@ -34,15 +35,14 @@ import (
 // All stores share the same loom.db file via separate connections with WAL mode.
 type SQLiteBackend struct {
 	sessionStore      agent.SessionStorage
-	errorStore        agent.ErrorStore
 	artifactStore     artifacts.ArtifactStore
-	resultStore       storage.ResultStore
 	humanRequestStore shuttle.HumanRequestStore
 	graphMemoryStore  memory.GraphMemoryStore
 	graphMemDB        *sql.DB // owned connection for graph memory; closed in Close()
 	taskStore         task.TaskStore
 	taskDB            *sql.DB // owned connection for task store; closed in Close()
 	migrator          *sqlite.Migrator
+	migratorDB        *sql.DB // owned connection backing migrator; closed in Close()
 	dbPath            string
 	tracer            observability.Tracer
 }
@@ -75,35 +75,12 @@ func NewSQLiteBackend(cfg *loomv1.SQLiteStorageConfig, tracer observability.Trac
 		return nil, fmt.Errorf("failed to create session store: %w", err)
 	}
 
-	// Create error store (reuses same DB path with separate connection)
-	errorStore, err := agent.NewSQLiteErrorStore(dbPath, tracer)
-	if err != nil {
-		return nil, errors.Join(
-			fmt.Errorf("failed to create error store: %w", err),
-			sessionStore.Close(),
-		)
-	}
-
 	// Create artifact store (reuses same DB path)
 	artifactStore, err := artifacts.NewSQLiteStore(dbPath, tracer)
 	if err != nil {
 		return nil, errors.Join(
 			fmt.Errorf("failed to create artifact store: %w", err),
 			sessionStore.Close(),
-			errorStore.Close(),
-		)
-	}
-
-	// Create result store
-	resultStore, err := storage.NewSQLResultStore(&storage.SQLResultStoreConfig{
-		DBPath: dbPath,
-	})
-	if err != nil {
-		return nil, errors.Join(
-			fmt.Errorf("failed to create result store: %w", err),
-			sessionStore.Close(),
-			errorStore.Close(),
-			artifactStore.Close(),
 		)
 	}
 
@@ -116,21 +93,27 @@ func NewSQLiteBackend(cfg *loomv1.SQLiteStorageConfig, tracer observability.Trac
 		return nil, errors.Join(
 			fmt.Errorf("failed to create human request store: %w", err),
 			sessionStore.Close(),
-			errorStore.Close(),
 			artifactStore.Close(),
-			resultStore.Close(),
 		)
 	}
 
+	// Shared DSN: busy_timeout and foreign_keys are per-connection settings,
+	// so they must ride in the DSN to reach every pooled connection.
+	// sqlitedriver.DSN renders the active driver's parameter syntax
+	// (mattn-style under CGO, _pragma-style under modernc).
+	dsn := sqlitedriver.DSN(dbPath, sqlitedriver.Options{
+		BusyTimeoutMS: 5000,
+		WAL:           true,
+		ForeignKeys:   true,
+	})
+
 	// Create migrator for versioned schema management
-	migratorDB, err := sql.Open("sqlite3", dbPath+"?_fk=1&_journal_mode=WAL")
+	migratorDB, err := sql.Open("sqlite3", dsn)
 	if err != nil {
 		return nil, errors.Join(
 			fmt.Errorf("failed to open DB for migrator: %w", err),
 			sessionStore.Close(),
-			errorStore.Close(),
 			artifactStore.Close(),
-			resultStore.Close(),
 			humanStore.Close(),
 		)
 	}
@@ -140,23 +123,19 @@ func NewSQLiteBackend(cfg *loomv1.SQLiteStorageConfig, tracer observability.Trac
 			fmt.Errorf("failed to create migrator: %w", err),
 			migratorDB.Close(),
 			sessionStore.Close(),
-			errorStore.Close(),
 			artifactStore.Close(),
-			resultStore.Close(),
 			humanStore.Close(),
 		)
 	}
 
 	// Create graph memory store (uses same DB path, separate connection).
-	graphMemDB, err := sql.Open("sqlite3", dbPath+"?_fk=1&_journal_mode=WAL&_busy_timeout=5000")
+	graphMemDB, err := sql.Open("sqlite3", dsn)
 	if err != nil {
 		return nil, errors.Join(
 			fmt.Errorf("failed to open DB for graph memory: %w", err),
 			migratorDB.Close(),
 			sessionStore.Close(),
-			errorStore.Close(),
 			artifactStore.Close(),
-			resultStore.Close(),
 			humanStore.Close(),
 		)
 	}
@@ -164,16 +143,14 @@ func NewSQLiteBackend(cfg *loomv1.SQLiteStorageConfig, tracer observability.Trac
 	graphMemoryStore := sqlite.NewGraphMemoryStore(graphMemDB, tc, tracer)
 
 	// Create task store (uses same DB path, separate connection).
-	taskDB, err := sql.Open("sqlite3", dbPath+"?_fk=1&_journal_mode=WAL&_busy_timeout=5000")
+	taskDB, err := sql.Open("sqlite3", dsn)
 	if err != nil {
 		return nil, errors.Join(
 			fmt.Errorf("failed to open DB for task store: %w", err),
 			graphMemDB.Close(),
 			migratorDB.Close(),
 			sessionStore.Close(),
-			errorStore.Close(),
 			artifactStore.Close(),
-			resultStore.Close(),
 			humanStore.Close(),
 		)
 	}
@@ -181,15 +158,14 @@ func NewSQLiteBackend(cfg *loomv1.SQLiteStorageConfig, tracer observability.Trac
 
 	return &SQLiteBackend{
 		sessionStore:      sessionStore,
-		errorStore:        errorStore,
 		artifactStore:     artifactStore,
-		resultStore:       resultStore,
 		humanRequestStore: humanStore,
 		graphMemoryStore:  graphMemoryStore,
 		graphMemDB:        graphMemDB,
 		taskStore:         taskStore,
 		taskDB:            taskDB,
 		migrator:          migrator,
+		migratorDB:        migratorDB,
 		dbPath:            dbPath,
 		tracer:            tracer,
 	}, nil
@@ -200,19 +176,9 @@ func (b *SQLiteBackend) SessionStorage() agent.SessionStorage {
 	return b.sessionStore
 }
 
-// ErrorStore returns the error store implementation.
-func (b *SQLiteBackend) ErrorStore() agent.ErrorStore {
-	return b.errorStore
-}
-
 // ArtifactStore returns the artifact store implementation.
 func (b *SQLiteBackend) ArtifactStore() artifacts.ArtifactStore {
 	return b.artifactStore
-}
-
-// ResultStore returns the SQL result store implementation.
-func (b *SQLiteBackend) ResultStore() storage.ResultStore {
-	return b.resultStore
 }
 
 // HumanRequestStore returns the human request store implementation.
@@ -262,7 +228,7 @@ func (b *SQLiteBackend) Migrator() *sqlite.Migrator {
 
 // Ping verifies the SQLite database is accessible.
 func (b *SQLiteBackend) Ping(ctx context.Context) error {
-	db, err := sql.Open("sqlite3", b.dbPath)
+	db, err := sql.Open("sqlite3", sqlitedriver.DSN(b.dbPath, sqlitedriver.Options{BusyTimeoutMS: 5000}))
 	if err != nil {
 		return fmt.Errorf("SQLite ping failed: %w", err)
 	}
@@ -280,14 +246,8 @@ func (b *SQLiteBackend) Close() error {
 	if err := b.sessionStore.Close(); err != nil && firstErr == nil {
 		firstErr = fmt.Errorf("session store close: %w", err)
 	}
-	if err := b.errorStore.Close(); err != nil && firstErr == nil {
-		firstErr = fmt.Errorf("error store close: %w", err)
-	}
 	if err := b.artifactStore.Close(); err != nil && firstErr == nil {
 		firstErr = fmt.Errorf("artifact store close: %w", err)
-	}
-	if err := b.resultStore.Close(); err != nil && firstErr == nil {
-		firstErr = fmt.Errorf("result store close: %w", err)
 	}
 	if err := b.humanRequestStore.Close(); err != nil && firstErr == nil {
 		firstErr = fmt.Errorf("human request store close: %w", err)
@@ -300,6 +260,11 @@ func (b *SQLiteBackend) Close() error {
 	if b.taskDB != nil {
 		if err := b.taskDB.Close(); err != nil && firstErr == nil {
 			firstErr = fmt.Errorf("task db close: %w", err)
+		}
+	}
+	if b.migratorDB != nil {
+		if err := b.migratorDB.Close(); err != nil && firstErr == nil {
+			firstErr = fmt.Errorf("migrator db close: %w", err)
 		}
 	}
 

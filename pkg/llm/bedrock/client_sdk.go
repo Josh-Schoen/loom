@@ -30,6 +30,7 @@ import (
 	"github.com/teradata-labs/loom/pkg/llm"
 	llmtypes "github.com/teradata-labs/loom/pkg/llm/types"
 	"github.com/teradata-labs/loom/pkg/shuttle"
+	"go.uber.org/zap"
 )
 
 // SDKClient implements the LLMProvider interface using the official Anthropic SDK for Bedrock.
@@ -41,7 +42,6 @@ type SDKClient struct {
 	maxTokens   int64
 	temperature float64
 	rateLimiter *llm.RateLimiter
-	toolNameMap map[string]string // sanitized name → original name
 }
 
 // NewSDKClient creates a new Bedrock client using the Anthropic SDK.
@@ -119,6 +119,18 @@ func NewSDKClient(cfg Config) (*SDKClient, error) {
 			},
 		)
 		awsCfg.AuthSchemePreference = []string{"httpBearerAuth"}
+	} else {
+		// No loom-configured bearer token: force SigV4. config.LoadDefaultConfig
+		// can auto-resolve a Bedrock bearer token (AWS_BEARER_TOKEN_BEDROCK or a
+		// profile setting) into BearerAuthTokenProvider. Unlike the raw Converse
+		// client, the Anthropic SDK's Bedrock middleware uses bearer auth
+		// unconditionally whenever that provider is non-nil (it ignores
+		// AuthSchemePreference), which breaks SigV4/SSO credentials. Clear it so
+		// the middleware signs requests with cfg.Credentials instead.
+		if awsCfg.BearerAuthTokenProvider != nil {
+			zap.L().Warn("ignoring ambient AWS bearer token (AWS_BEARER_TOKEN_BEDROCK or profile bearer setting); signing Bedrock requests with SigV4 credentials instead — set the bearer token in loom's Bedrock config to use bearer auth")
+			awsCfg.BearerAuthTokenProvider = nil
+		}
 	}
 
 	// Initialize rate limiter if enabled
@@ -151,7 +163,7 @@ func NewSDKClient(cfg Config) (*SDKClient, error) {
 			rlCfg.QueueTimeout = cfg.RateLimiterConfig.QueueTimeout
 		}
 
-		rateLimiter = getOrCreateGlobalRateLimiter(rlCfg)
+		rateLimiter = llm.SharedRateLimiter("bedrock|"+cfg.Region+"|"+cfg.ModelID, rlCfg)
 	}
 
 	// Create Anthropic client with Bedrock backend
@@ -170,9 +182,9 @@ func NewSDKClient(cfg Config) (*SDKClient, error) {
 	}, nil
 }
 
-// Name returns the provider name.
+// Name returns the canonical provider name used in configuration.
 func (c *SDKClient) Name() string {
-	return "bedrock-sdk"
+	return "bedrock"
 }
 
 // Model returns the model identifier.
@@ -180,10 +192,30 @@ func (c *SDKClient) Model() string {
 	return c.modelID
 }
 
+// requiresStreaming reports whether the Anthropic SDK would reject a
+// non-streaming Messages.New call for this client's model + max_tokens.
+// The SDK pre-flights non-streaming requests via CalculateNonStreamingTimeout
+// and errors with "streaming is required for operations that may take longer
+// than 10 minutes" when max_tokens implies >10 minutes of generation
+// (max_tokens > ~21,333) or exceeds the model's non-streaming token cap.
+// Claude models are routinely configured with 32k–64k max output tokens,
+// which trips that guard even for trivial prompts.
+func (c *SDKClient) requiresStreaming() bool {
+	_, err := anthropic.CalculateNonStreamingTimeout(int(c.maxTokens), anthropic.Model(c.modelID), nil)
+	return err != nil
+}
+
 // Chat sends a conversation to Bedrock using the Anthropic SDK and returns the response.
+// When the SDK would refuse the non-streaming API for this max_tokens (see
+// requiresStreaming), the request transparently runs over the streaming API
+// and returns the fully accumulated response instead of erroring.
 func (c *SDKClient) Chat(ctx context.Context, messages []llmtypes.Message, tools []shuttle.Tool) (*llmtypes.LLMResponse, error) {
+	if c.requiresStreaming() {
+		return c.ChatStream(ctx, messages, tools, nil)
+	}
+
 	// Convert messages to Anthropic SDK format
-	systemPrompt, sdkMessages := c.convertMessagesToSDK(messages)
+	systemBlocks, sdkMessages := c.convertMessagesToSDK(messages)
 
 	// Validate that we have at least one message
 	if len(sdkMessages) == 0 {
@@ -198,20 +230,18 @@ func (c *SDKClient) Chat(ctx context.Context, messages []llmtypes.Message, tools
 		Temperature: anthropic.Float(c.temperature),
 	}
 
-	// Add system prompt if present, with cache_control for prompt caching
-	if systemPrompt != "" {
-		params.System = []anthropic.TextBlockParam{
-			{
-				Text:         systemPrompt,
-				CacheControl: anthropic.NewCacheControlEphemeralParam(),
-			},
-		}
+	// System blocks carry the compile's cache breakpoints, one per block.
+	if len(systemBlocks) > 0 {
+		params.System = systemBlocks
 	}
 
-	// Add tools if provided; mark the last tool with cache_control
+	// Add tools if provided; mark the last tool with cache_control.
+	// The sanitized→original name mapping is request-local so concurrent
+	// requests on a shared client cannot corrupt each other's tool names.
+	var toolNameMap map[string]string
 	if len(tools) > 0 {
-		c.toolNameMap = make(map[string]string)
-		sdkTools := c.convertToolsToSDK(tools)
+		var sdkTools []anthropic.ToolParam
+		sdkTools, toolNameMap = c.convertToolsToSDK(tools)
 		// Mark the last tool with cache_control so the entire tool list is cached
 		if len(sdkTools) > 0 {
 			sdkTools[len(sdkTools)-1].CacheControl = anthropic.NewCacheControlEphemeralParam()
@@ -236,6 +266,9 @@ func (c *SDKClient) Chat(ctx context.Context, messages []llmtypes.Message, tools
 			return c.client.Messages.New(ctx, params)
 		})
 		if err != nil {
+			if llm.IsBedrockContextTooLong(err) {
+				return nil, fmt.Errorf("bedrock SDK invocation failed: %s: %w", err, llm.ErrContextTooLong)
+			}
 			return nil, fmt.Errorf("bedrock SDK invocation failed: %w", err)
 		}
 		message = result.(*anthropic.Message)
@@ -243,12 +276,15 @@ func (c *SDKClient) Chat(ctx context.Context, messages []llmtypes.Message, tools
 		// Direct call without rate limiting
 		message, err = c.client.Messages.New(ctx, params)
 		if err != nil {
+			if llm.IsBedrockContextTooLong(err) {
+				return nil, fmt.Errorf("bedrock SDK invocation failed: %s: %w", err, llm.ErrContextTooLong)
+			}
 			return nil, fmt.Errorf("bedrock SDK invocation failed: %w", err)
 		}
 	}
 
 	// Convert response to our format
-	llmResp := c.convertResponseFromSDK(message)
+	llmResp := c.convertResponseFromSDK(message, toolNameMap)
 
 	// Record token usage for rate limiter metrics
 	if c.rateLimiter != nil {
@@ -260,17 +296,26 @@ func (c *SDKClient) Chat(ctx context.Context, messages []llmtypes.Message, tools
 }
 
 // convertMessagesToSDK converts agent messages to Anthropic SDK format.
-// Returns the system prompt and the API messages.
-func (c *SDKClient) convertMessagesToSDK(messages []llmtypes.Message) (string, []anthropic.MessageParam) {
-	var systemPrompts []string
+// Returns the system blocks and the API messages.
+//
+// One block per source system message, each carrying its own cache_control
+// when compile marked it (HLD §5.2 step 8). Merging them into a single block
+// would put ROM and the summary behind one breakpoint, so a fold — which
+// rewrites only the summary — would invalidate ROM's cached prefix too.
+func (c *SDKClient) convertMessagesToSDK(messages []llmtypes.Message) ([]anthropic.TextBlockParam, []anthropic.MessageParam) {
+	var systemBlocks []anthropic.TextBlockParam
 	var sdkMessages []anthropic.MessageParam
 
 	for _, msg := range messages {
 		switch msg.Role {
 		case "system":
-			// Extract system messages - they'll be combined and sent separately
+			// Each system message is its own block; the marker rides with it.
 			if msg.Content != "" {
-				systemPrompts = append(systemPrompts, msg.Content)
+				block := anthropic.TextBlockParam{Text: msg.Content}
+				if msg.CacheBreakpoint {
+					block.CacheControl = anthropic.NewCacheControlEphemeralParam()
+				}
+				systemBlocks = append(systemBlocks, block)
 			}
 
 		case "user":
@@ -294,14 +339,12 @@ func (c *SDKClient) convertMessagesToSDK(messages []llmtypes.Message) (string, [
 						}
 					}
 				}
-				if len(content) > 0 {
-					sdkMessages = append(sdkMessages, anthropic.NewUserMessage(content...))
-				}
+				sdkMessages = appendUserOrCoalesceSDK(sdkMessages, content)
 			} else if msg.Content != "" {
 				// Plain text message
-				sdkMessages = append(sdkMessages, anthropic.NewUserMessage(
+				sdkMessages = appendUserOrCoalesceSDK(sdkMessages, []anthropic.ContentBlockParamUnion{
 					anthropic.NewTextBlock(msg.Content),
-				))
+				})
 			}
 
 		case "assistant":
@@ -329,28 +372,77 @@ func (c *SDKClient) convertMessagesToSDK(messages []llmtypes.Message) (string, [
 			}
 
 		case "tool":
-			sdkMessages = append(sdkMessages, anthropic.NewUserMessage(
+			// Tool results go under user role; coalesce with any adjacent user
+			// message so we never emit consecutive user wire messages
+			// (Anthropic 400: "roles must alternate"). Also lets a tool_result
+			// and a following user text sidecar (e.g. manage_skills's skill
+			// body) share one wire user message with mixed content blocks.
+			sdkMessages = appendUserOrCoalesceSDK(sdkMessages, []anthropic.ContentBlockParamUnion{
 				anthropic.NewToolResultBlock(msg.ToolUseID, msg.Content, false),
-			))
+			})
+		}
+		// Prompt-cache breakpoint the compile flagged (§ prompt caching). ROM and
+		// the summary are system messages, already cached via the System block
+		// above; here we mark the message breakpoint (the last stable message
+		// before any current-turn offload stub) on the block just appended.
+		if msg.CacheBreakpoint && msg.Role != "system" {
+			markLastBlockCacheControl(sdkMessages)
 		}
 	}
 
-	// Combine all system prompts
-	systemPrompt := strings.Join(systemPrompts, "\n\n")
-
-	return systemPrompt, sdkMessages
+	return systemBlocks, sdkMessages
 }
 
-// convertToolsToSDK converts shuttle tools to Anthropic SDK format.
-func (c *SDKClient) convertToolsToSDK(tools []shuttle.Tool) []anthropic.ToolParam {
+// markLastBlockCacheControl sets an ephemeral cache_control marker on the last
+// content block of the last SDK message — the wire form of a prompt-cache
+// breakpoint on the conversation prefix.
+func markLastBlockCacheControl(msgs []anthropic.MessageParam) {
+	if len(msgs) == 0 {
+		return
+	}
+	blocks := msgs[len(msgs)-1].Content
+	if len(blocks) == 0 {
+		return
+	}
+	b := &blocks[len(blocks)-1]
+	switch {
+	case b.OfText != nil:
+		b.OfText.CacheControl = anthropic.NewCacheControlEphemeralParam()
+	case b.OfToolResult != nil:
+		b.OfToolResult.CacheControl = anthropic.NewCacheControlEphemeralParam()
+	}
+}
+
+// appendUserOrCoalesceSDK appends content blocks to the last user message in
+// the slice when that last message is user-role; otherwise it appends a new
+// user message. This is the sole path by which user-role wire messages are
+// produced by the SDK converter, so it guarantees the outgoing message list
+// never contains two consecutive user-role messages — which Anthropic rejects
+// with 400 "roles must alternate". It also lets a tool_result and an
+// immediately-following user-role text (e.g. the manage_skills skill-body
+// sidecar) share a single wire user message with mixed content blocks.
+func appendUserOrCoalesceSDK(msgs []anthropic.MessageParam, blocks []anthropic.ContentBlockParamUnion) []anthropic.MessageParam {
+	if len(blocks) == 0 {
+		return msgs
+	}
+	if n := len(msgs); n > 0 && msgs[n-1].Role == anthropic.MessageParamRoleUser {
+		msgs[n-1].Content = append(msgs[n-1].Content, blocks...)
+		return msgs
+	}
+	return append(msgs, anthropic.NewUserMessage(blocks...))
+}
+
+// convertToolsToSDK converts tools to SDK format and returns this request's
+// sanitized→original tool-name mapping alongside them. The mapping is returned
+// rather than stored on the client so concurrent requests stay independent.
+func (c *SDKClient) convertToolsToSDK(tools []shuttle.Tool) ([]anthropic.ToolParam, map[string]string) {
 	var sdkTools []anthropic.ToolParam
+	toolNameMap := make(map[string]string, len(tools))
 
 	for _, tool := range tools {
 		originalName := tool.Name()
 		sanitizedName := llm.SanitizeToolName(originalName)
-		if c.toolNameMap != nil {
-			c.toolNameMap[sanitizedName] = originalName
-		}
+		toolNameMap[sanitizedName] = originalName
 
 		sdkTool := anthropic.ToolParam{
 			Name:        sanitizedName,
@@ -374,11 +466,13 @@ func (c *SDKClient) convertToolsToSDK(tools []shuttle.Tool) []anthropic.ToolPara
 		sdkTools = append(sdkTools, sdkTool)
 	}
 
-	return sdkTools
+	return sdkTools, toolNameMap
 }
 
 // convertResponseFromSDK converts Anthropic SDK response to agent format.
-func (c *SDKClient) convertResponseFromSDK(message *anthropic.Message) *llmtypes.LLMResponse {
+// toolNameMap is the request-local sanitized→original mapping produced by
+// convertToolsToSDK for the same request; nil is safe and leaves names as-is.
+func (c *SDKClient) convertResponseFromSDK(message *anthropic.Message, toolNameMap map[string]string) *llmtypes.LLMResponse {
 	cacheRead := int(message.Usage.CacheReadInputTokens)
 	cacheCreation := int(message.Usage.CacheCreationInputTokens)
 	llmResp := &llmtypes.LLMResponse{
@@ -415,7 +509,7 @@ func (c *SDKClient) convertResponseFromSDK(message *anthropic.Message) *llmtypes
 
 			toolCall := llmtypes.ToolCall{
 				ID:    block.ID,
-				Name:  llm.ReverseToolName(c.toolNameMap, block.Name),
+				Name:  llm.ReverseToolName(toolNameMap, block.Name),
 				Input: input,
 			}
 			llmResp.ToolCalls = append(llmResp.ToolCalls, toolCall)
@@ -467,7 +561,7 @@ func (c *SDKClient) ChatStream(ctx context.Context, messages []llmtypes.Message,
 	tokenCallback llmtypes.TokenCallback) (*llmtypes.LLMResponse, error) {
 
 	// Convert messages to SDK format
-	systemPrompt, sdkMessages := c.convertMessagesToSDK(messages)
+	systemBlocks, sdkMessages := c.convertMessagesToSDK(messages)
 
 	// Validate that we have at least one message
 	if len(sdkMessages) == 0 {
@@ -482,20 +576,18 @@ func (c *SDKClient) ChatStream(ctx context.Context, messages []llmtypes.Message,
 		Temperature: anthropic.Float(c.temperature),
 	}
 
-	// Add system prompt if present, with cache_control for prompt caching
-	if systemPrompt != "" {
-		params.System = []anthropic.TextBlockParam{
-			{
-				Text:         systemPrompt,
-				CacheControl: anthropic.NewCacheControlEphemeralParam(),
-			},
-		}
+	// System blocks carry the compile's cache breakpoints, one per block.
+	if len(systemBlocks) > 0 {
+		params.System = systemBlocks
 	}
 
-	// Add tools if provided; mark the last tool with cache_control
+	// Add tools if provided; mark the last tool with cache_control.
+	// The sanitized→original name mapping is request-local so concurrent
+	// requests on a shared client cannot corrupt each other's tool names.
+	var toolNameMap map[string]string
 	if len(tools) > 0 {
-		c.toolNameMap = make(map[string]string)
-		sdkTools := c.convertToolsToSDK(tools)
+		var sdkTools []anthropic.ToolParam
+		sdkTools, toolNameMap = c.convertToolsToSDK(tools)
 		// Mark the last tool with cache_control so the entire tool list is cached
 		if len(sdkTools) > 0 {
 			sdkTools[len(sdkTools)-1].CacheControl = anthropic.NewCacheControlEphemeralParam()
@@ -549,7 +641,7 @@ func (c *SDKClient) ChatStream(ctx context.Context, messages []llmtypes.Message,
 				// Start tracking a new tool call - reverse map sanitized name
 				toolCall := llmtypes.ToolCall{
 					ID:    event.ContentBlock.ID,
-					Name:  llm.ReverseToolName(c.toolNameMap, event.ContentBlock.Name),
+					Name:  llm.ReverseToolName(toolNameMap, event.ContentBlock.Name),
 					Input: make(map[string]interface{}), // Will be populated from deltas
 				}
 				toolCallIndex := len(toolCalls)
@@ -574,6 +666,9 @@ func (c *SDKClient) ChatStream(ctx context.Context, messages []llmtypes.Message,
 
 			// Handle tool input delta
 			if event.Delta.Type == "input_json_delta" {
+				// Tool-input deltas never reach tokenCallback (text only);
+				// report them as stream activity, then accumulate the JSON.
+				llmtypes.NotifyStreamActivity(ctx)
 				// Accumulate the JSON delta (uses PartialJSON field, not Text)
 				if buf, exists := toolInputBuffers[event.Index]; exists {
 					buf.WriteString(event.Delta.PartialJSON)
@@ -611,6 +706,9 @@ func (c *SDKClient) ChatStream(ctx context.Context, messages []llmtypes.Message,
 
 	// Check for stream errors (EOF is normal at end of stream)
 	if err := stream.Err(); err != nil && err != io.EOF {
+		if llm.IsBedrockContextTooLong(err) {
+			return nil, fmt.Errorf("stream error: %s: %w", err, llm.ErrContextTooLong)
+		}
 		return nil, fmt.Errorf("stream error: %w", err)
 	}
 

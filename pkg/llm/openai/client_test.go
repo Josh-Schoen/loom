@@ -17,6 +17,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -28,6 +30,27 @@ import (
 	"github.com/teradata-labs/loom/pkg/shuttle"
 	"github.com/teradata-labs/loom/pkg/types"
 )
+
+type retryBodyTransport struct {
+	bodies [][]byte
+}
+
+func (t *retryBodyTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	body, err := io.ReadAll(request.Body)
+	if err != nil {
+		return nil, err
+	}
+	t.bodies = append(t.bodies, body)
+	if len(t.bodies) == 1 {
+		return nil, io.EOF
+	}
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     make(http.Header),
+		Body: io.NopCloser(bytes.NewBufferString(
+			`{"choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`)),
+	}, nil
+}
 
 func TestNewClient(t *testing.T) {
 	tests := []struct {
@@ -77,6 +100,48 @@ func TestNewClient(t *testing.T) {
 			assert.Equal(t, tt.want.maxTokens, got.maxTokens)
 			assert.Equal(t, tt.want.temperature, got.temperature)
 			assert.NotNil(t, got.httpClient)
+			transport, ok := got.httpClient.Transport.(*http.Transport)
+			require.True(t, ok)
+			assert.True(t, transport.ForceAttemptHTTP2)
+		})
+	}
+}
+
+func TestClient_ChatRetryReconstructsRequestBody(t *testing.T) {
+	transport := &retryBodyTransport{}
+	client := NewClient(Config{APIKey: "test-key", Endpoint: "http://openai.test/chat"})
+	client.httpClient = &http.Client{Transport: transport}
+
+	response, err := client.Chat(context.Background(), []types.Message{{Role: "user", Content: "hello"}}, nil)
+
+	require.NoError(t, err)
+	assert.Equal(t, "ok", response.Content)
+	require.Len(t, transport.bodies, 2)
+	assert.NotEmpty(t, transport.bodies[0])
+	assert.Equal(t, transport.bodies[0], transport.bodies[1])
+}
+
+func TestClient_ConvertResponseDropsIncompleteToolCalls(t *testing.T) {
+	client := NewClient(Config{})
+	tests := []struct {
+		name string
+		call ToolCall
+	}{
+		{name: "missing id", call: ToolCall{Function: FunctionCall{Name: "search", Arguments: `{}`}}},
+		{name: "missing name", call: ToolCall{ID: "call_123", Function: FunctionCall{Arguments: `{}`}}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			response := client.convertResponse(&ChatCompletionResponse{
+				Choices: []ChatCompletionChoice{{
+					Message:      ChatMessage{ToolCalls: []ToolCall{tt.call}},
+					FinishReason: "tool_calls",
+				}},
+			}, 0)
+
+			assert.Empty(t, response.ToolCalls)
+			assert.Equal(t, "end_turn", response.StopReason)
 		})
 	}
 }
@@ -175,7 +240,71 @@ func TestClient_ConvertMessages(t *testing.T) {
 			},
 		},
 		{
-			name: "tool result message",
+			// Regression: json.Marshal of a nil map returns "null" (no error),
+			// which the old `if err != nil` guard let through. LiteLLM forwards
+			// that to Vertex AI as tool_use.input=null, which is rejected with
+			// "Input should be a valid dictionary". Must coerce to "{}".
+			name: "assistant tool call with nil input",
+			messages: []types.Message{
+				{
+					Role: "assistant",
+					ToolCalls: []types.ToolCall{
+						{
+							ID:    "call_nil",
+							Name:  "get_status",
+							Input: nil,
+						},
+					},
+				},
+			},
+			want: []ChatMessage{
+				{
+					Role: "assistant",
+					ToolCalls: []ToolCall{
+						{
+							ID:   "call_nil",
+							Type: "function",
+							Function: FunctionCall{
+								Name:      "get_status",
+								Arguments: `{}`,
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "assistant tool call with empty input",
+			messages: []types.Message{
+				{
+					Role: "assistant",
+					ToolCalls: []types.ToolCall{
+						{
+							ID:    "call_empty",
+							Name:  "get_status",
+							Input: map[string]interface{}{},
+						},
+					},
+				},
+			},
+			want: []ChatMessage{
+				{
+					Role: "assistant",
+					ToolCalls: []ToolCall{
+						{
+							ID:   "call_empty",
+							Type: "function",
+							Function: FunctionCall{
+								Name:      "get_status",
+								Arguments: `{}`,
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "orphaned tool result is dropped",
 			messages: []types.Message{
 				{
 					Role:      "tool",
@@ -183,13 +312,7 @@ func TestClient_ConvertMessages(t *testing.T) {
 					ToolUseID: "call_123",
 				},
 			},
-			want: []ChatMessage{
-				{
-					Role:       "tool",
-					Content:    "Temperature is 72F",
-					ToolCallID: "call_123",
-				},
-			},
+			want: []ChatMessage{},
 		},
 		{
 			name: "conversation with multiple message types",
@@ -250,6 +373,29 @@ func TestClient_ConvertMessages(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestClientConvertMessagesDropsOrphanedToolResults(t *testing.T) {
+	client := NewClient(Config{APIKey: "test"})
+	messages := []types.Message{
+		{
+			Role: "assistant",
+			ToolCalls: []types.ToolCall{
+				{ID: "", Name: "broken", Input: map[string]interface{}{}},
+				{ID: "valid-call", Name: "working", Input: map[string]interface{}{}},
+			},
+		},
+		{Role: "tool", ToolUseID: "", Content: "orphaned result"},
+		{Role: "tool", ToolUseID: "unknown-call", Content: "unpaired result"},
+		{Role: "tool", ToolUseID: "valid-call", Content: "paired result"},
+	}
+
+	got := client.convertMessages(messages)
+	require.Len(t, got, 2)
+	require.Len(t, got[0].ToolCalls, 1)
+	assert.Equal(t, "valid-call", got[0].ToolCalls[0].ID)
+	assert.Equal(t, "tool", got[1].Role)
+	assert.Equal(t, "valid-call", got[1].ToolCallID)
 }
 
 func TestClient_ConvertTools(t *testing.T) {
@@ -409,7 +555,7 @@ func TestClient_ConvertResponse(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := client.convertResponse(tt.resp)
+			got := client.convertResponse(tt.resp, 0)
 
 			assert.Equal(t, tt.want.Content, got.Content)
 			assert.Equal(t, tt.want.StopReason, got.StopReason)
@@ -476,8 +622,8 @@ func TestClient_CalculateCost(t *testing.T) {
 			model:        "gpt-5",
 			inputTokens:  1000,
 			outputTokens: 500,
-			wantMin:      0.007, // (1000 * 2.5 + 500 * 10) / 1M = 0.0075
-			wantMax:      0.008,
+			wantMin:      0.006240, // (1000 * 1.25 + 500 * 10) / 1M = 0.00625 (catalog)
+			wantMax:      0.006260,
 		},
 		{
 			name:         "gpt-5-mini",
@@ -516,8 +662,8 @@ func TestClient_CalculateCost(t *testing.T) {
 			model:        "o3",
 			inputTokens:  1000,
 			outputTokens: 500,
-			wantMin:      0.029, // (1000 * 10.0 + 500 * 40.0) / 1M = 0.03
-			wantMax:      0.031,
+			wantMin:      0.005990, // (1000 * 2.0 + 500 * 8.0) / 1M = 0.006 (catalog)
+			wantMax:      0.006010,
 		},
 		{
 			name:         "o3-mini",
@@ -540,7 +686,7 @@ func TestClient_CalculateCost(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			client := NewClient(Config{APIKey: "test", Model: tt.model})
-			got := client.calculateCost(tt.inputTokens, tt.outputTokens)
+			got := client.calculateCost(tt.inputTokens, tt.outputTokens, 0, 0)
 			assert.GreaterOrEqual(t, got, tt.wantMin)
 			assert.LessOrEqual(t, got, tt.wantMax)
 		})
@@ -862,4 +1008,201 @@ func TestChatRequest_MaxTokensField(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestClient_ExtraHeaders(t *testing.T) {
+	// Verify that ExtraHeaders are sent with every HTTP request.
+	var receivedHeaders http.Header
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedHeaders = r.Header.Clone()
+
+		resp := ChatCompletionResponse{
+			ID:      "chatcmpl-123",
+			Object:  "chat.completion",
+			Created: 1234567890,
+			Model:   "gpt-4o",
+			Choices: []ChatCompletionChoice{
+				{
+					Index: 0,
+					Message: ChatMessage{
+						Role:    "assistant",
+						Content: "Hello",
+					},
+					FinishReason: "stop",
+				},
+			},
+			Usage: ChatCompletionUsage{
+				PromptTokens:     10,
+				CompletionTokens: 5,
+				TotalTokens:      15,
+			},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer server.Close()
+
+	client := NewClient(Config{
+		APIKey:   "test-key",
+		Model:    "gpt-4o",
+		Endpoint: server.URL,
+		ExtraHeaders: map[string]string{
+			"x-litellm-tags":  "user:alice@example.com",
+			"x-custom-header": "custom-value",
+		},
+	})
+
+	ctx := &mockContext{Context: context.Background()}
+	messages := []types.Message{
+		{Role: "user", Content: "Hi"},
+	}
+
+	_, err := client.Chat(ctx, messages, nil)
+	require.NoError(t, err)
+
+	// Verify extra headers were sent
+	assert.Equal(t, "user:alice@example.com", receivedHeaders.Get("x-litellm-tags"))
+	assert.Equal(t, "custom-value", receivedHeaders.Get("x-custom-header"))
+	// Standard headers should still be present
+	assert.Equal(t, "application/json", receivedHeaders.Get("Content-Type"))
+	assert.Equal(t, "Bearer test-key", receivedHeaders.Get("Authorization"))
+}
+
+func TestClient_ExtraHeaders_NilMap(t *testing.T) {
+	// Verify that nil ExtraHeaders does not cause issues.
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		resp := ChatCompletionResponse{
+			ID:      "chatcmpl-123",
+			Object:  "chat.completion",
+			Created: 1234567890,
+			Model:   "gpt-4o",
+			Choices: []ChatCompletionChoice{
+				{
+					Index: 0,
+					Message: ChatMessage{
+						Role:    "assistant",
+						Content: "Hello",
+					},
+					FinishReason: "stop",
+				},
+			},
+			Usage: ChatCompletionUsage{
+				PromptTokens:     10,
+				CompletionTokens: 5,
+				TotalTokens:      15,
+			},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer server.Close()
+
+	client := NewClient(Config{
+		APIKey:   "test-key",
+		Model:    "gpt-4o",
+		Endpoint: server.URL,
+		// No ExtraHeaders set (nil map)
+	})
+
+	ctx := &mockContext{Context: context.Background()}
+	messages := []types.Message{
+		{Role: "user", Content: "Hi"},
+	}
+
+	resp, err := client.Chat(ctx, messages, nil)
+	require.NoError(t, err)
+	assert.NotNil(t, resp)
+	assert.Equal(t, "Hello", resp.Content)
+}
+
+func TestClient_ExtraHeaders_Stream(t *testing.T) {
+	// Verify that ExtraHeaders are forwarded on ChatStream requests.
+	var receivedHeaders http.Header
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedHeaders = r.Header.Clone()
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		chunks := []string{
+			`{"id":"1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"Hi"},"finish_reason":null}]}`,
+			`{"id":"2","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`,
+		}
+		for _, c := range chunks {
+			_, _ = fmt.Fprintf(w, "data: %s\n\n", c)
+		}
+		_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+	}))
+	defer server.Close()
+
+	client := NewClient(Config{
+		APIKey:   "test-key",
+		Model:    "gpt-4o",
+		Endpoint: server.URL,
+		ExtraHeaders: map[string]string{
+			"x-litellm-tags": "env=test",
+		},
+	})
+
+	ctx := &mockContext{Context: context.Background()}
+	messages := []types.Message{{Role: "user", Content: "Hi"}}
+
+	_, err := client.ChatStream(ctx, messages, nil, nil)
+	require.NoError(t, err)
+
+	assert.Equal(t, "env=test", receivedHeaders.Get("x-litellm-tags"))
+	assert.Equal(t, "Bearer test-key", receivedHeaders.Get("Authorization"))
+}
+
+func TestClient_ChatStream_BackfillsToolCallIdentity(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		chunks := []string{
+			`{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"location\":"}}]}}]}`,
+			`{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_123","function":{"name":"get_weather","arguments":"\"Boston\"}"}}]},"finish_reason":"tool_calls"}]}`,
+		}
+		for _, chunk := range chunks {
+			_, _ = fmt.Fprintf(w, "data: %s\n\n", chunk)
+		}
+		_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer server.Close()
+
+	client := NewClient(Config{APIKey: "test-key", Endpoint: server.URL})
+	response, err := client.ChatStream(
+		&mockContext{Context: context.Background()},
+		[]types.Message{{Role: "user", Content: "weather"}},
+		nil,
+		nil,
+	)
+
+	require.NoError(t, err)
+	require.Len(t, response.ToolCalls, 1)
+	assert.Equal(t, "call_123", response.ToolCalls[0].ID)
+	assert.Equal(t, "get_weather", response.ToolCalls[0].Name)
+	assert.Equal(t, "Boston", response.ToolCalls[0].Input["location"])
+	assert.Equal(t, "tool_use", response.StopReason)
+}
+
+func TestClient_ChatStream_DroppedToolCallEndsTurn(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n")
+		_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer server.Close()
+
+	client := NewClient(Config{APIKey: "test-key", Endpoint: server.URL})
+	response, err := client.ChatStream(
+		&mockContext{Context: context.Background()},
+		[]types.Message{{Role: "user", Content: "run it"}},
+		nil,
+		nil,
+	)
+
+	require.NoError(t, err)
+	assert.Empty(t, response.ToolCalls)
+	assert.Equal(t, "end_turn", response.StopReason)
 }

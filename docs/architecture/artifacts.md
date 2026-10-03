@@ -1,8 +1,8 @@
 # Artifact Management Architecture
 
-**Version**: v1.2.0
+**Version**: v1.3.0
 **Status**: ✅ Implemented (Session-based with CASCADE cleanup)
-**Last Updated**: 2026-03-28
+**Last Updated**: 2026-04-08
 
 ---
 
@@ -25,6 +25,7 @@
 - [Data Structures](#data-structures)
   - [Session-Artifact Relationship](#session-artifact-relationship)
   - [Directory Structure](#directory-structure)
+  - [Session artifact metadata](#session-artifact-metadata-metadatajson)
   - [Database Schema](#database-schema)
 - [Design Rationale](#design-rationale)
   - [Session-Based Organization](#session-based-organization)
@@ -52,6 +53,10 @@
 The Artifact Management subsystem provides **session-aware file storage** for the Loom agent framework. Every artifact is automatically organized by session, enabling automatic cleanup, isolation, and simplified path management.
 
 **Target Audience**: Architects, academics, advanced developers
+
+**What changed (recent)**:
+
+- Session directories may include `metadata.json` for attribution (agent, times, allowlisted context IDs); see [Session artifact metadata](#session-artifact-metadata-metadatajson).
 
 **What Changed in v1.0.2**:
 - ✅ Session-based directory structure (`sessions/<session-id>/agent/`, `sessions/<session-id>/scratchpad/`)
@@ -818,7 +823,9 @@ LIMIT 100;
 **Rationale**:
 - **Search**: Session-scoped by default for isolation
 - **List**: Only show artifacts in current session (avoid clutter)
-- **Read**: Session-scoped for security (no cross-session access)
+- **Read**: Session-scoped for the agent tool path (no cross-session access); on the
+  gRPC API an explicit `session_id` is accepted and authorized against the caller
+  (see [Session Isolation](#session-isolation))
 - **API-level**: Cross-session search available for server-side operations
 
 ---
@@ -882,6 +889,7 @@ $LOOM_DATA_DIR/
 │   │   └── <uuid>.tmp
 │   └── sessions/
 │       ├── sess_abc123/
+│       │   ├── metadata.json      # Session attribution (agent, times, optional context IDs)
 │       │   ├── agent/             # Agent/generated artifacts (indexed)
 │       │   │   ├── analysis.md
 │       │   │   ├── query.sql
@@ -910,6 +918,22 @@ $LOOM_DATA_DIR/
 | Agent/generated with session | `$LOOM_DATA_DIR/artifacts/sessions/<session>/agent/<filename>` |
 | Scratchpad | `$LOOM_DATA_DIR/artifacts/sessions/<session>/scratchpad/<filename>` |
 | No session context | `$LOOM_DATA_DIR/artifacts/temp/<filename>` |
+
+### Session artifact metadata (`metadata.json`)
+
+Each session directory may contain **`metadata.json`** at:
+
+`$LOOM_DATA_DIR/artifacts/sessions/<session_id>/metadata.json`
+
+It records **non-secret attribution** for dashboards and APIs: session id, agent identifiers, start/end times, lifecycle status (`active`, `completed`), optional **`context`** with allowlisted keys only (`user_id`, `project_id`, `conversation_id`), and optional artifact stats. The file is created/updated when the session is persisted; missing files remain valid for older sessions.
+
+**Feature flag (default off):** set `artifacts.session_metadata_enabled: true` in `looms.yaml` or `LOOM_ARTIFACTS_SESSION_METADATA_ENABLED=1` so the server writes `metadata.json` on session save, marks completion on delete, and merges this file into list/get session APIs when filters require it. When disabled, no per-session disk I/O runs for this feature and APIs omit disk-derived lifecycle fields unless another code path sets them.
+
+**Multi-replica / PostgreSQL caveat:** `metadata.json` lives on the server process filesystem (`$LOOM_DATA_DIR/artifacts/sessions/...`). Multiple `looms serve` replicas each have their own local tree unless you mount shared storage; session rows in PostgreSQL are shared, but artifact metadata files are not replicated by the database. For consistent cross-replica attribution, use shared storage for `$LOOM_DATA_DIR` or keep metadata in the database (future work; see project backlog).
+
+API responses merge this file into `Session` fields (for example `metadata_status`, `started_at`, `ended_at`, `artifact_count`) using the same **context allowlist** so tampered files cannot inject arbitrary keys into HTTP/gRPC payloads.
+
+See [GitHub issue #111](https://github.com/teradata-labs/loom/issues/111).
 
 ---
 
@@ -1252,9 +1276,9 @@ db.Exec("PRAGMA foreign_keys=ON")
 3. **Storage-level**: SQLite queries filtered by session_id
 4. **Filesystem-level**: Paths constructed from validated session ID only
 
-**Bypass Prevention**:
+**Bypass Prevention (agent tool path)**:
 ```go
-// Agent cannot override session ID via tool parameters
+// The agent cannot override session ID via tool parameters
 // Session ID comes from context, not user-controllable input
 
 func (t *WorkspaceTool) Execute(ctx context.Context, params map[string]interface{}) (*shuttle.Result, error) {
@@ -1262,6 +1286,55 @@ func (t *WorkspaceTool) Execute(ctx context.Context, params map[string]interface
     // params["session_id"] is ignored - session ID always from context
 }
 ```
+
+This holds for the in-process agent tool (`pkg/shuttle/builtin/workspace.go`), which
+is the path an agent drives. It is **not** a statement about the gRPC API — see below.
+
+**gRPC API path (`ListArtifacts`, `GetArtifact`)**: these accept an explicit
+`session_id` on the request, because a remote surface has no session in its call
+context and still has to answer "which files did this session produce?". A
+request-supplied session id is caller-declared rather than server-derived, so it is
+authorized before it selects anything: `MultiAgentServer.authorizeSessionScope`
+runs the same per-user isolation predicate (`sessionAccessibleBy`) that every other
+session-scoped RPC uses.
+
+| Deployment | Effect of an explicit `session_id` |
+|---|---|
+| Ownership enforcement on (authenticated) | Must resolve to a session the caller owns, or the call returns `NotFound`. A blank identity is never a wildcard. |
+| Single-tenant (default, unauthenticated) | Permitted, matching the mode's documented trust model — `looms serve` states all data is accessible to all callers and there is no per-user isolation. |
+
+Denial is reported as `NotFound`, not `PermissionDenied`, so a caller cannot
+distinguish "exists but not yours" from "no such session" by probing.
+
+**Soft-deleted sessions stay readable by their owner.** Postgres `DeleteSession`
+only sets `deleted_at`, and a session's artifacts outlive it — `purge_soft_deleted`
+reaps artifacts by their *own* `deleted_at`, and the `artifacts.session_id`
+CASCADE fires only on the later hard purge. Because `LoadSession` and
+`SessionExists` both filter `deleted_at IS NULL`, neither can tell an owner's
+just-deleted session from one that never existed. Ownership therefore falls back
+to `SessionStore.CallerOwnsSession`, an owner-scoped existence check that ignores
+`deleted_at`, so the owner keeps the session-filtered view of artifacts the store
+still returns unfiltered. It is exposed as an optional capability
+(`sessionOwnershipProbe`) rather than a `SessionStorage` method, because that
+interface is implemented outside this repo; a store without it keeps the
+fail-closed behaviour.
+
+Only the Postgres store needs this, and so only it implements the capability.
+SQLite hard-deletes sessions and its `artifacts.session_id` foreign key is
+`ON DELETE CASCADE`, so a deleted session's artifacts are already gone — there is
+nothing to be locked out of. The two backends therefore answer the same request
+differently in *shape*: with enforcement on, scoping to a deleted session yields
+an empty list on Postgres and `NotFound` on SQLite. Both mean "no artifacts";
+a client that distinguishes the two should treat `NotFound` as empty here.
+
+Two limits worth stating plainly, because "session scoping" reads broader than what
+is enforced:
+
+- **ID lookups are not session-scoped.** `GetArtifact` by `id`, `GetArtifactContent`,
+  and `DeleteArtifact` ignore session entirely — artifact IDs are global, and
+  scoping them would only manufacture spurious not-founds. Session scoping is a
+  filtering and name-resolution boundary, not an access-control boundary on IDs.
+- **The write path is not session-scoped.** `UploadArtifact` has no `session_id`.
 
 **Coordinator Exception**: Agents configured with `restrictReads=all_sessions` can read across sessions for research purposes, but write access remains session-scoped.
 
@@ -1611,7 +1684,7 @@ COUNT(*) FROM artifacts WHERE session_id = s = 0
 
 ---
 
-**Document Version:** v1.2.0
+**Document Version:** v1.3.0
 **Last Updated:** 2026-03-28
 **Diagrams Created By:** ascii-diagram-architect (agent a309de1)
 **Verified:** ✅ All design claims verified against implementation

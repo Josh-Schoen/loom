@@ -82,6 +82,7 @@ const (
 	LoomService_StreamWorkflow_FullMethodName              = "/loom.v1.LoomService/StreamWorkflow"
 	LoomService_GetWorkflowExecution_FullMethodName        = "/loom.v1.LoomService/GetWorkflowExecution"
 	LoomService_ListWorkflowExecutions_FullMethodName      = "/loom.v1.LoomService/ListWorkflowExecutions"
+	LoomService_ListWorkflows_FullMethodName               = "/loom.v1.LoomService/ListWorkflows"
 	LoomService_ScheduleWorkflow_FullMethodName            = "/loom.v1.LoomService/ScheduleWorkflow"
 	LoomService_UpdateScheduledWorkflow_FullMethodName     = "/loom.v1.LoomService/UpdateScheduledWorkflow"
 	LoomService_GetScheduledWorkflow_FullMethodName        = "/loom.v1.LoomService/GetScheduledWorkflow"
@@ -91,7 +92,7 @@ const (
 	LoomService_PauseSchedule_FullMethodName               = "/loom.v1.LoomService/PauseSchedule"
 	LoomService_ResumeSchedule_FullMethodName              = "/loom.v1.LoomService/ResumeSchedule"
 	LoomService_GetScheduleHistory_FullMethodName          = "/loom.v1.LoomService/GetScheduleHistory"
-	LoomService_CancelWorkflowExecution_FullMethodName     = "/loom.v1.LoomService/CancelWorkflowExecution"
+	LoomService_CancelScheduledExecution_FullMethodName    = "/loom.v1.LoomService/CancelScheduledExecution"
 	LoomService_Publish_FullMethodName                     = "/loom.v1.LoomService/Publish"
 	LoomService_Subscribe_FullMethodName                   = "/loom.v1.LoomService/Subscribe"
 	LoomService_Unsubscribe_FullMethodName                 = "/loom.v1.LoomService/Unsubscribe"
@@ -234,6 +235,10 @@ type LoomServiceClient interface {
 	GetWorkflowExecution(ctx context.Context, in *GetWorkflowExecutionRequest, opts ...grpc.CallOption) (*WorkflowExecution, error)
 	// ListWorkflowExecutions lists workflow executions.
 	ListWorkflowExecutions(ctx context.Context, in *ListWorkflowExecutionsRequest, opts ...grpc.CallOption) (*ListWorkflowExecutionsResponse, error)
+	// ListWorkflows lists saved workflow definitions that can be run by name via
+	// ExecuteWorkflow's workflow_ref. Lets a client discover existing workflows
+	// instead of re-supplying a full pattern/YAML.
+	ListWorkflows(ctx context.Context, in *ListWorkflowsRequest, opts ...grpc.CallOption) (*ListWorkflowsResponse, error)
 	// ScheduleWorkflow creates a new scheduled workflow.
 	ScheduleWorkflow(ctx context.Context, in *ScheduleWorkflowRequest, opts ...grpc.CallOption) (*ScheduleWorkflowResponse, error)
 	// UpdateScheduledWorkflow updates an existing scheduled workflow.
@@ -252,18 +257,38 @@ type LoomServiceClient interface {
 	ResumeSchedule(ctx context.Context, in *ResumeScheduleRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	// GetScheduleHistory retrieves execution history for a schedule.
 	GetScheduleHistory(ctx context.Context, in *GetScheduleHistoryRequest, opts ...grpc.CallOption) (*GetScheduleHistoryResponse, error)
-	// CancelWorkflowExecution stops an execution that is currently running.
-	//
+	// CancelScheduledExecution stops a scheduled execution that is in flight.  //
 	// Pausing a schedule prevents future runs but does nothing about one already
 	// in flight, and max_execution_seconds only detects a stuck run after the
 	// fact. This is the operator's stop button: without it a workflow that hangs
 	// holds its schedule's slot until the timeout expires, and skip_if_running
 	// silently skips every run in the meantime.
 	//
-	// Cancellation is cooperative — the execution's context is cancelled and the
-	// run is recorded as cancelled. Work already committed by earlier stages is
-	// not rolled back.
-	CancelWorkflowExecution(ctx context.Context, in *CancelWorkflowExecutionRequest, opts ...grpc.CallOption) (*CancelWorkflowExecutionResponse, error)
+	// Scope: this cancels executions minted by the scheduler — the IDs reported
+	// in ScheduledWorkflow.current_execution_id and in the response to
+	// TriggerScheduledWorkflow. Execution IDs from ExecuteWorkflow and
+	// StreamWorkflow live in a different namespace (the one GetWorkflowExecution
+	// and ListWorkflowExecutions read) and cannot be canceled here; passing one
+	// returns NOT_FOUND.
+	//
+	// NOT_FOUND means no scheduled execution with that ID exists, neither in
+	// flight nor in the schedule's history. A response with canceled = false and
+	// a message means the execution was found but had already reached its verdict
+	// before the request arrived; that is deliberately not an error, because a
+	// caller stopping a run that just finished got the state it asked for.
+	//
+	// Cancellation is cooperative — the execution's context is canceled and the
+	// run is recorded as canceled once it unwinds. Work already committed by
+	// earlier stages is not rolled back.
+	//
+	// Authorization: like the sibling schedule RPCs (PauseSchedule,
+	// ResumeSchedule, DeleteScheduledWorkflow, TriggerScheduledWorkflow), this
+	// performs no ownership check — the scheduled_workflows table has no owner
+	// column, so there is nothing to check against. Any caller that reaches the
+	// service can stop any scheduled execution. Adding ownership is a follow-up
+	// for the whole schedule surface rather than something this one RPC can
+	// solve; it is recorded here so the gap is not mistaken for an oversight.
+	CancelScheduledExecution(ctx context.Context, in *CancelScheduledExecutionRequest, opts ...grpc.CallOption) (*CancelScheduledExecutionResponse, error)
 	// Publish publishes a message to a topic (one-to-many broadcast).
 	Publish(ctx context.Context, in *PublishRequest, opts ...grpc.CallOption) (*PublishResponse, error)
 	// Subscribe subscribes to a topic and receives messages via stream.
@@ -860,6 +885,16 @@ func (c *loomServiceClient) ListWorkflowExecutions(ctx context.Context, in *List
 	return out, nil
 }
 
+func (c *loomServiceClient) ListWorkflows(ctx context.Context, in *ListWorkflowsRequest, opts ...grpc.CallOption) (*ListWorkflowsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ListWorkflowsResponse)
+	err := c.cc.Invoke(ctx, LoomService_ListWorkflows_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *loomServiceClient) ScheduleWorkflow(ctx context.Context, in *ScheduleWorkflowRequest, opts ...grpc.CallOption) (*ScheduleWorkflowResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ScheduleWorkflowResponse)
@@ -950,10 +985,10 @@ func (c *loomServiceClient) GetScheduleHistory(ctx context.Context, in *GetSched
 	return out, nil
 }
 
-func (c *loomServiceClient) CancelWorkflowExecution(ctx context.Context, in *CancelWorkflowExecutionRequest, opts ...grpc.CallOption) (*CancelWorkflowExecutionResponse, error) {
+func (c *loomServiceClient) CancelScheduledExecution(ctx context.Context, in *CancelScheduledExecutionRequest, opts ...grpc.CallOption) (*CancelScheduledExecutionResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(CancelWorkflowExecutionResponse)
-	err := c.cc.Invoke(ctx, LoomService_CancelWorkflowExecution_FullMethodName, in, out, cOpts...)
+	out := new(CancelScheduledExecutionResponse)
+	err := c.cc.Invoke(ctx, LoomService_CancelScheduledExecution_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -1379,6 +1414,10 @@ type LoomServiceServer interface {
 	GetWorkflowExecution(context.Context, *GetWorkflowExecutionRequest) (*WorkflowExecution, error)
 	// ListWorkflowExecutions lists workflow executions.
 	ListWorkflowExecutions(context.Context, *ListWorkflowExecutionsRequest) (*ListWorkflowExecutionsResponse, error)
+	// ListWorkflows lists saved workflow definitions that can be run by name via
+	// ExecuteWorkflow's workflow_ref. Lets a client discover existing workflows
+	// instead of re-supplying a full pattern/YAML.
+	ListWorkflows(context.Context, *ListWorkflowsRequest) (*ListWorkflowsResponse, error)
 	// ScheduleWorkflow creates a new scheduled workflow.
 	ScheduleWorkflow(context.Context, *ScheduleWorkflowRequest) (*ScheduleWorkflowResponse, error)
 	// UpdateScheduledWorkflow updates an existing scheduled workflow.
@@ -1397,18 +1436,38 @@ type LoomServiceServer interface {
 	ResumeSchedule(context.Context, *ResumeScheduleRequest) (*emptypb.Empty, error)
 	// GetScheduleHistory retrieves execution history for a schedule.
 	GetScheduleHistory(context.Context, *GetScheduleHistoryRequest) (*GetScheduleHistoryResponse, error)
-	// CancelWorkflowExecution stops an execution that is currently running.
-	//
+	// CancelScheduledExecution stops a scheduled execution that is in flight.  //
 	// Pausing a schedule prevents future runs but does nothing about one already
 	// in flight, and max_execution_seconds only detects a stuck run after the
 	// fact. This is the operator's stop button: without it a workflow that hangs
 	// holds its schedule's slot until the timeout expires, and skip_if_running
 	// silently skips every run in the meantime.
 	//
-	// Cancellation is cooperative — the execution's context is cancelled and the
-	// run is recorded as cancelled. Work already committed by earlier stages is
-	// not rolled back.
-	CancelWorkflowExecution(context.Context, *CancelWorkflowExecutionRequest) (*CancelWorkflowExecutionResponse, error)
+	// Scope: this cancels executions minted by the scheduler — the IDs reported
+	// in ScheduledWorkflow.current_execution_id and in the response to
+	// TriggerScheduledWorkflow. Execution IDs from ExecuteWorkflow and
+	// StreamWorkflow live in a different namespace (the one GetWorkflowExecution
+	// and ListWorkflowExecutions read) and cannot be canceled here; passing one
+	// returns NOT_FOUND.
+	//
+	// NOT_FOUND means no scheduled execution with that ID exists, neither in
+	// flight nor in the schedule's history. A response with canceled = false and
+	// a message means the execution was found but had already reached its verdict
+	// before the request arrived; that is deliberately not an error, because a
+	// caller stopping a run that just finished got the state it asked for.
+	//
+	// Cancellation is cooperative — the execution's context is canceled and the
+	// run is recorded as canceled once it unwinds. Work already committed by
+	// earlier stages is not rolled back.
+	//
+	// Authorization: like the sibling schedule RPCs (PauseSchedule,
+	// ResumeSchedule, DeleteScheduledWorkflow, TriggerScheduledWorkflow), this
+	// performs no ownership check — the scheduled_workflows table has no owner
+	// column, so there is nothing to check against. Any caller that reaches the
+	// service can stop any scheduled execution. Adding ownership is a follow-up
+	// for the whole schedule surface rather than something this one RPC can
+	// solve; it is recorded here so the gap is not mistaken for an oversight.
+	CancelScheduledExecution(context.Context, *CancelScheduledExecutionRequest) (*CancelScheduledExecutionResponse, error)
 	// Publish publishes a message to a topic (one-to-many broadcast).
 	Publish(context.Context, *PublishRequest) (*PublishResponse, error)
 	// Subscribe subscribes to a topic and receives messages via stream.
@@ -1624,6 +1683,9 @@ func (UnimplementedLoomServiceServer) GetWorkflowExecution(context.Context, *Get
 func (UnimplementedLoomServiceServer) ListWorkflowExecutions(context.Context, *ListWorkflowExecutionsRequest) (*ListWorkflowExecutionsResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ListWorkflowExecutions not implemented")
 }
+func (UnimplementedLoomServiceServer) ListWorkflows(context.Context, *ListWorkflowsRequest) (*ListWorkflowsResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ListWorkflows not implemented")
+}
 func (UnimplementedLoomServiceServer) ScheduleWorkflow(context.Context, *ScheduleWorkflowRequest) (*ScheduleWorkflowResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ScheduleWorkflow not implemented")
 }
@@ -1651,8 +1713,8 @@ func (UnimplementedLoomServiceServer) ResumeSchedule(context.Context, *ResumeSch
 func (UnimplementedLoomServiceServer) GetScheduleHistory(context.Context, *GetScheduleHistoryRequest) (*GetScheduleHistoryResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetScheduleHistory not implemented")
 }
-func (UnimplementedLoomServiceServer) CancelWorkflowExecution(context.Context, *CancelWorkflowExecutionRequest) (*CancelWorkflowExecutionResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "method CancelWorkflowExecution not implemented")
+func (UnimplementedLoomServiceServer) CancelScheduledExecution(context.Context, *CancelScheduledExecutionRequest) (*CancelScheduledExecutionResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method CancelScheduledExecution not implemented")
 }
 func (UnimplementedLoomServiceServer) Publish(context.Context, *PublishRequest) (*PublishResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Publish not implemented")
@@ -2591,6 +2653,24 @@ func _LoomService_ListWorkflowExecutions_Handler(srv interface{}, ctx context.Co
 	return interceptor(ctx, in, info, handler)
 }
 
+func _LoomService_ListWorkflows_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListWorkflowsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LoomServiceServer).ListWorkflows(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LoomService_ListWorkflows_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LoomServiceServer).ListWorkflows(ctx, req.(*ListWorkflowsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _LoomService_ScheduleWorkflow_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(ScheduleWorkflowRequest)
 	if err := dec(in); err != nil {
@@ -2753,20 +2833,20 @@ func _LoomService_GetScheduleHistory_Handler(srv interface{}, ctx context.Contex
 	return interceptor(ctx, in, info, handler)
 }
 
-func _LoomService_CancelWorkflowExecution_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(CancelWorkflowExecutionRequest)
+func _LoomService_CancelScheduledExecution_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CancelScheduledExecutionRequest)
 	if err := dec(in); err != nil {
 		return nil, err
 	}
 	if interceptor == nil {
-		return srv.(LoomServiceServer).CancelWorkflowExecution(ctx, in)
+		return srv.(LoomServiceServer).CancelScheduledExecution(ctx, in)
 	}
 	info := &grpc.UnaryServerInfo{
 		Server:     srv,
-		FullMethod: LoomService_CancelWorkflowExecution_FullMethodName,
+		FullMethod: LoomService_CancelScheduledExecution_FullMethodName,
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(LoomServiceServer).CancelWorkflowExecution(ctx, req.(*CancelWorkflowExecutionRequest))
+		return srv.(LoomServiceServer).CancelScheduledExecution(ctx, req.(*CancelScheduledExecutionRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -3459,6 +3539,10 @@ var LoomService_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _LoomService_ListWorkflowExecutions_Handler,
 		},
 		{
+			MethodName: "ListWorkflows",
+			Handler:    _LoomService_ListWorkflows_Handler,
+		},
+		{
 			MethodName: "ScheduleWorkflow",
 			Handler:    _LoomService_ScheduleWorkflow_Handler,
 		},
@@ -3495,8 +3579,8 @@ var LoomService_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _LoomService_GetScheduleHistory_Handler,
 		},
 		{
-			MethodName: "CancelWorkflowExecution",
-			Handler:    _LoomService_CancelWorkflowExecution_Handler,
+			MethodName: "CancelScheduledExecution",
+			Handler:    _LoomService_CancelScheduledExecution_Handler,
 		},
 		{
 			MethodName: "Publish",

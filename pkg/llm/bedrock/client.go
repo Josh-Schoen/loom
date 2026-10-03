@@ -19,7 +19,6 @@ import (
 	"fmt"
 	"os"
 	"strings"
-	"sync"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
@@ -28,6 +27,7 @@ import (
 	bedrocktypes "github.com/aws/aws-sdk-go-v2/service/bedrockruntime/types"
 	"github.com/aws/smithy-go/auth/bearer"
 	"github.com/teradata-labs/loom/pkg/llm"
+	"github.com/teradata-labs/loom/pkg/llm/catalog"
 	llmtypes "github.com/teradata-labs/loom/pkg/llm/types"
 	"github.com/teradata-labs/loom/pkg/shuttle"
 )
@@ -35,11 +35,6 @@ import (
 // Global rate limiter shared across all Bedrock clients.
 // This ensures all agents using Bedrock coordinate through a single rate limiter,
 // preventing AWS Bedrock throttling when multiple agents make concurrent requests.
-var (
-	globalRateLimiter     *llm.RateLimiter
-	globalRateLimiterOnce sync.Once
-)
-
 // Client implements the LLMProvider interface for AWS Bedrock.
 type Client struct {
 	client      *bedrockruntime.Client
@@ -53,20 +48,6 @@ type Client struct {
 	toolNameMap map[string]string
 	// rateLimiter handles request rate limiting to prevent AWS throttling
 	rateLimiter *llm.RateLimiter
-}
-
-// getOrCreateGlobalRateLimiter returns the singleton rate limiter for all Bedrock clients.
-// The first call initializes the rate limiter with the provided config.
-// Subsequent calls return the existing rate limiter (ignoring the config parameter).
-func getOrCreateGlobalRateLimiter(config llm.RateLimiterConfig) *llm.RateLimiter {
-	globalRateLimiterOnce.Do(func() {
-		// Apply defaults if not provided
-		if config.Logger == nil {
-			config = llm.DefaultRateLimiterConfig()
-		}
-		globalRateLimiter = llm.NewRateLimiter(config)
-	})
-	return globalRateLimiter
 }
 
 // Config holds configuration for the Bedrock client.
@@ -179,7 +160,7 @@ func NewClient(cfg Config) (*Client, error) {
 		awsCfg.AuthSchemePreference = []string{"httpBearerAuth"}
 	}
 
-	// Initialize rate limiter - use global singleton shared across all Bedrock clients.
+	// Initialize rate limiter - shared per (region, model) quota boundary.
 	// This prevents AWS throttling when multiple agents make concurrent requests.
 	var rateLimiter *llm.RateLimiter
 	if cfg.RateLimiterConfig.Enabled {
@@ -210,9 +191,7 @@ func NewClient(cfg Config) (*Client, error) {
 			rlCfg.QueueTimeout = cfg.RateLimiterConfig.QueueTimeout
 		}
 
-		// Get or create the global singleton rate limiter
-		// Note: Only the first client's config is used to initialize the rate limiter
-		rateLimiter = getOrCreateGlobalRateLimiter(rlCfg)
+		rateLimiter = llm.SharedRateLimiter("bedrock|"+cfg.Region+"|"+cfg.ModelID, rlCfg)
 	}
 
 	return &Client{
@@ -455,7 +434,9 @@ func (c *Client) chatStreamDisabled(ctx context.Context, messages []llmtypes.Mes
 
 			// Handle tool input delta (accumulate JSON for tool parameters)
 			if chunk.Type == "content_block_delta" && chunk.Delta.Type == "input_json_delta" {
-				// Accumulate the JSON delta
+				// Tool-input deltas never reach tokenCallback (text only);
+				// report them as stream activity, then accumulate the JSON.
+				llmtypes.NotifyStreamActivity(ctx)
 				if buf, exists := toolInputBuffers[chunk.Index]; exists {
 					buf.WriteString(chunk.Delta.Text)
 				}
@@ -501,7 +482,8 @@ func (c *Client) chatStreamDisabled(ctx context.Context, messages []llmtypes.Mes
 		usage.OutputTokens = tokenCount
 	}
 	usage.TotalTokens = usage.InputTokens + usage.OutputTokens
-	usage.CostUSD = c.calculateCost(usage.InputTokens, usage.OutputTokens)
+	usage.CostUSD = c.calculateCost(usage.InputTokens, usage.OutputTokens,
+		usage.CacheReadInputTokens, usage.CacheCreationInputTokens)
 
 	// Record token usage for rate limiter metrics
 	if c.rateLimiter != nil {
@@ -764,7 +746,8 @@ func (c *Client) convertResponse(resp *bedrockResponse) *llmtypes.LLMResponse {
 			InputTokens:  resp.Usage.InputTokens,
 			OutputTokens: resp.Usage.OutputTokens,
 			TotalTokens:  resp.Usage.InputTokens + resp.Usage.OutputTokens,
-			CostUSD:      c.calculateCost(resp.Usage.InputTokens, resp.Usage.OutputTokens),
+			CostUSD: c.calculateCost(resp.Usage.InputTokens, resp.Usage.OutputTokens,
+				resp.Usage.CacheReadInputTokens, resp.Usage.CacheCreationInputTokens),
 		},
 		Metadata: map[string]interface{}{
 			"model":       c.modelID,
@@ -807,39 +790,48 @@ func (c *Client) convertResponse(resp *bedrockResponse) *llmtypes.LLMResponse {
 
 // calculateCost estimates cost for Bedrock Claude models.
 // Pricing varies by model and region - these are approximate.
-func (c *Client) calculateCost(inputTokens, outputTokens int) float64 {
-	// Pricing based on model ID
-	var inputPricePerMillion, outputPricePerMillion float64
-
-	// Check model ID to determine pricing.
-	// IMPORTANT: check "opus-4-1" BEFORE "opus-4" because strings.Contains("opus-4-5", "opus-4") is true.
-	// Opus 4.1 is the expensive model ($15/$75); Opus 4.5/4.6 are cheaper ($5/$25).
-	switch {
-	case strings.Contains(c.modelID, "claude-opus-4-1"):
-		// Claude Opus 4.1: $15 per 1M input, $75 per 1M output
-		inputPricePerMillion = 15.0
-		outputPricePerMillion = 75.0
-	case strings.Contains(c.modelID, "claude-opus-4"):
-		// Claude Opus 4.5/4.6: $5 per 1M input, $25 per 1M output
-		inputPricePerMillion = 5.0
-		outputPricePerMillion = 25.0
-	case strings.Contains(c.modelID, "claude-haiku-4"):
-		// Claude Haiku 4: $1 per 1M input, $5 per 1M output
-		inputPricePerMillion = 1.0
-		outputPricePerMillion = 5.0
-	case strings.Contains(c.modelID, "claude-sonnet-4"):
-		// Claude Sonnet 4: $3 per 1M input, $15 per 1M output
-		inputPricePerMillion = 3.0
-		outputPricePerMillion = 15.0
-	default:
-		// Default to Sonnet pricing for unknown models
-		inputPricePerMillion = 3.0
-		outputPricePerMillion = 15.0
+//
+// Cache tiers: a cache write bills at 1.25x the input rate and a cache read at
+// 0.10x. Bedrock/Anthropic report input_tokens EXCLUSIVE of cached tokens, so
+// the three buckets are additive (unlike the OpenAI-compatible shape, where
+// prompt_tokens includes them). Mirrors SDKClient.calculateCost.
+func (c *Client) calculateCost(inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens int) float64 {
+	// The catalog (pkg/llm/catalog) is the source of truth for pricing. Fall back
+	// to substring matching only for model ids it does not list.
+	// IMPORTANT: in the fallback, check "opus-4-1" BEFORE "opus-4" because
+	// strings.Contains("opus-4-5", "opus-4") is true. Opus 4.1 is the expensive
+	// model ($15/$75); Opus 4.5/4.6 are cheaper ($5/$25).
+	inputPricePerMillion, outputPricePerMillion, ok := catalog.LookupPricing("bedrock", c.modelID)
+	if !ok {
+		switch {
+		case strings.Contains(c.modelID, "claude-opus-4-1"):
+			// Claude Opus 4.1: $15 per 1M input, $75 per 1M output
+			inputPricePerMillion = 15.0
+			outputPricePerMillion = 75.0
+		case strings.Contains(c.modelID, "claude-opus-4"):
+			// Claude Opus 4.5/4.6: $5 per 1M input, $25 per 1M output
+			inputPricePerMillion = 5.0
+			outputPricePerMillion = 25.0
+		case strings.Contains(c.modelID, "claude-haiku-4"):
+			// Claude Haiku 4: $1 per 1M input, $5 per 1M output
+			inputPricePerMillion = 1.0
+			outputPricePerMillion = 5.0
+		case strings.Contains(c.modelID, "claude-sonnet-4"):
+			// Claude Sonnet 4: $3 per 1M input, $15 per 1M output
+			inputPricePerMillion = 3.0
+			outputPricePerMillion = 15.0
+		default:
+			// Default to Sonnet pricing for unknown models
+			inputPricePerMillion = 3.0
+			outputPricePerMillion = 15.0
+		}
 	}
 
 	inputCost := float64(inputTokens) * inputPricePerMillion / 1_000_000
 	outputCost := float64(outputTokens) * outputPricePerMillion / 1_000_000
-	return inputCost + outputCost
+	cacheWriteCost := float64(cacheCreationTokens) * inputPricePerMillion * 1.25 / 1_000_000
+	cacheReadCost := float64(cacheReadTokens) * inputPricePerMillion * 0.10 / 1_000_000
+	return inputCost + outputCost + cacheWriteCost + cacheReadCost
 }
 
 // bedrockResponse represents Bedrock's response format (Anthropic-compatible).
@@ -856,6 +848,10 @@ type bedrockResponse struct {
 type bedrockUsage struct {
 	InputTokens  int `json:"input_tokens"`
 	OutputTokens int `json:"output_tokens"`
+	// Cache tiers are billed differently (write 1.25x, read 0.10x), so they
+	// must be parsed to cost the call correctly.
+	CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
+	CacheReadInputTokens     int `json:"cache_read_input_tokens"`
 }
 
 // bedrockStreamChunk represents a chunk from Bedrock's streaming response.

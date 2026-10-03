@@ -262,17 +262,17 @@ func TestAdaptMCPTools_Integration(t *testing.T) {
 		assert.NotNil(t, tool.InputSchema())
 	}
 
-	// Try to find and use a specific tool
-	var readFileTool *protocol.Tool
+	// The adapted set must include the filesystem read_file tool, exposed via
+	// the shuttle.Tool interface under the prefixed name.
+	foundReadFile := false
 	for _, tool := range shuttleTools {
 		if tool.Name() == "filesystem:read_file" {
 			t.Log("Found filesystem:read_file tool")
+			foundReadFile = true
 			break
 		}
 	}
-
-	// All adapted tools should be usable via shuttle.Tool interface
-	assert.NotNil(t, readFileTool)
+	assert.True(t, foundReadFile, "adapted tools should include filesystem:read_file")
 }
 
 func TestMCPClient_Ping_Integration(t *testing.T) {
@@ -286,6 +286,7 @@ func TestMCPClient_Ping_Integration(t *testing.T) {
 	defer func() { _ = mcpClient.Close() }()
 
 	// Ping the server
+	//nolint:staticcheck // frozen legacy surface keeps test coverage through the 2026-07-28 deprecation window
 	err := mcpClient.Ping(ctx)
 	assert.NoError(t, err)
 }

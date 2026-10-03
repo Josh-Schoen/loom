@@ -18,6 +18,7 @@ package loom.v1;
 import "google/api/annotations.proto";
 import "google/protobuf/empty.proto";
 import "google/protobuf/struct.proto";
+import "google/protobuf/timestamp.proto";
 import "loom/v1/agent_config.proto";
 import "loom/v1/apps.proto";
 import "loom/v1/bus.proto";
@@ -360,6 +361,13 @@ service LoomService {
     option (google.api.http) = {get: "/v1/workflows/executions"};
   }
 
+  // ListWorkflows lists saved workflow definitions that can be run by name via
+  // ExecuteWorkflow's workflow_ref. Lets a client discover existing workflows
+  // instead of re-supplying a full pattern/YAML.
+  rpc ListWorkflows(ListWorkflowsRequest) returns (ListWorkflowsResponse) {
+    option (google.api.http) = {get: "/v1/workflows"};
+  }
+
   // Workflow Scheduling RPCs
 
   // ScheduleWorkflow creates a new scheduled workflow.
@@ -422,20 +430,40 @@ service LoomService {
     option (google.api.http) = {get: "/v1/workflows/schedules/{schedule_id}/history"};
   }
 
-  // CancelWorkflowExecution stops an execution that is currently running.
-  //
+  // CancelScheduledExecution stops a scheduled execution that is in flight.  //
   // Pausing a schedule prevents future runs but does nothing about one already
   // in flight, and max_execution_seconds only detects a stuck run after the
   // fact. This is the operator's stop button: without it a workflow that hangs
   // holds its schedule's slot until the timeout expires, and skip_if_running
   // silently skips every run in the meantime.
   //
-  // Cancellation is cooperative — the execution's context is cancelled and the
-  // run is recorded as cancelled. Work already committed by earlier stages is
-  // not rolled back.
-  rpc CancelWorkflowExecution(CancelWorkflowExecutionRequest) returns (CancelWorkflowExecutionResponse) {
+  // Scope: this cancels executions minted by the scheduler — the IDs reported
+  // in ScheduledWorkflow.current_execution_id and in the response to
+  // TriggerScheduledWorkflow. Execution IDs from ExecuteWorkflow and
+  // StreamWorkflow live in a different namespace (the one GetWorkflowExecution
+  // and ListWorkflowExecutions read) and cannot be canceled here; passing one
+  // returns NOT_FOUND.
+  //
+  // NOT_FOUND means no scheduled execution with that ID exists, neither in
+  // flight nor in the schedule's history. A response with canceled = false and
+  // a message means the execution was found but had already reached its verdict
+  // before the request arrived; that is deliberately not an error, because a
+  // caller stopping a run that just finished got the state it asked for.
+  //
+  // Cancellation is cooperative — the execution's context is canceled and the
+  // run is recorded as canceled once it unwinds. Work already committed by
+  // earlier stages is not rolled back.
+  //
+  // Authorization: like the sibling schedule RPCs (PauseSchedule,
+  // ResumeSchedule, DeleteScheduledWorkflow, TriggerScheduledWorkflow), this
+  // performs no ownership check — the scheduled_workflows table has no owner
+  // column, so there is nothing to check against. Any caller that reaches the
+  // service can stop any scheduled execution. Adding ownership is a follow-up
+  // for the whole schedule surface rather than something this one RPC can
+  // solve; it is recorded here so the gap is not mistaken for an oversight.
+  rpc CancelScheduledExecution(CancelScheduledExecutionRequest) returns (CancelScheduledExecutionResponse) {
     option (google.api.http) = {
-      post: "/v1/workflows/executions/{execution_id}:cancel"
+      post: "/v1/workflows/schedules/executions/{execution_id}:cancel"
       body: "*"
     };
   }
@@ -691,6 +719,39 @@ message WeaveRequest {
   // When true, the agent's SegmentedMemory is reset (L1/L2/swap cleared)
   // before the query is processed, giving a fresh context window.
   bool reset_context = 10;
+
+  // Historical arrival time for replayed or imported conversations (optional).
+  // When set, every message persisted during this call — the user turn, the
+  // assistant reply, and tool rows — carries this timestamp instead of the
+  // server wall clock, so temporal grounding (compiled-view arrival stamps,
+  // graph-memory extraction anchoring) reflects when the conversation
+  // actually happened rather than when it was ingested.
+  //
+  // Servers reject this field unless server.allow_time_override is enabled
+  // (FAILED_PRECONDITION), and reject values in the future beyond a small
+  // clock-skew allowance (INVALID_ARGUMENT). Live conversations should leave
+  // it unset.
+  google.protobuf.Timestamp occurred_at = 11;
+
+  // Generation-free replay: when set, the agent does NOT call the LLM to
+  // generate a response. Instead it records this text verbatim as the
+  // assistant's turn and runs the full turn pipeline exactly as a live turn
+  // would — context compilation, memory compression (relief/fold),
+  // graph-memory extraction, and salience updates. Only generation is skipped.
+  //
+  // This replays a pre-written conversation turn-by-turn while preserving the
+  // ground-truth assistant content (never inventing the assistant's side), so
+  // the memory system is exercised under realistic accumulation. It is used by
+  // the LongMemEval conversation-replay harness and is typically paired with
+  // occurred_at to anchor each turn at its historical time.
+  //
+  // Gated by its own server.allow_assistant_override switch
+  // (FAILED_PRECONDITION when disabled) — separate from occurred_at's
+  // server.allow_time_override, so operators who enabled timestamp anchoring
+  // have not implicitly accepted caller-supplied assistant content.
+  // Whitespace-only values are rejected (INVALID_ARGUMENT). Live
+  // conversations leave it unset.
+  string replay_assistant_message = 12;
 }
 
 // WeaveResponse contains the execution result.
@@ -743,7 +804,26 @@ message WeaveProgress {
   // Partial result (available at certain stages)
   ExecutionResult partial_result = 6;
 
-  // HITL request info (only when stage == EXECUTION_STAGE_HUMAN_IN_THE_LOOP)
+  // HITL request info (only when stage == EXECUTION_STAGE_HUMAN_IN_THE_LOOP).
+  //
+  // A non-empty hitl_request.request_id is what makes a message an ANSWERABLE
+  // card. Consumers MUST key the human-facing prompt off that id, because it is
+  // the handle AnswerClarificationQuestion / RespondToRequest take; a prompt
+  // raised without one cannot deliver its answer, and the hold behind it stays
+  // pending until it times out. Two other shapes ride the same stage and MUST
+  // NOT raise a prompt:
+  //
+  //   - hitl_request ABSENT — a hold heartbeat. A hold is otherwise byte-silent
+  //     on this stream for its whole window (up to 300s for an approval hold),
+  //     long enough for an intermediary to trip an inactivity timeout and tear
+  //     down the stream the decision has to travel back on. These messages
+  //     exist only to produce traffic and carry no state; they may also be
+  //     dropped under backpressure, so consumers must not count on receiving
+  //     every one.
+  //   - hitl_request PRESENT with an empty request_id — the pre-creation ping
+  //     the conversation loop emits off a contact_human call before the store
+  //     row exists. Useful as an early "a hold is coming" hint; the answerable
+  //     card follows once the row is written.
   HITLRequestInfo hitl_request = 7;
 
   // Token streaming fields
@@ -1308,6 +1388,24 @@ message Session {
 
   // Metadata
   map<string, string> metadata = 9;
+
+  // Agent ID for this session (logical agent identifier, often the configured agent name).
+  string agent_id = 10;
+
+  // Human-readable agent name when available (from session context or artifact metadata).
+  string agent_name = 11;
+
+  // Session start time in RFC3339 UTC (mirrors created_at for API consumers).
+  string started_at = 12;
+
+  // Session end time in RFC3339 UTC when recorded in artifact metadata (e.g. after completion).
+  string ended_at = 13;
+
+  // Lifecycle status from artifacts/sessions/<id>/metadata.json (e.g. active, completed).
+  string metadata_status = 14;
+
+  // Count of indexed artifacts when present in session artifact metadata.
+  int32 artifact_count = 15;
 }
 
 // GetSessionRequest retrieves a session.
@@ -1324,19 +1422,29 @@ message ListSessionsRequest {
   // Filter by backend
   string backend = 2;
 
-  // Pagination offset
+  // Pagination offset (sessions skipped; must be >= 0).
   int32 offset = 3;
 
-  // Pagination limit
+  // Pagination page size. Omitted or <= 0 defaults to 50; values above 500 are capped at 500.
   int32 limit = 4;
+
+  // Filter by agent ID (matches Session.agent_id; often the configured agent name).
+  string agent_id = 5;
+
+  // Filter by project_id stored in session metadata (context / artifact metadata).
+  string project_id = 6;
+
+  // Filter by metadata_status from session artifact metadata (e.g. active, completed).
+  string metadata_status = 7;
 }
 
 // ListSessionsResponse returns sessions.
 message ListSessionsResponse {
-  // Sessions
+  // Sessions for the current page (after filters, offset, and limit).
   repeated Session sessions = 1;
 
-  // Total count
+  // Total number of sessions matching the request filters (before applying offset/limit).
+  // int32 is sufficient for in-memory listings; values above 2^31-1 are not expected.
   int32 total_count = 2;
 }
 
@@ -2059,10 +2167,15 @@ message GetScheduleHistoryResponse {
   repeated ScheduleExecution executions = 1;
 }
 
-// CancelWorkflowExecutionRequest stops a running execution.
-message CancelWorkflowExecutionRequest {
+// CancelScheduledExecutionRequest stops a scheduled execution that is in
+// flight.
+//
+// The ID must be one the scheduler minted. IDs returned by ExecuteWorkflow and
+// StreamWorkflow belong to a different namespace and yield NOT_FOUND.
+message CancelScheduledExecutionRequest {
   // Execution ID to cancel, as reported by ScheduledWorkflow.current_execution_id
-  // or by the response to TriggerScheduledWorkflow.
+  // or by the response to TriggerScheduledWorkflow. An ID that names no
+  // scheduled execution — in flight or in history — returns NOT_FOUND.
   string execution_id = 1;
 
   // Optional human-readable reason, recorded in the execution history so the
@@ -2070,14 +2183,23 @@ message CancelWorkflowExecutionRequest {
   string reason = 2;
 }
 
-// CancelWorkflowExecutionResponse reports what the cancellation did.
-message CancelWorkflowExecutionResponse {
-  // True when a running execution was found and signalled. False means the
-  // execution was already finished or was never running — not an error, since
-  // a user cancelling a run that just completed has got what they wanted.
-  bool cancelled = 1;
+// CancelScheduledExecutionResponse reports what the cancellation did.
+//
+// Reaching this message at all means the execution exists in the scheduler's
+// namespace; an unknown ID is a NOT_FOUND error instead.
+message CancelScheduledExecutionResponse {
+  // True when the execution was in flight and its context was canceled; the
+  // run is recorded as canceled once it unwinds. False means the execution had
+  // already reached its verdict before the request arrived, so nothing was
+  // signaled and the recorded outcome stands — not an error, since a caller
+  // stopping a run that just completed got the state it asked for.
+  //
+  // Cancellation is cooperative: true says the signal was delivered, not that
+  // the run has stopped yet, and work already committed is not rolled back.
+  bool canceled = 1;
 
-  // Human-readable outcome, suitable for showing directly.
+  // Human-readable outcome, suitable for showing directly. It is the only thing
+  // that distinguishes "signaled" from "already finished" beyond the boolean.
   string message = 2;
 }
 
@@ -2092,7 +2214,9 @@ message ScheduleExecution {
   // Completed at timestamp (Unix seconds)
   int64 completed_at = 3;
 
-  // Status: "success", "failed", "skipped"
+  // Status: "success", "failed", "skipped", "canceled"
+  // The US spelling matches WorkflowStatus "canceled" in the workflow-execution
+  // namespace, so both surfaces report the same word for the same outcome.
   string status = 4;
 
   // Error message (if failed)

@@ -30,9 +30,28 @@ type SessionStorage interface {
 	DeleteSession(ctx context.Context, sessionID string) error
 	LoadAgentSessions(ctx context.Context, agentID string) ([]string, error)
 
+	// SessionExists reports whether any session row has this id, regardless
+	// of owner. It is an authorization primitive, not a data read: resume
+	// gates use it to distinguish exists-but-foreign (must deny) from absent
+	// (safe to create) — an owner-scoped read cannot tell those apart, and
+	// treating foreign as absent would let a caller squat another user's
+	// session id with a fresh session under their own identity.
+	SessionExists(ctx context.Context, sessionID string) (bool, error)
+
 	// Messages
-	SaveMessage(ctx context.Context, sessionID string, msg Message) error
+	//
+	// SaveMessage derives the row's turn at insert (HLD §4.5): the turnStart
+	// site — the Chat()-entry user message, the only turn-incrementing event —
+	// computes turn = COALESCE(MAX(turn),0)+1 for the session; every other site
+	// uses the same subquery without the +1. The store stamps the derived seq
+	// and turn back onto msg.
+	SaveMessage(ctx context.Context, sessionID string, msg *Message, turnStart bool) error
 	LoadMessages(ctx context.Context, sessionID string) ([]Message, error)
+
+	// ListMessagesBySeqRange is the by-seq span read backing recall (HLD §6):
+	// rows lo..hi inclusive, session-filtered, seq ascending, folded included
+	// (a summary-cited span is exactly what recall retrieves).
+	ListMessagesBySeqRange(ctx context.Context, sessionID string, lo, hi int64) ([]Message, error)
 	LoadMessagesForAgent(ctx context.Context, agentID string) ([]Message, error)
 	LoadMessagesFromParentSession(ctx context.Context, sessionID string) ([]Message, error)
 
@@ -42,6 +61,16 @@ type SessionStorage interface {
 
 	// Tool executions
 	SaveToolExecution(ctx context.Context, sessionID string, exec ToolExecution) error
+
+	// Relief transactions (HLD §5.2 — write-once flags, one transaction per
+	// operation, set only inside releasePressure):
+	//
+	// MarkEvicted sets evicted=true on the given rows in one transaction.
+	MarkEvicted(ctx context.Context, sessionID string, seqs []int64) error
+	// FoldMessages writes summary version n (snapshot_type='fold', content =
+	// JSON {"n","text"}) and sets the region's folded flags in ONE transaction
+	// (HLD §5.4.6) — a fold never stands in memory without its row.
+	FoldMessages(ctx context.Context, sessionID string, seqs []int64, n int, text string) error
 
 	// Memory snapshots
 	SaveMemorySnapshot(ctx context.Context, sessionID, snapshotType, content string, tokenCount int) error

@@ -3,7 +3,7 @@
 
 Technical reference for connecting Loom to Ollama for local LLM inference.
 
-**Version**: v1.2.0
+**Version**: v1.3.0
 
 
 ## Table of Contents
@@ -853,7 +853,7 @@ ollama show llama3.1
 
 ### Rate Limiting (Go API Only)
 
-The Ollama client supports client-side rate limiting via the `RateLimiterConfig` field in `ollama.Config`. This is a global singleton shared across all Ollama client instances.
+The Ollama client supports client-side rate limiting via the `RateLimiterConfig` field in `ollama.Config`. Clients on the same endpoint with the same rate-limit values share one limiter.
 
 ```go
 client := ollama.NewClient(ollama.Config{

@@ -14,50 +14,84 @@
 package openai
 
 import (
+	"go.uber.org/zap"
+
 	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
-	"sync"
+	"syscall"
 	"time"
 
 	"github.com/teradata-labs/loom/pkg/llm"
+	"github.com/teradata-labs/loom/pkg/llm/catalog"
 	llmtypes "github.com/teradata-labs/loom/pkg/llm/types"
 	"github.com/teradata-labs/loom/pkg/shuttle"
 )
 
-// Global singleton rate limiter shared across all OpenAI clients
-var (
-	globalRateLimiter     *llm.RateLimiter
-	globalRateLimiterOnce sync.Once
-)
-
 // Client implements the LLMProvider interface for OpenAI's API.
 type Client struct {
-	apiKey      string
-	model       string
-	endpoint    string
-	httpClient  *http.Client
-	maxTokens   int
-	temperature float64
-	rateLimiter *llm.RateLimiter
-	toolNameMap map[string]string // sanitized name → original name
+	apiKey                 string
+	model                  string
+	endpoint               string
+	httpClient             *http.Client
+	streamHTTPClient       *http.Client
+	streamFirstByteTimeout time.Duration
+	streamIdleTimeout      time.Duration
+	maxTokens              int
+	temperature            float64
+	rateLimiter            *llm.RateLimiter
+	toolNameMap            map[string]string // sanitized name → original name
+	extraHeaders           map[string]string // additional headers sent with every request
+	// catalogProvider is the catalog namespace calculateCost prices under.
+	// "openai" unless Config.CatalogProvider overrides it.
+	catalogProvider string
 }
+
+// DefaultCatalogProvider is the catalog namespace the client prices under
+// when Config.CatalogProvider is empty.
+const DefaultCatalogProvider = "openai"
 
 // Config holds configuration for the OpenAI client.
 type Config struct {
-	APIKey            string
-	Model             string        // Default: gpt-4o
-	Endpoint          string        // Default: https://api.openai.com/v1/chat/completions
-	Timeout           time.Duration // Default: 60s
-	MaxTokens         int           // Default: 4096
-	Temperature       float64       // Default: 1.0
-	RateLimiterConfig llm.RateLimiterConfig
+	APIKey   string
+	Model    string        // Default: gpt-4o
+	Endpoint string        // Default: https://api.openai.com/v1/chat/completions
+	Timeout  time.Duration // Default: 60s
+	// StreamFirstByteTimeout limits the wait for the first response-body bytes in
+	// ChatStream. StreamIdleTimeout limits silence during subsequent network
+	// reads. Non-positive values use DefaultOpenAIStreamFirstByteTimeout and
+	// DefaultOpenAIStreamIdleTimeout.
+	StreamFirstByteTimeout time.Duration
+	StreamIdleTimeout      time.Duration
+	MaxTokens              int     // Default: 4096
+	Temperature            float64 // Default: 1.0
+	RateLimiterConfig      llm.RateLimiterConfig
+	// ExtraHeaders are additional HTTP headers sent with every request.
+	// Useful for proxy-specific metadata (e.g. LiteLLM user tracking tags).
+	//
+	// Headers are applied after Content-Type and Authorization, so a key
+	// present in ExtraHeaders will override those standard headers if the
+	// same name is used. Use with care when targeting proxies that require
+	// a different auth scheme.
+	ExtraHeaders map[string]string
+	// CatalogProvider is the catalog namespace (the provider key passed to
+	// catalog.LookupPricing) used to price responses. Default "openai".
+	//
+	// Set it when this client fronts an OpenAI-compatible gateway (LiteLLM,
+	// vLLM, …) whose model ids are not OpenAI's: the embedder registers those
+	// ids under its own provider key via catalog.Register, and this is how the
+	// client is told to look there. Without it a gateway alias never matches
+	// the "openai" namespace and is priced at the gpt-4o default below.
+	CatalogProvider string
 }
 
 // Default OpenAI configuration values.
@@ -66,11 +100,13 @@ type Config struct {
 //   - OPENAI_API_ENDPOINT / LOOM_LLM_OPENAI_ENDPOINT
 const (
 	// DefaultOpenAIModel uses GPT-4.1 (latest general-purpose model as of 2025)
-	DefaultOpenAIModel       = "gpt-4.1"
-	DefaultOpenAIEndpoint    = "https://api.openai.com/v1/chat/completions"
-	DefaultOpenAITimeout     = 60 * time.Second
-	DefaultOpenAIMaxTokens   = 4096
-	DefaultOpenAITemperature = 1.0
+	DefaultOpenAIModel                  = "gpt-4.1"
+	DefaultOpenAIEndpoint               = "https://api.openai.com/v1/chat/completions"
+	DefaultOpenAITimeout                = 60 * time.Second
+	DefaultOpenAIStreamFirstByteTimeout = 90 * time.Second
+	DefaultOpenAIStreamIdleTimeout      = 60 * time.Second
+	DefaultOpenAIMaxTokens              = 4096
+	DefaultOpenAITemperature            = 1.0
 )
 
 // NewClient creates a new OpenAI client.
@@ -98,38 +134,222 @@ func NewClient(config Config) *Client {
 	if config.Timeout == 0 {
 		config.Timeout = DefaultOpenAITimeout
 	}
+	if config.StreamFirstByteTimeout <= 0 {
+		config.StreamFirstByteTimeout = DefaultOpenAIStreamFirstByteTimeout
+	}
+	if config.StreamIdleTimeout <= 0 {
+		config.StreamIdleTimeout = DefaultOpenAIStreamIdleTimeout
+	}
 	if config.MaxTokens == 0 {
 		config.MaxTokens = DefaultOpenAIMaxTokens
 	}
 	if config.Temperature == 0 {
 		config.Temperature = DefaultOpenAITemperature
 	}
+	if config.CatalogProvider == "" {
+		config.CatalogProvider = DefaultCatalogProvider
+	}
+	httpTransport := &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		DialContext:           (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+		ForceAttemptHTTP2:     true,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ResponseHeaderTimeout: config.Timeout,
+		ExpectContinueTimeout: 1 * time.Second,
+		MaxIdleConns:          100,
+		// Use a short idle-connection timeout so the pool doesn't
+		// hand out stale connections that the LLM proxy has already
+		// closed on its side (which causes EOF errors).
+		IdleConnTimeout:     30 * time.Second,
+		MaxIdleConnsPerHost: 5,
+	}
+	httpClient := &http.Client{
+		Timeout:   config.Timeout,
+		Transport: httpTransport,
+	}
+	streamTransport := httpTransport.Clone()
+	streamTransport.ResponseHeaderTimeout = config.StreamFirstByteTimeout
+	streamHTTPClient := *httpClient
+	streamHTTPClient.Timeout = 0
+	streamHTTPClient.Transport = streamTransport
 
-	// Initialize rate limiter if enabled
+	// Initialize rate limiter if enabled — keyed by credential+endpoint+model
+	// so clients with independent quotas do not throttle each other.
 	var rateLimiter *llm.RateLimiter
 	if config.RateLimiterConfig.Enabled {
-		rateLimiter = getOrCreateGlobalRateLimiter(config.RateLimiterConfig)
+		scope := "openai|" + llm.CredentialScope(config.APIKey) + "|" + config.Endpoint + "|" + config.Model
+		rateLimiter = llm.SharedRateLimiter(scope, config.RateLimiterConfig)
 	}
 
 	return &Client{
-		apiKey:      config.APIKey,
-		model:       config.Model,
-		endpoint:    config.Endpoint,
-		maxTokens:   config.MaxTokens,
-		temperature: config.Temperature,
-		rateLimiter: rateLimiter,
-		httpClient: &http.Client{
-			Timeout: config.Timeout,
-		},
+		apiKey:                 config.APIKey,
+		model:                  config.Model,
+		endpoint:               config.Endpoint,
+		streamFirstByteTimeout: config.StreamFirstByteTimeout,
+		streamIdleTimeout:      config.StreamIdleTimeout,
+		maxTokens:              config.MaxTokens,
+		temperature:            config.Temperature,
+		rateLimiter:            rateLimiter,
+		extraHeaders:           copyHeaders(config.ExtraHeaders),
+		catalogProvider:        config.CatalogProvider,
+		httpClient:             httpClient,
+		streamHTTPClient:       &streamHTTPClient,
 	}
 }
 
-// getOrCreateGlobalRateLimiter returns the global rate limiter, creating it if necessary.
-func getOrCreateGlobalRateLimiter(config llm.RateLimiterConfig) *llm.RateLimiter {
-	globalRateLimiterOnce.Do(func() {
-		globalRateLimiter = llm.NewRateLimiter(config)
-	})
-	return globalRateLimiter
+// copyHeaders returns a shallow copy of m, or nil when m is nil/empty.
+// Prevents callers from racing with the client after construction.
+func copyHeaders(m map[string]string) map[string]string {
+	if len(m) == 0 {
+		return nil
+	}
+	cp := make(map[string]string, len(m))
+	for k, v := range m {
+		cp[k] = v
+	}
+	return cp
+}
+
+// isRetryableTransportError reports whether an HTTP transport error is transient
+// and safe to retry (stale keep-alive connection recycled by the server).
+//
+// Single-retry only: a second attempt on EOF/reset is a best-effort recovery
+// for stale keep-alive connections. Go surfaces these errors both before and
+// after the server processes the request, so a retry may cause the completion
+// to execute twice. Callers must not rely on exactly-once semantics.
+func isRetryableTransportError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	return errors.Is(err, syscall.ECONNRESET) || errors.Is(err, net.ErrClosed)
+}
+
+func (c *Client) sendRequest(ctx context.Context, body []byte) (*http.Response, error) {
+	return c.sendRequestWithClient(ctx, body, c.httpClient, 0, 0)
+}
+
+func (c *Client) streamingHTTPClient() *http.Client {
+	return c.streamHTTPClient
+}
+
+func (c *Client) sendStreamingRequest(ctx context.Context, body []byte) (*http.Response, error) {
+	return c.sendRequestWithClient(
+		ctx,
+		body,
+		c.streamingHTTPClient(),
+		c.streamFirstByteTimeout,
+		c.streamIdleTimeout,
+	)
+}
+
+func (c *Client) sendRequestWithClient(
+	ctx context.Context,
+	body []byte,
+	httpClient *http.Client,
+	streamFirstByteTimeout time.Duration,
+	streamIdleTimeout time.Duration,
+) (*http.Response, error) {
+	newReq := func(ctx context.Context) (*http.Request, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint, bytes.NewReader(body))
+		if err != nil {
+			return nil, fmt.Errorf("failed to create request: %w", err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+c.apiKey)
+		for key, value := range c.extraHeaders {
+			req.Header.Set(key, value)
+		}
+		return req, nil
+	}
+
+	if c.rateLimiter != nil {
+		// Each retry re-enters the limiter so every outbound attempt is paced.
+		for attempt := 1; attempt <= 2; attempt++ {
+			result, err := c.rateLimiter.Do(ctx, func(ctx context.Context) (interface{}, error) {
+				req, err := newReq(ctx)
+				if err != nil {
+					return nil, err
+				}
+				resp, err := sendHTTPRequest(httpClient, req, streamFirstByteTimeout, streamIdleTimeout)
+				if err != nil {
+					return nil, err
+				}
+				if resp.StatusCode == http.StatusTooManyRequests {
+					retryAfter := llm.RetryAfterFromHeaders(resp.Header)
+					respBody, _ := io.ReadAll(resp.Body)
+					_ = resp.Body.Close()
+					return nil, llm.NewThrottleError(
+						fmt.Errorf("API error (status 429): %s", string(respBody)),
+						retryAfter)
+				}
+				return resp, nil
+			})
+			if err == nil {
+				return result.(*http.Response), nil
+			}
+			if attempt == 2 || !isRetryableTransportError(err) {
+				return nil, err
+			}
+		}
+		return nil, fmt.Errorf("HTTP request failed")
+	}
+
+	// Without rate limiter: single retry on transient transport errors only.
+	for attempt := 1; attempt <= 2; attempt++ {
+		req, err := newReq(ctx)
+		if err != nil {
+			return nil, err
+		}
+		resp, doErr := sendHTTPRequest(httpClient, req, streamFirstByteTimeout, streamIdleTimeout)
+		if doErr == nil {
+			return resp, nil
+		}
+		if attempt == 2 || !isRetryableTransportError(doErr) {
+			return nil, fmt.Errorf("HTTP request failed: %w", doErr)
+		}
+	}
+	return nil, fmt.Errorf("HTTP request failed")
+}
+
+func sendHTTPRequest(
+	httpClient *http.Client,
+	req *http.Request,
+	streamFirstByteTimeout time.Duration,
+	streamIdleTimeout time.Duration,
+) (*http.Response, error) {
+	var cancelStream context.CancelFunc
+	if streamFirstByteTimeout > 0 || streamIdleTimeout > 0 {
+		streamCtx, cancel := context.WithCancel(req.Context())
+		cancelStream = cancel
+		req = req.Clone(streamCtx)
+	}
+	startedAt := time.Now()
+	resp, err := httpClient.Do(req)
+	if err != nil && cancelStream != nil {
+		cancelStream()
+	}
+	if err == nil && (streamFirstByteTimeout > 0 || streamIdleTimeout > 0) {
+		firstByteWait := streamFirstByteTimeout
+		if firstByteWait > 0 {
+			firstByteWait -= time.Since(startedAt)
+			if firstByteWait <= 0 {
+				cancelStream()
+				_ = resp.Body.Close()
+				return nil, streamIdleTimeoutError{phase: "first-byte", timeout: streamFirstByteTimeout}
+			}
+		}
+		resp.Body = newStreamReadTimeoutReadCloser(
+			resp.Body,
+			firstByteWait,
+			streamFirstByteTimeout,
+			streamIdleTimeout,
+			cancelStream,
+		)
+	}
+	return resp, err
 }
 
 // Name returns the provider name.
@@ -169,23 +389,36 @@ func (c *Client) Chat(ctx context.Context, messages []llmtypes.Message, tools []
 	}
 
 	// Call API
-	resp, err := c.callAPI(ctx, req)
+	resp, hdr, err := c.callAPI(ctx, req)
 	if err != nil {
 		return nil, fmt.Errorf("API call failed: %w", err)
 	}
 
-	// Convert response
-	return c.convertResponse(resp), nil
+	// Convert response. The gateway's own cost (cache-aware) wins when present.
+	return c.convertResponse(resp, parseProviderCost(hdr)), nil
 }
 
 // convertMessages converts agent messages to OpenAI format.
 func (c *Client) convertMessages(messages []llmtypes.Message) []ChatMessage {
 	var apiMessages []ChatMessage
-
+	srcToEmitted := make(map[int]int)
+	validToolCallIDs := make(map[string]struct{})
 	for _, msg := range messages {
+		if msg.Role != "assistant" {
+			continue
+		}
+		for _, toolCall := range msg.ToolCalls {
+			if toolCall.ID != "" && llm.SanitizeToolName(toolCall.Name) != "" {
+				validToolCallIDs[toolCall.ID] = struct{}{}
+			}
+		}
+	}
+
+	for i, msg := range messages {
 		switch msg.Role {
 		case "system":
 			// System messages always use plain text
+			srcToEmitted[i] = len(apiMessages)
 			apiMessages = append(apiMessages, ChatMessage{
 				Role:    msg.Role,
 				Content: msg.Content,
@@ -225,12 +458,14 @@ func (c *Client) convertMessages(messages []llmtypes.Message) []ChatMessage {
 						}
 					}
 				}
+				srcToEmitted[i] = len(apiMessages)
 				apiMessages = append(apiMessages, ChatMessage{
 					Role:    "user",
 					Content: content,
 				})
 			} else {
 				// Fallback to plain text (backward compatible)
+				srcToEmitted[i] = len(apiMessages)
 				apiMessages = append(apiMessages, ChatMessage{
 					Role:    msg.Role,
 					Content: msg.Content,
@@ -251,6 +486,12 @@ func (c *Client) convertMessages(messages []llmtypes.Message) []ChatMessage {
 			if len(msg.ToolCalls) > 0 {
 				var toolCalls []ToolCall
 				for _, tc := range msg.ToolCalls {
+					// Skip tool calls with empty id or sanitized name — sending
+					// these to Bedrock causes a 400 validation error.
+					sanitized := llm.SanitizeToolName(tc.Name)
+					if tc.ID == "" || sanitized == "" {
+						continue
+					}
 					// Marshal input to JSON string.
 					// Guard against nil Input — json.Marshal(nil) returns "null"
 					// (no error), which LiteLLM forwards to Vertex AI as a non-dict
@@ -265,18 +506,28 @@ func (c *Client) convertMessages(messages []llmtypes.Message) []ChatMessage {
 						ID:   tc.ID,
 						Type: "function",
 						Function: FunctionCall{
-							Name:      llm.SanitizeToolName(tc.Name),
+							Name:      sanitized,
 							Arguments: string(argsJSON),
 						},
 					})
 				}
-				apiMsg.ToolCalls = toolCalls
+				if len(toolCalls) > 0 {
+					apiMsg.ToolCalls = toolCalls
+				}
 			}
 
+			if apiMsg.Content == nil && len(apiMsg.ToolCalls) == 0 {
+				continue
+			}
+			srcToEmitted[i] = len(apiMessages)
 			apiMessages = append(apiMessages, apiMsg)
 
 		case "tool":
+			if _, ok := validToolCallIDs[msg.ToolUseID]; !ok {
+				continue
+			}
 			// Tool results as tool role message
+			srcToEmitted[i] = len(apiMessages)
 			apiMessages = append(apiMessages, ChatMessage{
 				Role:       "tool",
 				Content:    msg.Content,
@@ -285,7 +536,52 @@ func (c *Client) convertMessages(messages []llmtypes.Message) []ChatMessage {
 		}
 	}
 
+	// Prompt-cache breakpoints: the compile marks the "perfect place" (ROM,
+	// summary, last message before any current-turn offload stub). Each maps 1:1
+	// to an apiMessage; convert its content to the block form litellm forwards to
+	// Anthropic as cache_control. Anthropic allows at most 4 breakpoints; the
+	// compile marks at most three (+ the tool list), so we stay within budget.
+	// Emitted only for Anthropic-backed models: cache_control is Anthropic's
+	// field, and a strict OpenAI-native endpoint may reject the foreign key or
+	// the string→block content reshaping that carries it.
+	if c.emitsCacheControl() {
+		for i, msg := range messages {
+			if emittedIdx, ok := srcToEmitted[i]; ok && msg.CacheBreakpoint {
+				apiMessages[emittedIdx].Content = withCacheControl(apiMessages[emittedIdx].Content)
+			}
+		}
+	}
+
 	return apiMessages
+}
+
+// emitsCacheControl reports whether the configured model is Anthropic-backed —
+// the only upstream that consumes cache_control. The OpenAI-shaped client
+// fronts many gateways (LiteLLM, Mistral, HuggingFace); only requests routed
+// to a claude model benefit from the marker, and only those get it.
+func (c *Client) emitsCacheControl() bool {
+	return strings.Contains(strings.ToLower(c.model), "claude")
+}
+
+// withCacheControl rewrites a message's content into the block form carrying a
+// cache_control marker on its last block. A plain string becomes a single text
+// block; an existing block list gets the marker appended to its last block.
+func withCacheControl(content interface{}) interface{} {
+	cc := map[string]interface{}{"type": "ephemeral"}
+	switch v := content.(type) {
+	case string:
+		if v == "" {
+			return content
+		}
+		return []map[string]interface{}{{"type": "text", "text": v, "cache_control": cc}}
+	case []map[string]interface{}:
+		if len(v) > 0 {
+			v[len(v)-1]["cache_control"] = cc
+		}
+		return v
+	default:
+		return content
+	}
 }
 
 // convertTools converts shuttle tools to OpenAI format.
@@ -387,19 +683,36 @@ func (c *Client) convertSchemaProperties(props map[string]*shuttle.JSONSchema) m
 }
 
 // convertResponse converts OpenAI response to agent format.
-func (c *Client) convertResponse(resp *ChatCompletionResponse) *llmtypes.LLMResponse {
+func (c *Client) convertResponse(resp *ChatCompletionResponse, providerCostUSD float64) *llmtypes.LLMResponse {
+	finishReason := ""
+	if len(resp.Choices) > 0 {
+		finishReason = resp.Choices[0].FinishReason
+	}
 	llmResp := &llmtypes.LLMResponse{
 		Usage: llmtypes.Usage{
-			InputTokens:  resp.Usage.PromptTokens,
-			OutputTokens: resp.Usage.CompletionTokens,
-			TotalTokens:  resp.Usage.TotalTokens,
-			CostUSD:      c.calculateCost(resp.Usage.PromptTokens, resp.Usage.CompletionTokens),
+			InputTokens:              resp.Usage.UncachedPromptTokens(),
+			OutputTokens:             resp.Usage.CompletionTokens,
+			TotalTokens:              resp.Usage.UncachedTotalTokens(),
+			CacheReadInputTokens:     resp.Usage.CacheRead(),
+			CacheCreationInputTokens: resp.Usage.CacheCreationInputTokens,
+			RateLimitTokens:          resp.Usage.MeteredTokens(),
+			CostUSD: costOrEstimate(providerCostUSD, func() float64 {
+				return c.calculateCost(resp.Usage.PromptTokens, resp.Usage.CompletionTokens,
+					resp.Usage.CacheRead(), resp.Usage.CacheCreationInputTokens)
+			}),
 		},
 		Metadata: map[string]interface{}{
 			"model":         resp.Model,
-			"finish_reason": resp.Choices[0].FinishReason,
+			"finish_reason": finishReason,
 		},
 	}
+
+	// Prompt-cache measurement: one line per call so a run's hit rate is legible
+	// in the logs (cache_read>0 means the provider served a cached prefix).
+	zap.L().Info("prompt cache usage",
+		zap.Int("prompt_tokens", resp.Usage.PromptTokens),
+		zap.Int("cache_read", resp.Usage.CacheRead()),
+		zap.Int("cache_creation", resp.Usage.CacheCreationInputTokens))
 
 	if len(resp.Choices) > 0 {
 		choice := resp.Choices[0]
@@ -425,8 +738,21 @@ func (c *Client) convertResponse(resp *ChatCompletionResponse) *llmtypes.LLMResp
 			}
 		}
 
+		// Reasoning models surface their trace in reasoning_content; map it to
+		// Thinking (never Content) so it is observable without polluting the
+		// user-facing answer or the replayed conversation.
+		llmResp.Thinking = choice.Message.ReasoningContent
+
 		// Extract tool calls
 		for _, tc := range choice.Message.ToolCalls {
+			// Skip tool calls with empty id or name — strict providers (Bedrock)
+			// reject messages containing toolUse blocks where either field is empty.
+			if tc.ID == "" || tc.Function.Name == "" {
+				zap.L().Warn("dropping incomplete tool call",
+					zap.String("tool_call_id", tc.ID),
+					zap.String("tool_name", tc.Function.Name))
+				continue
+			}
 			// Parse arguments JSON string back to map
 			var input map[string]interface{}
 			if err := json.Unmarshal([]byte(tc.Function.Arguments), &input); err != nil {
@@ -442,72 +768,183 @@ func (c *Client) convertResponse(resp *ChatCompletionResponse) *llmtypes.LLMResp
 				Input: input,
 			})
 		}
+		if llmResp.StopReason == "tool_use" && len(choice.Message.ToolCalls) > 0 && len(llmResp.ToolCalls) == 0 {
+			llmResp.StopReason = "end_turn"
+		}
 	}
 
 	return llmResp
 }
 
-// calculateCost estimates the cost in USD based on token usage.
-// Pricing as of 2024-11 for various OpenAI models.
-func (c *Client) calculateCost(inputTokens, outputTokens int) float64 {
-	// Pricing per million tokens (as of 2024-11)
-	var inputCostPerM, outputCostPerM float64
+// anthropicFallbackPricing returns published Anthropic rates for a model id
+// proxied through an OpenAI-compatible endpoint. Mirrors the bedrock client's
+// substring matching so a gateway-proxied Claude is never priced as a GPT.
+func anthropicFallbackPricing(modelID string) (inputPerM, outputPerM float64, matched bool) {
+	switch {
+	case strings.Contains(modelID, "claude-opus-4-1"):
+		return 15.0, 75.0, true
+	case strings.Contains(modelID, "claude-opus"):
+		return 5.0, 25.0, true
+	case strings.Contains(modelID, "claude-haiku"):
+		return 1.0, 5.0, true
+	case strings.Contains(modelID, "claude-sonnet"), strings.Contains(modelID, "claude-3-5-sonnet"):
+		return 3.0, 15.0, true
+	}
+	return 0, 0, false
+}
 
-	switch c.model {
-	case "gpt-4o":
-		inputCostPerM = 2.50
-		outputCostPerM = 10.00
-	case "gpt-4o-mini":
-		inputCostPerM = 0.15
-		outputCostPerM = 0.60
-	case "gpt-4-turbo", "gpt-4-turbo-preview":
-		inputCostPerM = 10.00
-		outputCostPerM = 30.00
-	case "gpt-4", "gpt-4-0613":
-		inputCostPerM = 30.00
-		outputCostPerM = 60.00
-	case "gpt-3.5-turbo", "gpt-3.5-turbo-0125":
-		inputCostPerM = 0.50
-		outputCostPerM = 1.50
-	case "o1-preview":
-		inputCostPerM = 15.00
-		outputCostPerM = 60.00
-	case "o1-mini":
-		inputCostPerM = 3.00
-		outputCostPerM = 12.00
-	case "gpt-5":
-		inputCostPerM = 2.50
-		outputCostPerM = 10.00
-	case "gpt-5-mini":
-		inputCostPerM = 0.40
-		outputCostPerM = 1.60
-	case "gpt-4.1":
-		inputCostPerM = 2.00
-		outputCostPerM = 8.00
-	case "gpt-4.1-mini":
-		inputCostPerM = 0.40
-		outputCostPerM = 1.60
-	case "gpt-4.1-nano":
-		inputCostPerM = 0.10
-		outputCostPerM = 0.40
-	case "o3":
-		inputCostPerM = 10.00
-		outputCostPerM = 40.00
-	case "o3-mini":
-		inputCostPerM = 1.10
-		outputCostPerM = 4.40
-	case "o4-mini":
-		inputCostPerM = 1.10
-		outputCostPerM = 4.40
-	default:
-		// Default to gpt-4o pricing
-		inputCostPerM = 2.50
-		outputCostPerM = 10.00
+// providerCostHeader is litellm's own computed cost for the call. It is
+// cache-aware and authoritative — preferred over any local estimate.
+const providerCostHeader = "x-litellm-response-cost"
+
+// Cache-tier multipliers on the input rate, by rate-card family. Anthropic
+// bills a 5-minute cache write at 1.25x and a cache read at 0.10x. OpenAI bills
+// a cached input token at 0.5x (gpt-4o: $1.25 cached against $2.50) and has no
+// separate write bucket, so a cache-creation token is simply an input token.
+const (
+	anthropicCacheWriteMultiplier = 1.25
+	anthropicCacheReadMultiplier  = 0.10
+	openAICacheWriteMultiplier    = 1.0
+	openAICacheReadMultiplier     = 0.5
+)
+
+// parseProviderCost reads the gateway's reported cost, if it sent one.
+// Returns 0 when absent or unparseable, meaning "fall back to the estimate".
+func parseProviderCost(h http.Header) float64 {
+	if h == nil {
+		return 0
+	}
+	v := strings.TrimSpace(h.Get(providerCostHeader))
+	if v == "" {
+		return 0
+	}
+	f, err := strconv.ParseFloat(v, 64)
+	if err != nil || f < 0 {
+		return 0
+	}
+	return f
+}
+
+// costOrEstimate prefers the provider's reported cost; estimate() is used only
+// when the provider did not report one.
+func costOrEstimate(providerCostUSD float64, estimate func() float64) float64 {
+	if providerCostUSD > 0 {
+		return providerCostUSD
+	}
+	return estimate()
+}
+
+// calculateCost estimates the cost in USD based on token usage.
+//
+// Cache tiers matter: a cache-blind total over-charges a cache-heavy workload by
+// several fold. The multipliers are family-dependent, so they follow the rate
+// card rather than being fixed:
+//
+//   - Anthropic (including gateway-proxied Claude ids): a cache write bills at
+//     1.25x the input rate (5-minute TTL; a 1-hour write is 2x, which loom does
+//     not request) and a cache read at 0.10x.
+//   - OpenAI: a cached input token bills at 0.5x and there is no separate write
+//     bucket, so cache-creation tokens bill at the plain input rate.
+//
+// NOTE the OpenAI-compatible semantics: prompt_tokens INCLUDES cached tokens
+// (unlike Anthropic native, where input_tokens excludes them), so the uncached
+// remainder must be derived by subtraction.
+//
+// This is the FALLBACK. When the gateway reports its own cost (litellm's
+// x-litellm-response-cost header) that figure is authoritative and is used
+// instead — see providerCostUSD.
+func (c *Client) calculateCost(inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens int) float64 {
+	// The catalog (pkg/llm/catalog) is the source of truth for pricing — the
+	// registered source chain first, then the static table — under the
+	// namespace Config.CatalogProvider selected. Fall back to the
+	// provider-local rates below only for model ids it does not list.
+	provider := c.catalogProvider
+	if provider == "" {
+		provider = DefaultCatalogProvider
+	}
+	inputCostPerM, outputCostPerM, ok := catalog.LookupPricing(provider, c.model)
+	if !ok {
+		// Gateways (litellm et al.) proxy non-OpenAI models through this
+		// OpenAI-compatible client under ids like "coding-agent/claude-sonnet-4-6".
+		// Falling through to the GPT rate card below would price them wrongly, so
+		// recognise the Anthropic family first. Order matters: check "opus-4-1"
+		// before "opus-4", since Contains("opus-4-5","opus-4") is true.
+		if in, out, matched := anthropicFallbackPricing(c.model); matched {
+			inputCostPerM, outputCostPerM = in, out
+			ok = true
+		}
+	}
+	if !ok {
+		switch c.model {
+		case "gpt-4o":
+			inputCostPerM = 2.50
+			outputCostPerM = 10.00
+		case "gpt-4o-mini":
+			inputCostPerM = 0.15
+			outputCostPerM = 0.60
+		case "gpt-4-turbo", "gpt-4-turbo-preview":
+			inputCostPerM = 10.00
+			outputCostPerM = 30.00
+		case "gpt-4", "gpt-4-0613":
+			inputCostPerM = 30.00
+			outputCostPerM = 60.00
+		case "gpt-3.5-turbo", "gpt-3.5-turbo-0125":
+			inputCostPerM = 0.50
+			outputCostPerM = 1.50
+		case "o1-preview":
+			inputCostPerM = 15.00
+			outputCostPerM = 60.00
+		case "o1-mini":
+			inputCostPerM = 3.00
+			outputCostPerM = 12.00
+		case "gpt-5":
+			inputCostPerM = 2.50
+			outputCostPerM = 10.00
+		case "gpt-5-mini":
+			inputCostPerM = 0.40
+			outputCostPerM = 1.60
+		case "gpt-4.1":
+			inputCostPerM = 2.00
+			outputCostPerM = 8.00
+		case "gpt-4.1-mini":
+			inputCostPerM = 0.40
+			outputCostPerM = 1.60
+		case "gpt-4.1-nano":
+			inputCostPerM = 0.10
+			outputCostPerM = 0.40
+		case "o3":
+			inputCostPerM = 10.00
+			outputCostPerM = 40.00
+		case "o3-mini":
+			inputCostPerM = 1.10
+			outputCostPerM = 4.40
+		case "o4-mini":
+			inputCostPerM = 1.10
+			outputCostPerM = 4.40
+		default:
+			// Default to gpt-4o pricing
+			inputCostPerM = 2.50
+			outputCostPerM = 10.00
+		}
 	}
 
-	inputCost := float64(inputTokens) * inputCostPerM / 1_000_000
+	// The family decides the cache multipliers, independently of which branch
+	// above supplied the rates: anthropicFallbackPricing is a pure matcher on the
+	// model id, so it still identifies a Claude that the catalog priced.
+	cacheReadMult, cacheWriteMult := openAICacheReadMultiplier, openAICacheWriteMultiplier
+	if _, _, isAnthropic := anthropicFallbackPricing(c.model); isAnthropic {
+		cacheReadMult, cacheWriteMult = anthropicCacheReadMultiplier, anthropicCacheWriteMultiplier
+	}
+
+	uncached := inputTokens - cacheReadTokens - cacheCreationTokens
+	if uncached < 0 {
+		uncached = 0
+	}
+	inputCost := float64(uncached) * inputCostPerM / 1_000_000
+	cacheWriteCost := float64(cacheCreationTokens) * inputCostPerM * cacheWriteMult / 1_000_000
+	cacheReadCost := float64(cacheReadTokens) * inputCostPerM * cacheReadMult / 1_000_000
 	outputCost := float64(outputTokens) * outputCostPerM / 1_000_000
-	return inputCost + outputCost
+	return inputCost + cacheWriteCost + cacheReadCost + outputCost
 }
 
 // usesMaxCompletionTokens returns true when the model requires max_completion_tokens
@@ -543,10 +980,11 @@ func (c *Client) ChatStream(ctx context.Context, messages []llmtypes.Message,
 	apiTools := c.convertTools(tools)
 
 	req := &ChatCompletionRequest{
-		Model:       c.model,
-		Messages:    apiMessages,
-		Temperature: c.temperature,
-		Stream:      true, // Enable streaming
+		Model:         c.model,
+		Messages:      apiMessages,
+		Temperature:   c.temperature,
+		Stream:        true,                               // Enable streaming
+		StreamOptions: &StreamOptions{IncludeUsage: true}, // final usage chunk (tokens + cache)
 	}
 	if c.usesMaxCompletionTokens() {
 		req.MaxCompletionTokens = c.maxTokens
@@ -565,44 +1003,31 @@ func (c *Client) ChatStream(ctx context.Context, messages []llmtypes.Message,
 		return nil, fmt.Errorf("failed to marshal request: %w", err)
 	}
 
-	// Create HTTP request
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", c.endpoint, bytes.NewReader(body))
+	// 2. Send request with rate limiting if enabled.
+	// Retry once on transient transport errors (stale keep-alive connection
+	// recycled by the LLM proxy, manifesting as EOF).
+	httpResp, err := c.sendStreamingRequest(ctx, body)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
-	}
-
-	// Set headers
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
-
-	// 2. Send request with rate limiting if enabled
-	var httpResp *http.Response
-	if c.rateLimiter != nil {
-		result, err := c.rateLimiter.Do(ctx, func(ctx context.Context) (interface{}, error) {
-			return c.httpClient.Do(httpReq)
-		})
-		if err != nil {
-			return nil, fmt.Errorf("HTTP request failed: %w", err)
-		}
-		httpResp = result.(*http.Response)
-	} else {
-		var err error
-		httpResp, err = c.httpClient.Do(httpReq)
-		if err != nil {
-			return nil, fmt.Errorf("HTTP request failed: %w", err)
-		}
+		return nil, err
 	}
 	defer func() { _ = httpResp.Body.Close() }()
 
 	// Check status code before streaming
 	if httpResp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(httpResp.Body)
+		// Positive identification of the provider's context-too-long refusal
+		// (HLD §5.2 step 12) — the only relief trigger.
+		if llm.IsOpenAIContextTooLong(httpResp.StatusCode, respBody) {
+			return nil, fmt.Errorf("API error (status %d): %s: %w", httpResp.StatusCode, string(respBody), llm.ErrContextTooLong)
+		}
 		return nil, fmt.Errorf("API error (status %d): %s", httpResp.StatusCode, string(respBody))
 	}
 
 	// 3. Process Server-Sent Events (SSE) stream
 	var contentBuffer strings.Builder
 	usage := llmtypes.Usage{}
+	// Raw prompt_tokens / total_tokens (cache-inclusive) from the final usage chunk.
+	var promptTokens, rawTotalTokens int
 	var finishReason string
 	tokenCount := 0
 	var toolCalls []llmtypes.ToolCall
@@ -649,22 +1074,30 @@ func (c *Client) ChatStream(ctx context.Context, messages []llmtypes.Message,
 				}
 			}
 
-			// Extract tool call deltas
+			// Extract tool call deltas. They never reach tokenCallback (text
+			// only), so report them as stream activity.
 			if len(choice.Delta.ToolCalls) > 0 {
+				llmtypes.NotifyStreamActivity(ctx)
 				for _, tcDelta := range choice.Delta.ToolCalls {
 					idx := tcDelta.Index
 					if _, exists := toolCallMap[idx]; !exists {
-						// New tool call - map sanitized name back to original
 						toolCallMap[idx] = &llmtypes.ToolCall{
-							ID:    tcDelta.ID,
-							Name:  llm.ReverseToolName(c.toolNameMap, tcDelta.Function.Name),
 							Input: make(map[string]interface{}),
 						}
+					}
+					tc := toolCallMap[idx]
+					// Some OpenAI-compatible proxies emit arguments before the ID
+					// and function name. Backfill identity fields on every delta so
+					// an args-first tool call is not silently discarded at the end.
+					if tcDelta.ID != "" {
+						tc.ID = tcDelta.ID
+					}
+					if tcDelta.Function.Name != "" {
+						tc.Name = llm.ReverseToolName(c.toolNameMap, tcDelta.Function.Name)
 					}
 
 					// Accumulate function arguments (they come in chunks)
 					if tcDelta.Function.Arguments != "" {
-						tc := toolCallMap[idx]
 						// Note: Arguments are accumulated as string, parsed at the end
 						if existingArgs, ok := tc.Input["_args"].(string); ok {
 							tc.Input["_args"] = existingArgs + tcDelta.Function.Arguments
@@ -683,9 +1116,14 @@ func (c *Client) ChatStream(ctx context.Context, messages []llmtypes.Message,
 
 		// Extract usage (only in final chunk, if provided)
 		if chunk.Usage != nil {
-			usage.InputTokens = chunk.Usage.PromptTokens
+			promptTokens = chunk.Usage.PromptTokens
+			rawTotalTokens = chunk.Usage.TotalTokens
+			usage.InputTokens = chunk.Usage.UncachedPromptTokens()
 			usage.OutputTokens = chunk.Usage.CompletionTokens
-			usage.TotalTokens = chunk.Usage.TotalTokens
+			usage.TotalTokens = chunk.Usage.UncachedTotalTokens()
+			usage.CacheReadInputTokens = chunk.Usage.CacheRead()
+			usage.CacheCreationInputTokens = chunk.Usage.CacheCreationInputTokens
+			usage.RateLimitTokens = chunk.Usage.MeteredTokens()
 		}
 
 		// Check context cancellation
@@ -701,7 +1139,19 @@ func (c *Client) ChatStream(ctx context.Context, messages []llmtypes.Message,
 	}
 
 	// 4. Parse accumulated tool call arguments
+	droppedToolCall := false
 	for _, tc := range toolCallMap {
+		// Skip tool calls with empty name or ID — Bedrock (and other strict
+		// providers) reject messages containing toolUse blocks where name or
+		// toolUseId is empty. This can happen when streaming produces partial
+		// delta chunks that initialize a slot before the name/id arrive.
+		if tc.ID == "" || tc.Name == "" {
+			zap.L().Warn("dropping incomplete streamed tool call",
+				zap.String("tool_call_id", tc.ID),
+				zap.String("tool_name", tc.Name))
+			droppedToolCall = true
+			continue
+		}
 		if argsStr, ok := tc.Input["_args"].(string); ok {
 			var parsedArgs map[string]interface{}
 			if err := json.Unmarshal([]byte(argsStr), &parsedArgs); err != nil {
@@ -716,15 +1166,25 @@ func (c *Client) ChatStream(ctx context.Context, messages []llmtypes.Message,
 	}
 
 	// 5. Build final response
-	if usage.TotalTokens == 0 {
+	if rawTotalTokens == 0 {
 		usage.OutputTokens = tokenCount
 		usage.TotalTokens = tokenCount // Input tokens not available in stream
 	}
-	usage.CostUSD = c.calculateCost(usage.InputTokens, usage.OutputTokens)
+	// calculateCost and the rate limiter take the raw, cache-inclusive
+	// prompt_tokens: cost splits the cache tiers itself, and OpenAI-style TPM
+	// limits count cached tokens.
+	usage.CostUSD = costOrEstimate(parseProviderCost(httpResp.Header), func() float64 {
+		return c.calculateCost(promptTokens, usage.OutputTokens,
+			usage.CacheReadInputTokens, usage.CacheCreationInputTokens)
+	})
+	zap.L().Info("prompt cache usage (stream)",
+		zap.Int("prompt_tokens", promptTokens),
+		zap.Int("cache_read", usage.CacheReadInputTokens),
+		zap.Int("cache_creation", usage.CacheCreationInputTokens))
 
 	// Record token usage for rate limiter metrics
 	if c.rateLimiter != nil {
-		totalTokens := int64(usage.InputTokens + usage.OutputTokens)
+		totalTokens := int64(promptTokens + usage.OutputTokens)
 		c.rateLimiter.RecordTokenUsage(totalTokens)
 	}
 
@@ -736,7 +1196,11 @@ func (c *Client) ChatStream(ctx context.Context, messages []llmtypes.Message,
 	case "length":
 		stopReason = "max_tokens"
 	case "tool_calls", "function_call":
-		stopReason = "tool_use"
+		if droppedToolCall && len(toolCalls) == 0 {
+			stopReason = "end_turn"
+		} else {
+			stopReason = "tool_use"
+		}
 	case "content_filter":
 		stopReason = "content_filter"
 	default:
@@ -757,65 +1221,51 @@ func (c *Client) ChatStream(ctx context.Context, messages []llmtypes.Message,
 }
 
 // callAPI makes the HTTP request to OpenAI's API.
-func (c *Client) callAPI(ctx context.Context, req *ChatCompletionRequest) (*ChatCompletionResponse, error) {
+func (c *Client) callAPI(ctx context.Context, req *ChatCompletionRequest) (*ChatCompletionResponse, http.Header, error) {
 	// Marshal request
 	body, err := json.Marshal(req)
 	if err != nil {
-		return nil, fmt.Errorf("failed to marshal request: %w", err)
+		return nil, nil, fmt.Errorf("failed to marshal request: %w", err)
 	}
 
-	// Create HTTP request
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", c.endpoint, bytes.NewReader(body))
+	// Send request with rate limiting if enabled.
+	// Retry once on transient transport errors (stale keep-alive connection
+	// recycled by the LLM proxy, manifesting as EOF).
+	httpResp, err := c.sendRequest(ctx, body)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
-	}
-
-	// Set headers
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
-
-	// Send request with rate limiting if enabled
-	var httpResp *http.Response
-	if c.rateLimiter != nil {
-		result, err := c.rateLimiter.Do(ctx, func(ctx context.Context) (interface{}, error) {
-			return c.httpClient.Do(httpReq)
-		})
-		if err != nil {
-			return nil, fmt.Errorf("HTTP request failed: %w", err)
-		}
-		httpResp = result.(*http.Response)
-	} else {
-		var err error
-		httpResp, err = c.httpClient.Do(httpReq)
-		if err != nil {
-			return nil, fmt.Errorf("HTTP request failed: %w", err)
-		}
+		return nil, nil, err
 	}
 	defer func() { _ = httpResp.Body.Close() }()
 
 	// Read response
 	respBody, err := io.ReadAll(httpResp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read response: %w", err)
+		return nil, nil, fmt.Errorf("failed to read response: %w", err)
 	}
 
 	// Parse response
 	var resp ChatCompletionResponse
 	if err := json.Unmarshal(respBody, &resp); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
+		return nil, nil, fmt.Errorf("failed to unmarshal response: %w", err)
+	}
+
+	// Positive identification of the provider's context-too-long refusal
+	// (HLD §5.2 step 12) — the only relief trigger.
+	if llm.IsOpenAIContextTooLong(httpResp.StatusCode, respBody) {
+		return nil, nil, fmt.Errorf("API error (status %d): %s: %w", httpResp.StatusCode, string(respBody), llm.ErrContextTooLong)
 	}
 
 	// Check for API errors
 	if resp.Error != nil {
-		return nil, fmt.Errorf("OpenAI API error: %s (type: %s)", resp.Error.Message, resp.Error.Type)
+		return nil, nil, fmt.Errorf("OpenAI API error: %s (type: %s)", resp.Error.Message, resp.Error.Type)
 	}
 
 	// Check status code
 	if httpResp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("API error (status %d): %s", httpResp.StatusCode, string(respBody))
+		return nil, nil, fmt.Errorf("API error (status %d): %s", httpResp.StatusCode, string(respBody))
 	}
 
-	return &resp, nil
+	return &resp, httpResp.Header, nil
 }
 
 // Ensure Client implements LLMProvider interface.

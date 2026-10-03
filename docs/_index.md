@@ -1,7 +1,7 @@
 
 # Loom Documentation
 
-**Version**: v1.2.0
+**Version**: v1.3.0
 
 
 ## Getting Started
@@ -81,5 +81,11 @@ API specifications and command documentation.
 
 **[CLI Commands →](reference/cli/)**
 `looms` (server) and `loom` (client) command reference.
+
+**[Workflow Output Retry →](reference/workflow-output-retry/)**
+Retry agent output that fails a schema or format check, with feedback in the retry prompt.
+
+**[Capability Leveling →](reference/workflow-leveling/)**
+Escalate a weak model's failed stage output up a ladder of stronger models.
 
 **[All Reference Docs →](reference/)**

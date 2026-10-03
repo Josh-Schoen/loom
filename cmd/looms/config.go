@@ -15,6 +15,7 @@ package main
 
 import (
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -22,6 +23,8 @@ import (
 	"github.com/spf13/viper"
 	loomv1 "github.com/teradata-labs/loom/gen/go/loom/v1"
 	loomconfig "github.com/teradata-labs/loom/pkg/config"
+	"github.com/teradata-labs/loom/pkg/observability"
+	"github.com/teradata-labs/loom/pkg/shuttle"
 	"github.com/zalando/go-keyring"
 	"gopkg.in/yaml.v3"
 )
@@ -101,6 +104,16 @@ type Config struct {
 
 	// Embedding configures vector embeddings for hybrid semantic memory search.
 	Embedding EmbeddingConfig `mapstructure:"embedding"`
+
+	// SkipEmbeddedAgents disables auto-installation of guide, weaver, and bundled
+	// skills into the agents/skills directories on startup. Set to true for runtime
+	// pods that should only serve the explicitly configured agent(s).
+	SkipEmbeddedAgents bool `mapstructure:"skip_embedded_agents"`
+
+	// PatternsDir is the server-level directory containing pattern YAML files.
+	// Per-agent metadata["patterns_dir"] overrides this; agents fall back to
+	// $LOOM_DATA_DIR/patterns when both are empty.
+	PatternsDir string `mapstructure:"patterns_dir"`
 }
 
 // EmbeddingConfig configures the vector embedding provider for hybrid memory search.
@@ -154,6 +167,10 @@ type ArtifactsConfig struct {
 
 	// TempCleanupAgeDays is the age in days for temp artifact cleanup (default: 7)
 	TempCleanupAgeDays int `mapstructure:"temp_cleanup_age_days"`
+
+	// SessionMetadataEnabled writes and reads artifacts/sessions/<id>/metadata.json for attribution
+	// and list/get session API enrichment. Default false (opt-in). Env: LOOM_ARTIFACTS_SESSION_METADATA_ENABLED.
+	SessionMetadataEnabled bool `mapstructure:"session_metadata_enabled"`
 }
 
 // DockerConfig holds Docker daemon configuration.
@@ -191,14 +208,41 @@ type TUIConfig struct {
 
 // ServerConfig holds server-specific configuration.
 type ServerConfig struct {
-	Port             int                 `mapstructure:"port"`
-	Host             string              `mapstructure:"host"`
-	HTTPPort         int                 `mapstructure:"http_port"` // HTTP/REST+SSE port (default: 5006, 0=disabled)
-	EnableReflection bool                `mapstructure:"enable_reflection"`
-	InsecureAdmin    bool                `mapstructure:"insecure_admin"` // Allow admin endpoints without LOOM_ADMIN_TOKEN (default: false)
-	TLS              TLSConfig           `mapstructure:"tls"`
-	Clarification    ClarificationConfig `mapstructure:"clarification"` // Clarification question timeouts
-	CORS             CORSServerConfig    `mapstructure:"cors"`          // CORS configuration for HTTP endpoints
+	Port              int    `mapstructure:"port"`
+	Host              string `mapstructure:"host"`
+	HTTPPort          int    `mapstructure:"http_port"` // HTTP/REST+SSE port (default: 5006, 0=disabled)
+	EnableReflection  bool   `mapstructure:"enable_reflection"`
+	InsecureAdmin     bool   `mapstructure:"insecure_admin"`      // Allow admin endpoints without LOOM_ADMIN_TOKEN (default: false)
+	AllowTimeOverride bool   `mapstructure:"allow_time_override"` // Honor WeaveRequest.occurred_at for replayed/imported conversations (default: false)
+	// AllowAssistantOverride honors WeaveRequest.replay_assistant_message
+	// (generation-free conversation replay — the caller supplies the assistant's
+	// turn verbatim). Separate from allow_time_override so enabling timestamp
+	// anchoring never implicitly accepts caller-supplied assistant content
+	// (default: false).
+	AllowAssistantOverride bool                `mapstructure:"allow_assistant_override"`
+	TLS                    TLSConfig           `mapstructure:"tls"`
+	Clarification          ClarificationConfig `mapstructure:"clarification"` // Clarification question timeouts
+	CORS                   CORSServerConfig    `mapstructure:"cors"`          // CORS configuration for HTTP endpoints
+	Auth                   AuthConfig          `mapstructure:"auth"`          // Endpoint authentication (Supabase JWT)
+}
+
+// AuthConfig gates JWT authentication of Loom's gRPC/HTTP endpoints. When
+// disabled (the default), Loom uses the legacy trusted x-user-id header.
+type AuthConfig struct {
+	Enabled  bool               `mapstructure:"enabled"`  // Master switch (default: false)
+	Provider string             `mapstructure:"provider"` // Only "supabase" is supported today
+	Mode     string             `mapstructure:"mode"`     // "required" (reject unauthenticated) or "optional"
+	Supabase SupabaseAuthConfig `mapstructure:"supabase"`
+}
+
+// SupabaseAuthConfig holds Supabase-specific JWT verification settings. The
+// jwt_secret is sensitive and must come from env/keyring, never YAML.
+type SupabaseAuthConfig struct {
+	ProjectRef string `mapstructure:"project_ref"` // Used to derive jwks_url/issuer when blank
+	JWTSecret  string `mapstructure:"jwt_secret"`  // HS256 shared secret (env/keyring only)
+	JWKSURL    string `mapstructure:"jwks_url"`    // Asymmetric keys; auto-derived from project_ref if blank
+	Audience   string `mapstructure:"audience"`    // Expected aud claim (default: "authenticated")
+	Issuer     string `mapstructure:"issuer"`      // Expected iss; auto-derived from project_ref if blank
 }
 
 // CORSServerConfig holds CORS configuration for HTTP endpoints.
@@ -288,6 +332,19 @@ type LLMConfig struct {
 	BedrockProfile         string `mapstructure:"bedrock_profile"`
 	BedrockModelID         string `mapstructure:"bedrock_model_id"`
 
+	// SchedulerEnabled turns on the LLM slot scheduler: per-quota-scope
+	// admission where waiting is a state, not an error
+	// (docs/architecture/llm-slot-scheduler.md). Default off.
+	SchedulerEnabled bool `mapstructure:"scheduler_enabled"`
+
+	// MaxActiveConversations caps concurrently active batch conversation
+	// turns; excess queues FIFO at the door. 0 = unlimited (gate off).
+	MaxActiveConversations int `mapstructure:"max_active_conversations"`
+
+	// MaxDoorQueue caps the door queue; beyond it new batch turns are
+	// rejected with RESOURCE_EXHAUSTED. 0 = unbounded queueing.
+	MaxDoorQueue int `mapstructure:"max_door_queue"`
+
 	// Ollama-specific
 	OllamaEndpoint string `mapstructure:"ollama_endpoint"`
 	OllamaModel    string `mapstructure:"ollama_model"`
@@ -313,6 +370,12 @@ type LLMConfig struct {
 	// HuggingFace-specific
 	HuggingFaceToken string `mapstructure:"huggingface_token"` // From CLI/env/keyring only
 	HuggingFaceModel string `mapstructure:"huggingface_model"`
+
+	// LiteLLM-specific
+	LiteLLMEndpoint     string            `mapstructure:"litellm_endpoint"`
+	LiteLLMAPIKey       string            `mapstructure:"litellm_api_key"` // From CLI/env/keyring only
+	LiteLLMModel        string            `mapstructure:"litellm_model"`
+	LiteLLMExtraHeaders map[string]string `mapstructure:"litellm_extra_headers"`
 
 	// Common generation parameters
 	Temperature float64 `mapstructure:"temperature"`
@@ -343,8 +406,10 @@ type LLMRateLimitConfig struct {
 	// Max requests per second (0 = default: 2.0).
 	RequestsPerSecond float64 `mapstructure:"requests_per_second"`
 
-	// Max tokens per minute for token-based throttling (0 = default: 40000).
-	// Match your API tier: Anthropic free=30000, Tier1=100000, Bedrock varies.
+	// Max tokens per minute. OBSERVATIONAL ONLY today: token consumption is
+	// tracked and reported in rate-limiter metrics, but this value is never
+	// enforced — only requests_per_second, burst_capacity, and min_delay_ms
+	// gate requests (0 = default: 40000, metrics baseline).
 	TokensPerMinute int64 `mapstructure:"tokens_per_minute"`
 
 	// Max burst size before queuing (0 = default: 5).
@@ -433,6 +498,26 @@ type PostgresConfig struct {
 	// Require X-User-ID header on all requests (default: true).
 	// When false, requests without X-User-ID use default_user_id or "default-user".
 	RequireUserID bool `mapstructure:"require_user_id"`
+
+	// Supabase configures storage by Supabase project (session-mode pooler DSN)
+	// instead of a raw DSN/host. Takes precedence over host fields but not `dsn`.
+	Supabase SupabaseStorageConfig `mapstructure:"supabase"`
+}
+
+// SupabaseStorageConfig configures Loom storage against a Supabase project.
+// When enabled, a session-mode (port 5432) pooler DSN is derived from these
+// fields. database_password is sensitive: prefer LOOM_SUPABASE_DB_PASSWORD or
+// the keyring over YAML.
+type SupabaseStorageConfig struct {
+	Enabled          bool   `mapstructure:"enabled"`
+	ProjectRef       string `mapstructure:"project_ref"`
+	DatabasePassword string `mapstructure:"database_password"`
+	Region           string `mapstructure:"region"`
+	PoolerHost       string `mapstructure:"pooler_host"`
+	Database         string `mapstructure:"database"`
+	ProjectURL       string `mapstructure:"project_url"`
+	AnonKey          string `mapstructure:"anon_key"`
+	ServiceRoleKey   string `mapstructure:"service_role_key"`
 }
 
 // PostgresPoolConfig holds PostgreSQL connection pool configuration.
@@ -537,6 +622,12 @@ type ObservabilityConfig struct {
 	StorageType   string `mapstructure:"storage_type"`   // memory, sqlite
 	SQLitePath    string `mapstructure:"sqlite_path"`    // Path for SQLite storage
 	FlushInterval string `mapstructure:"flush_interval"` // e.g., "5s", "30s"
+
+	// OTel mode — exports to any OTLP HTTP backend (Opik, Jaeger, Tempo, etc.)
+	OTLPEndpoint     string            `mapstructure:"otlp_endpoint"`      // Full OTLP HTTP URL
+	OTLPHeaders      map[string]string `mapstructure:"otlp_headers"`       // e.g. Authorization: Bearer <key>
+	OTLPInsecure     bool              `mapstructure:"otlp_insecure"`      // Use plaintext HTTP (local dev only)
+	OTLPIncludeSpans []string          `mapstructure:"otlp_include_spans"` // Span name prefixes to export; empty = all
 }
 
 // LoggingConfig holds logging configuration.
@@ -609,6 +700,12 @@ type MCPServerConfig struct {
 	// URL is the server URL (required for http/sse/streamable-http transport)
 	URL string `mapstructure:"url"`
 
+	// Headers are extra HTTP headers for http/sse/streamable-http transport.
+	// Values support ${ENV_VAR} expansion at serve time, so secrets (e.g. an
+	// Authorization bearer token) live in the environment, not the config file:
+	//   headers: { Authorization: "Bearer ${OPENDATA_API_KEY}" }
+	Headers map[string]string `mapstructure:"headers"`
+
 	// EnableSessions enables session management (for streamable-http transport)
 	EnableSessions bool `mapstructure:"enable_sessions"`
 
@@ -646,6 +743,11 @@ type ToolsConfig struct {
 
 	// Permissions holds tool permission configuration
 	Permissions ToolPermissionsConfig `mapstructure:"permissions"`
+
+	// Hooks holds the library admission-policy bindings. Squashed so the
+	// binding list is authored at `tools.hooks` itself (the documented shape),
+	// not nested at `tools.hooks.hooks`.
+	Hooks shuttle.HooksConfig `mapstructure:",squash"`
 
 	// Executor holds tool executor configuration
 	Executor ToolExecutorConfig `mapstructure:"executor"`
@@ -987,6 +1089,15 @@ func LoadConfig(cfgFile string) (*Config, error) {
 	// Non-fatal: keyring might not be available - user can provide secrets via CLI/env
 	_ = loadSecretsFromKeyring(&config)
 
+	// Derive Supabase auth issuer/JWKS URL from the project ref when not set.
+	deriveSupabaseAuthDefaults(&config)
+
+	// Convenience env var for the Supabase storage DB password (shorter than the
+	// nested LOOM_STORAGE_POSTGRES_SUPABASE_DATABASE_PASSWORD).
+	if v := os.Getenv("LOOM_SUPABASE_DB_PASSWORD"); v != "" {
+		config.Storage.Postgres.Supabase.DatabasePassword = v
+	}
+
 	// Fix MCP environment variable case (Viper lowercases all keys)
 	// This must be done after unmarshal to restore original case from YAML
 	configFile := viper.ConfigFileUsed()
@@ -1016,6 +1127,10 @@ func setDefaults() {
 	viper.SetDefault("server.host", "0.0.0.0")
 	viper.SetDefault("server.enable_reflection", true)
 	viper.SetDefault("server.insecure_admin", false)
+	viper.SetDefault("server.allow_time_override", false)
+	viper.SetDefault("server.allow_assistant_override", false)
+	viper.SetDefault("skip_embedded_agents", false)
+	viper.SetDefault("patterns_dir", "")
 
 	// Clarification defaults
 	viper.SetDefault("server.clarification.rpc_timeout_seconds", 5)
@@ -1032,8 +1147,22 @@ func setDefaults() {
 	viper.SetDefault("server.cors.allow_credentials", false) // MUST be false with wildcard origins
 	viper.SetDefault("server.cors.max_age", 86400)           // 24 hours
 
+	// Auth (Supabase JWT). Keys are registered (even empty) so AutomaticEnv binds
+	// e.g. LOOM_SERVER_AUTH_SUPABASE_JWT_SECRET on Unmarshal.
+	viper.SetDefault("server.auth.enabled", false)
+	viper.SetDefault("server.auth.provider", "supabase")
+	viper.SetDefault("server.auth.mode", "required")
+	viper.SetDefault("server.auth.supabase.project_ref", "")
+	viper.SetDefault("server.auth.supabase.jwt_secret", "")
+	viper.SetDefault("server.auth.supabase.jwks_url", "")
+	viper.SetDefault("server.auth.supabase.audience", "authenticated")
+	viper.SetDefault("server.auth.supabase.issuer", "")
+
 	// LLM defaults
 	viper.SetDefault("llm.provider", "anthropic")
+	viper.SetDefault("llm.scheduler_enabled", false)
+	viper.SetDefault("llm.max_active_conversations", 0)
+	viper.SetDefault("llm.max_door_queue", 0)
 	viper.SetDefault("llm.anthropic_model", "claude-sonnet-4-5-20250929")
 	viper.SetDefault("llm.bedrock_region", "us-west-2")
 	viper.SetDefault("llm.bedrock_model_id", "us.anthropic.claude-sonnet-4-5-20250929-v1:0") // Cross-region inference profile
@@ -1069,6 +1198,13 @@ func setDefaults() {
 	viper.SetDefault("storage.postgres.pool.max_idle_time_seconds", 300)
 	viper.SetDefault("storage.postgres.pool.max_lifetime_seconds", 3600)
 	viper.SetDefault("storage.postgres.pool.health_check_interval_seconds", 30)
+	// Supabase storage keys (registered so AutomaticEnv binds them on Unmarshal).
+	viper.SetDefault("storage.postgres.supabase.enabled", false)
+	viper.SetDefault("storage.postgres.supabase.project_ref", "")
+	viper.SetDefault("storage.postgres.supabase.database_password", "")
+	viper.SetDefault("storage.postgres.supabase.region", "")
+	viper.SetDefault("storage.postgres.supabase.pooler_host", "")
+	viper.SetDefault("storage.postgres.supabase.database", "")
 	viper.SetDefault("storage.migration.auto_migrate", true)
 	viper.SetDefault("storage.postgres.soft_delete.grace_period_seconds", 2592000)   // 30 days
 	viper.SetDefault("storage.postgres.soft_delete.cleanup_interval_seconds", 86400) // 1 day
@@ -1175,6 +1311,7 @@ func setDefaults() {
 	viper.SetDefault("artifacts.session_namespacing", true)         // Enable session-based organization
 	viper.SetDefault("artifacts.temp_cleanup_enabled", true)        // Enable temp cleanup
 	viper.SetDefault("artifacts.temp_cleanup_age_days", 7)          // 7-day cleanup for temp artifacts
+	viper.SetDefault("artifacts.session_metadata_enabled", false)   // Opt-in metadata.json integration
 
 	// Shell execute tool defaults
 	viper.SetDefault("tools.shell_execute.restrict_writes", true)        // Enforce write restrictions
@@ -1229,6 +1366,16 @@ func GetSecretMappings() []SecretMapping {
 			KeyringKey: "hawk_api_key",
 			Setter:     func(c *Config, val string) { c.Observability.HawkAPIKey = val },
 			IsSet:      func(c *Config) bool { return c.Observability.HawkAPIKey != "" },
+		},
+		{
+			KeyringKey: "supabase_jwt_secret",
+			Setter:     func(c *Config, val string) { c.Server.Auth.Supabase.JWTSecret = val },
+			IsSet:      func(c *Config) bool { return c.Server.Auth.Supabase.JWTSecret != "" },
+		},
+		{
+			KeyringKey: "supabase_db_password",
+			Setter:     func(c *Config, val string) { c.Storage.Postgres.Supabase.DatabasePassword = val },
+			IsSet:      func(c *Config) bool { return c.Storage.Postgres.Supabase.DatabasePassword != "" },
 		},
 		{
 			KeyringKey: "openai_api_key",
@@ -1328,6 +1475,65 @@ func GetSecretMappings() []SecretMapping {
 	}
 }
 
+// validateAuth checks the endpoint authentication configuration when enabled.
+func (c *Config) validateAuth() error {
+	a := c.Server.Auth
+	if !a.Enabled {
+		return nil
+	}
+	if a.Provider != "supabase" {
+		return fmt.Errorf("server.auth.provider %q not supported (only \"supabase\")", a.Provider)
+	}
+	if a.Mode != "required" && a.Mode != "optional" {
+		return fmt.Errorf("server.auth.mode must be \"required\" or \"optional\" (got %q)", a.Mode)
+	}
+	if a.Supabase.JWTSecret == "" && a.Supabase.JWKSURL == "" {
+		return fmt.Errorf("server.auth requires a verification source: set server.auth.supabase.jwt_secret (HS256) " +
+			"via LOOM_SERVER_AUTH_SUPABASE_JWT_SECRET/keyring, or server.auth.supabase.project_ref (derives JWKS)")
+	}
+	if a.Supabase.Issuer == "" || a.Supabase.Audience == "" {
+		return fmt.Errorf("server.auth requires issuer and audience: set server.auth.supabase.project_ref to derive them, or set them explicitly")
+	}
+	// Tokens must not traverse a non-loopback interface in plaintext.
+	if !c.Server.TLS.Enabled && !isLoopbackHost(c.Server.Host) {
+		return fmt.Errorf("server.auth.enabled requires TLS when server.host is not loopback (got %q); "+
+			"set server.tls.enabled=true or bind server.host to 127.0.0.1", c.Server.Host)
+	}
+	return nil
+}
+
+// isLoopbackHost reports whether a server host binds only the loopback interface.
+// An empty host binds all interfaces and is therefore NOT loopback.
+func isLoopbackHost(host string) bool {
+	switch host {
+	case "127.0.0.1", "::1", "localhost":
+		return true
+	case "":
+		return false
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback()
+	}
+	return false
+}
+
+// deriveSupabaseAuthDefaults fills in the Supabase JWKS URL and issuer from the
+// project ref when they are not explicitly configured. Supabase exposes its
+// JWKS at https://<ref>.supabase.co/auth/v1/.well-known/jwks.json and signs
+// tokens with issuer https://<ref>.supabase.co/auth/v1.
+func deriveSupabaseAuthDefaults(config *Config) {
+	sb := &config.Server.Auth.Supabase
+	if sb.ProjectRef == "" {
+		return
+	}
+	if sb.JWKSURL == "" {
+		sb.JWKSURL = fmt.Sprintf("https://%s.supabase.co/auth/v1/.well-known/jwks.json", sb.ProjectRef)
+	}
+	if sb.Issuer == "" {
+		sb.Issuer = fmt.Sprintf("https://%s.supabase.co/auth/v1", sb.ProjectRef)
+	}
+}
+
 // loadSecretsFromKeyring loads API keys from system keyring using the secret mappings.
 // This is extensible - just add more entries to GetSecretMappings().
 func loadSecretsFromKeyring(config *Config) error {
@@ -1418,6 +1624,10 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("invalid port: %d (must be 1-65535)", c.Server.Port)
 	}
 
+	if err := c.validateAuth(); err != nil {
+		return err
+	}
+
 	// Validate LLM config
 	if c.LLM.Provider == "" {
 		return fmt.Errorf("llm.provider is required")
@@ -1478,8 +1688,22 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("huggingface token is required (set LOOM_LLM_HUGGINGFACE_TOKEN, HUGGINGFACE_API_KEY, or save to keyring with 'looms config set-key huggingface_token')")
 		}
 
+	case "litellm":
+		// endpoint and API key are optional — defaults apply
+
 	default:
-		return fmt.Errorf("unsupported LLM provider: %s (must be anthropic, bedrock, ollama, openai, azure-openai, mistral, gemini, or huggingface)", c.LLM.Provider)
+		return fmt.Errorf("unsupported LLM provider: %s (must be anthropic, bedrock, ollama, openai, azure-openai, mistral, gemini, huggingface, or litellm)", c.LLM.Provider)
+	}
+
+	// Door admission knobs: a negative value is a configuration error, not a
+	// silent disable (max_active_conversations) or an unbounded queue
+	// (max_door_queue). Zero keeps its documented meaning: gate off /
+	// unbounded queueing.
+	if c.LLM.MaxActiveConversations < 0 {
+		return fmt.Errorf("llm.max_active_conversations must be >= 0, got %d (0 disables the door gate)", c.LLM.MaxActiveConversations)
+	}
+	if c.LLM.MaxDoorQueue < 0 {
+		return fmt.Errorf("llm.max_door_queue must be >= 0, got %d (0 means unbounded queueing)", c.LLM.MaxDoorQueue)
 	}
 
 	// Validate storage config
@@ -1516,7 +1740,18 @@ func (c *Config) Validate() error {
 	if c.Observability.Enabled {
 		mode := c.Observability.Mode
 		if mode == "" {
-			mode = "service" // Default to service mode for backward compatibility
+			// Resolve an empty mode the same way the tracer builder does (see
+			// cmd_serve.go): "service" only when a Hawk endpoint is configured,
+			// otherwise "embedded". This keeps Validate() in step with what the
+			// server actually runs, so enabling observability without an explicit
+			// mode or endpoint validates as embedded instead of being rejected.
+			if c.Observability.OTLPEndpoint != "" {
+				mode = "otel"
+			} else if c.Observability.HawkEndpoint != "" {
+				mode = "service"
+			} else {
+				mode = "embedded"
+			}
 		}
 
 		switch mode {
@@ -1535,10 +1770,17 @@ func (c *Config) Validate() error {
 				return fmt.Errorf("observability.hawk_endpoint is required when mode=service")
 			}
 			// Note: HawkAPIKey is optional - not required for local Hawk installations
+		case "otel":
+			// OTel mode: validate endpoint — also accept the platform env var
+			// injected by AgentOpsCore at deploy time (OTEL_EXPORTER_OTLP_TRACES_ENDPOINT).
+			// cmd_serve.go will apply this override before building the tracer.
+			if c.Observability.OTLPEndpoint == "" && observability.ResolveOTLPEndpointEnv() == "" {
+				return fmt.Errorf("observability.otlp_endpoint is required when mode=otel (set otlp_endpoint, OTEL_EXPORTER_OTLP_TRACES_ENDPOINT, OTEL_EXPORTER_OTLP_ENDPOINT, or LOOM_OTLP_ENDPOINT)")
+			}
 		case "none":
 			// No-op mode: no validation needed
 		default:
-			return fmt.Errorf("observability.mode must be 'embedded', 'service', or 'none' (got: %s)", mode)
+			return fmt.Errorf("observability.mode must be 'embedded', 'service', 'otel', or 'none' (got: %s)", mode)
 		}
 	}
 
@@ -1589,6 +1831,17 @@ func (c *Config) BuildProtoStorageConfig() *loomv1.StorageConfig {
 					CleanupIntervalSeconds: pg.SoftDelete.CleanupIntervalSeconds,
 				},
 				RequireUserId: pg.RequireUserID,
+				Supabase: &loomv1.SupabaseConfig{
+					Enabled:          pg.Supabase.Enabled,
+					ProjectUrl:       pg.Supabase.ProjectURL,
+					AnonKey:          pg.Supabase.AnonKey,
+					ServiceRoleKey:   pg.Supabase.ServiceRoleKey,
+					ProjectRef:       pg.Supabase.ProjectRef,
+					DatabasePassword: pg.Supabase.DatabasePassword,
+					Region:           pg.Supabase.Region,
+					PoolerHost:       pg.Supabase.PoolerHost,
+					Database:         pg.Supabase.Database,
+				},
 			},
 			Migration: &loomv1.MigrationConfig{
 				AutoMigrate:   c.Storage.Migration.AutoMigrate,
@@ -1623,6 +1876,8 @@ server:
   host: 0.0.0.0
   enable_reflection: true
   # insecure_admin: false  # Set to true to allow admin endpoints without LOOM_ADMIN_TOKEN (NOT recommended for production)
+  # allow_time_override: false  # Set to true to honor WeaveRequest.occurred_at (replayed/imported conversations only)
+  # allow_assistant_override: false  # Set to true to honor WeaveRequest.replay_assistant_message (generation-free conversation replay only)
 
 llm:
   # Provider options: anthropic, bedrock, ollama, openai, azure-openai, mistral
@@ -1666,6 +1921,11 @@ llm:
   # HuggingFace configuration
   huggingface_model: meta-llama/Meta-Llama-3.1-70B-Instruct
   # huggingface_token: set via keyring (looms config set-key huggingface_token)
+
+  # LiteLLM proxy configuration
+  # litellm_endpoint: http://litellm:4000/v1/chat/completions
+  # litellm_model: anthropic/claude-sonnet-4-5-20250929
+  # litellm_api_key: set via keyring (looms config set-key litellm_api_key)
 
   # Common generation parameters (apply to all providers)
   temperature: 1.0

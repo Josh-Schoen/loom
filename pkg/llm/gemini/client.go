@@ -22,18 +22,12 @@ import (
 	"io"
 	"net/http"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/teradata-labs/loom/pkg/llm"
+	"github.com/teradata-labs/loom/pkg/llm/catalog"
 	llmtypes "github.com/teradata-labs/loom/pkg/llm/types"
 	"github.com/teradata-labs/loom/pkg/shuttle"
-)
-
-// Global singleton rate limiter shared across all Gemini clients
-var (
-	globalRateLimiter     *llm.RateLimiter
-	globalRateLimiterOnce sync.Once
 )
 
 // Client implements the LLMProvider interface for Google Gemini.
@@ -87,7 +81,7 @@ func NewClient(config Config) *Client {
 	// Initialize rate limiter if enabled
 	var rateLimiter *llm.RateLimiter
 	if config.RateLimiterConfig.Enabled {
-		rateLimiter = getOrCreateGlobalRateLimiter(config.RateLimiterConfig)
+		rateLimiter = llm.SharedRateLimiter("gemini|"+llm.CredentialScope(config.APIKey)+"|"+config.Model, config.RateLimiterConfig)
 	}
 
 	return &Client{
@@ -100,14 +94,6 @@ func NewClient(config Config) *Client {
 			Timeout: config.Timeout,
 		},
 	}
-}
-
-// getOrCreateGlobalRateLimiter returns the global rate limiter, creating it if necessary.
-func getOrCreateGlobalRateLimiter(config llm.RateLimiterConfig) *llm.RateLimiter {
-	globalRateLimiterOnce.Do(func() {
-		globalRateLimiter = llm.NewRateLimiter(config)
-	})
-	return globalRateLimiter
 }
 
 // Name returns the provider name.
@@ -174,31 +160,23 @@ func (c *Client) callAPI(ctx context.Context, req *GenerateContentRequest) (*Gen
 		return nil, fmt.Errorf("failed to marshal request: %w", err)
 	}
 
-	// Create HTTP request
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", apiURL, bytes.NewReader(body))
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
-	}
-
-	// Set headers
-	httpReq.Header.Set("Content-Type", "application/json")
-
-	// Send request with rate limiting if enabled
+	// Send request with rate limiting if enabled. sendOnce rebuilds the
+	// http.Request per attempt and surfaces 429 as a throttle error so the
+	// limiter's retry fires (and each retry re-sends the full body).
 	var httpResp *http.Response
+	sendOnce := c.sendOnce(apiURL, body)
 	if c.rateLimiter != nil {
-		result, err := c.rateLimiter.Do(ctx, func(ctx context.Context) (interface{}, error) {
-			return c.httpClient.Do(httpReq)
-		})
+		result, err := c.rateLimiter.Do(ctx, sendOnce)
 		if err != nil {
 			return nil, fmt.Errorf("HTTP request failed: %w", err)
 		}
 		httpResp = result.(*http.Response)
 	} else {
-		var err error
-		httpResp, err = c.httpClient.Do(httpReq)
+		result, err := sendOnce(ctx)
 		if err != nil {
 			return nil, fmt.Errorf("HTTP request failed: %w", err)
 		}
+		httpResp = result.(*http.Response)
 	}
 	defer func() { _ = httpResp.Body.Close() }()
 
@@ -227,14 +205,47 @@ func (c *Client) callAPI(ctx context.Context, req *GenerateContentRequest) (*Gen
 	return &resp, nil
 }
 
+// sendOnce returns a closure that builds and sends ONE fresh HTTP request per
+// attempt. It must construct a new http.Request each time — a consumed body
+// cannot be re-sent, so a retry of a request built once outside the closure
+// would go out empty. It also surfaces HTTP 429 as an ERROR carrying any
+// server-specified wait (Retry-After and friends): httpClient.Do returns nil
+// error for any HTTP status, so without this the rate limiter's retry never
+// sees throttling and 429s go straight to the caller un-retried.
+func (c *Client) sendOnce(apiURL string, body []byte) func(context.Context) (interface{}, error) {
+	return func(ctx context.Context) (interface{}, error) {
+		httpReq, err := http.NewRequestWithContext(ctx, "POST", apiURL, bytes.NewReader(body))
+		if err != nil {
+			return nil, fmt.Errorf("failed to create request: %w", err)
+		}
+		httpReq.Header.Set("Content-Type", "application/json")
+		resp, err := c.httpClient.Do(httpReq)
+		if err != nil {
+			return nil, err
+		}
+		if resp.StatusCode == http.StatusTooManyRequests {
+			respBody, _ := io.ReadAll(resp.Body)
+			_ = resp.Body.Close()
+			return nil, llm.NewThrottleError(
+				fmt.Errorf("API error (status 429): %s", string(respBody)),
+				llm.RetryAfterFromHeaders(resp.Header))
+		}
+		return resp, nil
+	}
+}
+
 // convertResponse converts Gemini response to agent format.
 func (c *Client) convertResponse(resp *GenerateContentResponse) *llmtypes.LLMResponse {
 	llmResp := &llmtypes.LLMResponse{
 		Usage: llmtypes.Usage{
-			InputTokens:  resp.UsageMetadata.PromptTokenCount,
+			// InputTokens/TotalTokens exclude cached tokens (loom convention);
+			// cost stays on the raw promptTokenCount, which calculateCost prices.
+			InputTokens:  resp.UsageMetadata.UncachedPromptTokens(),
 			OutputTokens: resp.UsageMetadata.CandidatesTokenCount,
-			TotalTokens:  resp.UsageMetadata.TotalTokenCount,
-			CostUSD:      c.calculateCost(resp.UsageMetadata.PromptTokenCount, resp.UsageMetadata.CandidatesTokenCount),
+			TotalTokens:  resp.UsageMetadata.UncachedTotalTokens(),
+			// Gemini meters cached tokens against rate limits.
+			RateLimitTokens: resp.UsageMetadata.MeteredTokens(),
+			CostUSD:         c.calculateCost(resp.UsageMetadata.PromptTokenCount, resp.UsageMetadata.CandidatesTokenCount),
 			// Gemini implicit caching (automatic since May 2025): map to CacheReadInputTokens for observability.
 			// Note: for Gemini, cached tokens still count against rate limits (cost savings only, not rate limit relief).
 			CacheReadInputTokens: resp.UsageMetadata.CachedContentTokenCount,
@@ -308,36 +319,39 @@ func (c *Client) convertResponse(resp *GenerateContentResponse) *llmtypes.LLMRes
 //
 // Note: Prices may vary. Check https://ai.google.dev/pricing for current rates.
 func (c *Client) calculateCost(inputTokens, outputTokens int) float64 {
-	var inputCostPerM, outputCostPerM float64
+	// The catalog (pkg/llm/catalog) is the source of truth for pricing. Fall back
+	// to the provider-local rates below only for model ids it does not list.
+	inputCostPerM, outputCostPerM, ok := catalog.LookupPricing("gemini", c.model)
+	if !ok {
+		switch c.model {
+		case "gemini-3-pro-preview", "gemini-3-pro":
+			// Use mid-range pricing (average of ≤200k and >200k tiers)
+			inputCostPerM = 3.00
+			outputCostPerM = 15.00
 
-	switch c.model {
-	case "gemini-3-pro-preview", "gemini-3-pro":
-		// Use mid-range pricing (average of ≤200k and >200k tiers)
-		inputCostPerM = 3.00
-		outputCostPerM = 15.00
+		case "gemini-3-flash-preview", "gemini-3-flash":
+			// Free during preview
+			inputCostPerM = 0.0
+			outputCostPerM = 0.0
 
-	case "gemini-3-flash-preview", "gemini-3-flash":
-		// Free during preview
-		inputCostPerM = 0.0
-		outputCostPerM = 0.0
+		case "gemini-2.5-pro":
+			// Use mid-range pricing
+			inputCostPerM = 1.875
+			outputCostPerM = 12.50
 
-	case "gemini-2.5-pro":
-		// Use mid-range pricing
-		inputCostPerM = 1.875
-		outputCostPerM = 12.50
+		case "gemini-2.5-flash":
+			inputCostPerM = 0.30
+			outputCostPerM = 2.50
 
-	case "gemini-2.5-flash":
-		inputCostPerM = 0.30
-		outputCostPerM = 2.50
+		case "gemini-2.5-flash-lite":
+			inputCostPerM = 0.10
+			outputCostPerM = 0.40
 
-	case "gemini-2.5-flash-lite":
-		inputCostPerM = 0.10
-		outputCostPerM = 0.40
-
-	default:
-		// Default to 2.5 Flash pricing for unknown models
-		inputCostPerM = 0.30
-		outputCostPerM = 2.50
+		default:
+			// Default to 2.5 Flash pricing for unknown models
+			inputCostPerM = 0.30
+			outputCostPerM = 2.50
+		}
 	}
 
 	inputCost := float64(inputTokens) * inputCostPerM / 1_000_000
@@ -576,31 +590,23 @@ func (c *Client) ChatStream(ctx context.Context, messages []llmtypes.Message,
 		return nil, fmt.Errorf("failed to marshal request: %w", err)
 	}
 
-	// Create HTTP request
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", apiURL, bytes.NewReader(body))
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
-	}
-
-	// Set headers
-	httpReq.Header.Set("Content-Type", "application/json")
-
-	// Send request with rate limiting if enabled
+	// Send request with rate limiting if enabled. sendOnce rebuilds the
+	// http.Request per attempt and surfaces 429 as a throttle error so the
+	// limiter's retry fires (and each retry re-sends the full body).
 	var httpResp *http.Response
+	sendOnce := c.sendOnce(apiURL, body)
 	if c.rateLimiter != nil {
-		result, err := c.rateLimiter.Do(ctx, func(ctx context.Context) (interface{}, error) {
-			return c.httpClient.Do(httpReq)
-		})
+		result, err := c.rateLimiter.Do(ctx, sendOnce)
 		if err != nil {
 			return nil, fmt.Errorf("HTTP request failed: %w", err)
 		}
 		httpResp = result.(*http.Response)
 	} else {
-		var err error
-		httpResp, err = c.httpClient.Do(httpReq)
+		result, err := sendOnce(ctx)
 		if err != nil {
 			return nil, fmt.Errorf("HTTP request failed: %w", err)
 		}
+		httpResp = result.(*http.Response)
 	}
 	defer func() { _ = httpResp.Body.Close() }()
 
@@ -613,6 +619,8 @@ func (c *Client) ChatStream(ctx context.Context, messages []llmtypes.Message,
 	// 3. Process Server-Sent Events stream
 	var contentBuffer strings.Builder
 	usage := llmtypes.Usage{}
+	// Raw promptTokenCount / totalTokenCount (cache-inclusive) from the last usage chunk.
+	var promptTokens, rawTotalTokens int
 	var finishReason string
 	tokenCount := 0
 	var toolCalls []llmtypes.ToolCall
@@ -657,8 +665,10 @@ func (c *Client) ChatStream(ctx context.Context, messages []llmtypes.Message,
 					}
 				}
 
-				// Extract tool calls
+				// Extract tool calls. A function-call part never reaches
+				// tokenCallback (text only); report it as stream activity.
 				if part.FunctionCall != nil {
+					llmtypes.NotifyStreamActivity(ctx)
 					reversedName := llm.ReverseToolName(c.toolNameMap, part.FunctionCall.Name)
 					toolCalls = append(toolCalls, llmtypes.ToolCall{
 						ID:               reversedName,
@@ -677,9 +687,12 @@ func (c *Client) ChatStream(ctx context.Context, messages []llmtypes.Message,
 
 		// Extract usage metadata
 		if chunk.UsageMetadata.TotalTokenCount > 0 {
-			usage.InputTokens = chunk.UsageMetadata.PromptTokenCount
+			promptTokens = chunk.UsageMetadata.PromptTokenCount
+			rawTotalTokens = chunk.UsageMetadata.TotalTokenCount
+			usage.InputTokens = chunk.UsageMetadata.UncachedPromptTokens()
 			usage.OutputTokens = chunk.UsageMetadata.CandidatesTokenCount
-			usage.TotalTokens = chunk.UsageMetadata.TotalTokenCount
+			usage.TotalTokens = chunk.UsageMetadata.UncachedTotalTokens()
+			usage.RateLimitTokens = chunk.UsageMetadata.MeteredTokens()
 			// Track Gemini implicit cache hits for observability
 			usage.CacheReadInputTokens = chunk.UsageMetadata.CachedContentTokenCount
 		}
@@ -697,15 +710,17 @@ func (c *Client) ChatStream(ctx context.Context, messages []llmtypes.Message,
 	}
 
 	// 4. Build final response
-	if usage.TotalTokens == 0 {
+	if rawTotalTokens == 0 {
 		usage.OutputTokens = tokenCount
 		usage.TotalTokens = tokenCount
 	}
-	usage.CostUSD = c.calculateCost(usage.InputTokens, usage.OutputTokens)
+	// Cost and the rate limiter take the raw promptTokenCount: calculateCost is
+	// cache-blind, and Gemini cached tokens still count against rate limits.
+	usage.CostUSD = c.calculateCost(promptTokens, usage.OutputTokens)
 
 	// Record token usage for rate limiter metrics
 	if c.rateLimiter != nil {
-		totalTokens := int64(usage.InputTokens + usage.OutputTokens)
+		totalTokens := int64(promptTokens + usage.OutputTokens)
 		c.rateLimiter.RecordTokenUsage(totalTokens)
 	}
 

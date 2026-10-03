@@ -14,9 +14,11 @@
 package agent
 
 import (
+	"context"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestGetModelContextLimits(t *testing.T) {
@@ -264,14 +266,34 @@ func TestResolveContextLimits(t *testing.T) {
 			description:        "Fall back to conservative system default",
 		},
 		{
-			name:               "Versioned model (prefix match)",
+			// A tagged Ollama ID now resolves through catalog.Lookup, which
+			// retries with the tag stripped after an exact miss, so it lands on
+			// the "llama3.1" catalog entry and reserves that entry's documented
+			// MaxOutputTokens (8192). Before tag-tolerant lookup this fell
+			// through to the legacy GetModelContextLimits table, which reserved
+			// a flat 10% (12800) instead. The untagged "llama3.1" already
+			// resolved to 8192, so this makes the tagged and untagged forms of
+			// the same model agree; the context window is 128000 either way.
+			name:               "Versioned model (tag-stripped catalog match)",
 			provider:           "ollama",
 			model:              "llama3.1:70b-instruct",
 			configuredMax:      0,
 			configuredReserved: 0,
 			expectedMax:        128000,
-			expectedReserved:   12800,
-			description:        "Prefix matching works for versioned models",
+			expectedReserved:   8192,
+			description:        "Tagged Ollama IDs resolve to their catalog entry's documented max output",
+		},
+		{
+			// A tagged model with no catalog entry under any tag still falls
+			// through to the legacy prefix table, so that path is not dead.
+			name:               "Versioned model with no catalog entry (legacy prefix match)",
+			provider:           "ollama",
+			model:              "llama2:70b",
+			configuredMax:      0,
+			configuredReserved: 0,
+			expectedMax:        4096,
+			expectedReserved:   409,
+			description:        "Legacy prefix matching still handles models absent from the catalog",
 		},
 	}
 
@@ -316,4 +338,128 @@ func TestModelPrefixMatching(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestEffectiveOutputReservation covers the §5.1 invariant: the reservation the
+// marks subtract must cover the request's real max_tokens, whichever build path
+// resolved it, so `usable` is never larger than the provider's real ceiling.
+func TestEffectiveOutputReservation(t *testing.T) {
+	tests := []struct {
+		name              string
+		provider, model   string
+		configuredMax     int // llm.max_tokens (the wire value)
+		configuredReserve int // llm.reserved_output_tokens
+		maxContext        int
+		want              int
+	}{
+		{
+			name:       "explicit wire max_tokens dominates the 10% default",
+			provider:   "anthropic",
+			model:      "unknown-model",
+			maxContext: 200000,
+			// 10% would be 20000; the request really sends 64000.
+			configuredMax: 64000,
+			want:          64000,
+		},
+		{
+			name:       "catalog output cap covers the factory path when max_tokens is unset",
+			provider:   "anthropic",
+			model:      "claude-sonnet-4-6", // catalog: 64000 max output
+			maxContext: 200000,
+			want:       64000, // not the 20000 the 10% default would give
+		},
+		{
+			name:              "explicit reserve wins when it is the largest",
+			provider:          "anthropic",
+			model:             "unknown-model",
+			maxContext:        200000,
+			configuredMax:     8000,
+			configuredReserve: 30000,
+			want:              30000,
+		},
+		{
+			name:       "10% default stands for an unknown model with no wire override",
+			provider:   "custom",
+			model:      "unknown-model",
+			maxContext: 100000,
+			want:       10000,
+		},
+		{
+			name:          "reserve never claims the whole window",
+			provider:      "custom",
+			model:         "unknown-model",
+			maxContext:    48000,
+			configuredMax: 64000, // larger than the window itself
+			want:          24000, // capped at half, leaving a working budget
+		},
+		{
+			name: "nothing known returns zero so callers keep their defaults",
+			want: 0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := EffectiveOutputReservation(tt.provider, tt.model,
+				tt.configuredMax, tt.configuredReserve, tt.maxContext)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+// TestEffectiveOutputReservation_MarksStayBelowRefusalLine is the end-to-end
+// property: with the reservation applied, the relief start mark sits below the
+// provider's ceiling (window − max_tokens), so proactive relief fires before a
+// refusal instead of after it.
+func TestEffectiveOutputReservation_MarksStayBelowRefusalLine(t *testing.T) {
+	const window, wireMaxTokens = 200000, 64000
+
+	reserve := EffectiveOutputReservation("anthropic", "claude-sonnet-4-6", wireMaxTokens, 0, window)
+	sm := NewSegmentedMemory("ROM", window, reserve)
+
+	sm.mu.Lock()
+	start := sm.startMarkLocked(0)
+	sm.mu.Unlock()
+
+	refusalLine := window - wireMaxTokens
+	assert.LessOrEqual(t, start, refusalLine,
+		"the start mark must sit at or below window − max_tokens, or relief can never fire")
+
+	// The pre-fix 10% reserve put the mark above the line — guard the regression.
+	stale := NewSegmentedMemory("ROM", window, window/10)
+	stale.mu.Lock()
+	staleStart := stale.startMarkLocked(0)
+	stale.mu.Unlock()
+	assert.Greater(t, staleStart, refusalLine,
+		"precondition: the 10% reserve is exactly the geometry this fix corrects")
+}
+
+// TestNewAgent_DoesNotClobberComputedReservation reproduces the server's build
+// order: the caller computes the effective reservation onto the Memory, then
+// NewAgent re-applies SetContextLimits from its config. A zero in the config
+// must not erase the computed value — otherwise the reserve falls back to
+// window/10 and the relief marks land above the provider's refusal line.
+func TestNewAgent_DoesNotClobberComputedReservation(t *testing.T) {
+	const window, effectiveReserve = 200000, 64000
+
+	m := NewMemory()
+	m.SetContextLimits(window, effectiveReserve) // what cmd_serve computes
+
+	ag := NewAgent(nil, nil,
+		WithMemory(m),
+		WithConfig(&Config{MaxContextTokens: window}), // ReservedOutputTokens unset
+	)
+
+	sess := ag.memory.GetOrCreateSession(context.Background(), "reserve-session")
+	segMem, ok := sess.SegmentedMem.(*SegmentedMemory)
+	require.True(t, ok)
+
+	segMem.mu.Lock()
+	defer segMem.mu.Unlock()
+	assert.Equal(t, effectiveReserve, segMem.tokenBudget.ReservedTokens,
+		"the computed reservation survives agent construction")
+	assert.Equal(t, window-effectiveReserve, segMem.usableLocked(),
+		"usable is window minus the real output reservation")
+	assert.Less(t, segMem.startMarkLocked(0), window-effectiveReserve,
+		"the start mark stays below the provider's refusal line")
 }

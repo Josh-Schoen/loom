@@ -105,6 +105,90 @@ func TestExecutor_Execute_ToolNotFound(t *testing.T) {
 	}
 }
 
+// TestExecutor_Execute_ResolvesServerPrefixedSuffix verifies that a tool
+// registered under a server-qualified name (e.g. "server:tool_name") can
+// still be called by its plain unprefixed name.
+func TestExecutor_Execute_ResolvesServerPrefixedSuffix(t *testing.T) {
+	reg := NewRegistry()
+	exec := NewExecutor(reg)
+
+	tool := &MockTool{MockName: "teradata-aiop-mcp-server:base_readQuery"}
+	reg.Register(tool)
+
+	result, err := exec.Execute(context.Background(), "base_readQuery", nil)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.Equal(t, 1, tool.ExecuteCount)
+}
+
+// TestExecutor_Execute_ResolvesSanitizedQualifiedName verifies that a tool
+// registered under a server-qualified name (e.g. "server:tool_name") can
+// still be called by its LLM-sanitized form (colon replaced with underscore),
+// since some providers reject ':' in tool names (see llm.SanitizeToolName)
+// and callers may re-derive the sanitized name instead of using the
+// provider's reverse-mapped original.
+func TestExecutor_Execute_ResolvesSanitizedQualifiedName(t *testing.T) {
+	reg := NewRegistry()
+	exec := NewExecutor(reg)
+
+	tool := &MockTool{MockName: "teradata-aiop-mcp-server:base_readQuery"}
+	reg.Register(tool)
+
+	result, err := exec.Execute(context.Background(), "teradata-aiop-mcp-server_base_readQuery", nil)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.Equal(t, 1, tool.ExecuteCount)
+}
+
+func TestExecutor_Execute_AliasCannotBypassCanonicalDisabledTool(t *testing.T) {
+	tests := []struct {
+		name     string
+		callName string
+	}{
+		{name: "plain suffix", callName: "base_writeQuery"},
+		{name: "sanitized qualified name", callName: "teradata-aiop-mcp-server_base_writeQuery"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			reg := NewRegistry()
+			exec := NewExecutor(reg)
+			tool := &MockTool{MockName: "teradata-aiop-mcp-server:base_writeQuery"}
+			reg.Register(tool)
+			exec.SetPermissionChecker(NewPermissionChecker(PermissionConfig{
+				DisabledTools: []string{tool.Name()},
+			}))
+
+			result, err := exec.Execute(context.Background(), tt.callName, nil)
+
+			require.NoError(t, err)
+			require.NotNil(t, result)
+			require.False(t, result.Success)
+			require.Equal(t, "permission_denied", result.Error.Code)
+			require.Equal(t, 0, tool.ExecuteCount)
+		})
+	}
+}
+
+func TestExecutorCanonicalToolNameResolvesUniqueSuffixBeforeExecution(t *testing.T) {
+	registry := NewRegistry()
+	registry.Register(&mockTool{name: "server:query"})
+	executor := NewExecutor(registry)
+
+	require.Equal(t, "server:query", executor.CanonicalToolName("query"))
+	require.Equal(t, "server:query", executor.CanonicalToolName("server_query"))
+}
+
+func TestExecutor_Execute_RejectsAmbiguousServerPrefixedSuffix(t *testing.T) {
+	reg := NewRegistry()
+	exec := NewExecutor(reg)
+	reg.Register(&MockTool{MockName: "server-b:search"})
+	reg.Register(&MockTool{MockName: "server-a:search"})
+
+	_, err := exec.Execute(context.Background(), "search", nil)
+	require.EqualError(t, err, "tool not found: search (dynamic registration failed: ambiguous tool name \"search\" matches server-a:search, server-b:search)")
+}
+
 func TestExecutor_Execute_ToolError(t *testing.T) {
 	reg := NewRegistry()
 	tool := &errorTool{name: "error"}
@@ -376,7 +460,7 @@ func TestExecutor_HandleLargeParameters(t *testing.T) {
 			"bool":         true,
 		}
 
-		result, err := exec.handleLargeParameters(params)
+		result, err := exec.handleLargeParameters(context.Background(), params)
 		if err != nil {
 			t.Fatalf("handleLargeParameters() error = %v", err)
 		}
@@ -401,7 +485,7 @@ func TestExecutor_HandleLargeParameters(t *testing.T) {
 			"small_param": "small",
 		}
 
-		result, err := exec.handleLargeParameters(params)
+		result, err := exec.handleLargeParameters(context.Background(), params)
 		if err != nil {
 			t.Fatalf("handleLargeParameters() error = %v", err)
 		}
@@ -438,7 +522,7 @@ func TestExecutor_HandleLargeParameters(t *testing.T) {
 			"large3": strings.Repeat("c", 5000),
 		}
 
-		result, err := exec.handleLargeParameters(params)
+		result, err := exec.handleLargeParameters(context.Background(), params)
 		if err != nil {
 			t.Fatalf("handleLargeParameters() error = %v", err)
 		}
@@ -457,7 +541,7 @@ func TestExecutor_HandleLargeParameters(t *testing.T) {
 			"large_param": strings.Repeat("a", 5000),
 		}
 
-		result, err := execNoMem.handleLargeParameters(params)
+		result, err := execNoMem.handleLargeParameters(context.Background(), params)
 		if err != nil {
 			t.Fatalf("handleLargeParameters() error = %v", err)
 		}
@@ -489,7 +573,7 @@ func TestExecutor_DereferenceLargeParameters(t *testing.T) {
 			"bool":   true,
 		}
 
-		result, err := exec.dereferenceLargeParameters(params)
+		result, err := exec.dereferenceLargeParameters(context.Background(), params)
 		if err != nil {
 			t.Fatalf("dereferenceLargeParameters() error = %v", err)
 		}
@@ -507,7 +591,7 @@ func TestExecutor_DereferenceLargeParameters(t *testing.T) {
 		// First, store data in shared memory
 		largeContent := strings.Repeat("test", 1000) // 4KB
 		id := storage.GenerateID()
-		ref, err := sharedMem.Store(id, []byte("\""+largeContent+"\""), "application/json", nil)
+		ref, err := sharedMem.Store(id, []byte("\""+largeContent+"\""), "application/json", nil, "")
 		if err != nil {
 			t.Fatalf("Failed to store: %v", err)
 		}
@@ -517,7 +601,7 @@ func TestExecutor_DereferenceLargeParameters(t *testing.T) {
 			"small_param": "small",
 		}
 
-		result, err := exec.dereferenceLargeParameters(params)
+		result, err := exec.dereferenceLargeParameters(context.Background(), params)
 		if err != nil {
 			t.Fatalf("dereferenceLargeParameters() error = %v", err)
 		}
@@ -544,7 +628,7 @@ func TestExecutor_DereferenceLargeParameters(t *testing.T) {
 			"invalid": invalidRef,
 		}
 
-		_, err := exec.dereferenceLargeParameters(params)
+		_, err := exec.dereferenceLargeParameters(context.Background(), params)
 		if err == nil {
 			t.Error("Expected error for invalid reference")
 		}

@@ -4,7 +4,7 @@ Salience-driven graph-backed episodic memory for persistent, cross-session agent
 
 **Target Audience**: Architects, academics, and advanced developers
 
-**Version**: v1.2.0
+**Version**: v1.3.0
 
 **Status**: ✅ Implemented (merged to main)
 
@@ -313,9 +313,11 @@ Two relation types:
 
 **Salience Model**:
 - Initial salience set at creation (default 0.5, range 0.0-1.0)
-- **Time decay**: `salience *= decay_rate` per day (default 0.995)
-- **Access boost**: `salience = min(1.0, salience + boost_amount)` on each access (default 0.05)
+- **Time decay**: `salience *= decay_rate` per day (`pkg/memory/salience.go` package default `DefaultDecayRate = 0.995`)
+- **Access boost**: `salience = min(1.0, salience + boost_amount)` on each access (`pkg/memory/salience.go` `DefaultBoostAmount = 0.05`)
 - **DecayAll**: Batch operation applying decay factor to all memories for an agent
+
+> Note: the agent-level `DefaultGraphMemoryConfig()` (`pkg/agent/config_loader.go:877`) applies its own defaults of `decay_rate=0.95` and `boost_amount=0.1`, which override the `pkg/memory/salience.go` package constants when an agent is constructed. See the [Configuration](#configuration) section.
 
 **Ranking Formula** (for recall):
 ```
@@ -374,9 +376,9 @@ Uses multiplicative combination (`CombineScores` in `pkg/memory/salience.go:122`
 
 **Token Budget**: Controlled by config. Default: 20% of context window (200K * 20% = 40K tokens). Can be overridden with absolute `max_context_tokens`. Within `ContextFor()`, the budget is allocated in three phases: entity profile (200 tokens reserved), graph neighborhood (300 tokens reserved), and remaining budget for ranked memories via `AllocateMemoryBudget()` in `pkg/memory/budget.go`.
 
-**System Prompt Supplement**: When graph memory is enabled, `graphMemoryPromptSupplement()` appends usage instructions to the agent's system prompt. This teaches the agent when and how to use the `graph_memory` tool (store, retrieve, update, remove, graph, context actions) without requiring manual prompt engineering.
+**Tool Guidance**: The `graph_memory` tool's own description carries its usage guidance. The system prompt gets no graph-memory supplement — the ROM slot is byte-stable for the life of a session (ContextCompilation HLD §3), so per-feature prompt injection is not a channel.
 
-**Implementation**: `pkg/agent/agent.go:injectGraphMemoryContext()` (per-turn context), `pkg/agent/agent.go:graphMemoryPromptSupplement()` (system prompt)
+**Implementation**: `pkg/agent/agent.go:injectGraphMemoryContext()` (per-turn context)
 
 
 ## Key Interactions
@@ -797,7 +799,7 @@ agent:
 - `pkg/memory/salience.go` -- Salience engine (`ComputeSalience`, `BoostSalience`, `RankBySalience`, `CombineScores`)
 - `pkg/memory/budget.go` -- Token budget phased allocation (`BudgetConfig`, `AllocateMemoryBudget`)
 - `pkg/agent/graph_memory_tool.go` -- Agent tool (8 actions)
-- `pkg/agent/agent.go` -- `injectGraphMemoryContext()`, `graphMemoryPromptSupplement()`, `checkAndRegisterGraphMemoryTool()`
+- `pkg/agent/agent.go` -- `injectGraphMemoryContext()`, `checkAndRegisterGraphMemoryTool()`
 - `pkg/storage/backend/backend.go` -- `GraphMemoryProvider` interface
 - `pkg/storage/sqlite/graph_memory_store.go` -- SQLite implementation
 - `pkg/storage/sqlite/migrations/000002_graph_memory.up.sql` -- SQLite schema

@@ -27,20 +27,18 @@ import (
 	"github.com/teradata-labs/loom/pkg/memory"
 	"github.com/teradata-labs/loom/pkg/observability"
 	"github.com/teradata-labs/loom/pkg/shuttle"
-	"github.com/teradata-labs/loom/pkg/storage"
 	"github.com/teradata-labs/loom/pkg/task"
 )
 
 // Backend implements backend.StorageBackend using PostgreSQL with pgx.
-// NOTE: The proto-defined PostgresStorageConfig includes a SupabaseConfig field
-// (loomv1.SupabaseConfig) for future Supabase-hosted PostgreSQL integration.
-// This is available via cfg.GetSupabase() but is not yet consumed by the backend.
+//
+// When PostgresStorageConfig.Supabase is enabled, the connection DSN is derived
+// from the Supabase project (session-mode pooler, port 5432) in
+// internal/pgxdriver.buildDSN.
 type Backend struct {
 	pool              *pgxpool.Pool
 	sessionStore      *SessionStore
-	errorStore        *ErrorStore
 	artifactStore     *ArtifactStore
-	resultStore       *ResultStore
 	humanRequestStore *HumanRequestStore
 	taskStore         *TaskStore
 	graphMemoryStore  *GraphMemoryStore
@@ -82,9 +80,7 @@ func NewBackend(ctx context.Context, cfg *loomv1.PostgresStorageConfig, tracer o
 	return &Backend{
 		pool:              pool,
 		sessionStore:      NewSessionStore(pool, tracer, logger.Named("session")),
-		errorStore:        NewErrorStore(pool, tracer),
 		artifactStore:     NewArtifactStore(pool, tracer),
-		resultStore:       NewResultStore(pool, tracer),
 		humanRequestStore: NewHumanRequestStore(pool, tracer),
 		taskStore:         NewTaskStore(pool, tracer),
 		graphMemoryStore:  NewGraphMemoryStore(pool, tc, tracer),
@@ -99,19 +95,9 @@ func (b *Backend) SessionStorage() agent.SessionStorage {
 	return b.sessionStore
 }
 
-// ErrorStore returns the PostgreSQL error store implementation.
-func (b *Backend) ErrorStore() agent.ErrorStore {
-	return b.errorStore
-}
-
 // ArtifactStore returns the PostgreSQL artifact store implementation.
 func (b *Backend) ArtifactStore() artifacts.ArtifactStore {
 	return b.artifactStore
-}
-
-// ResultStore returns the PostgreSQL result store implementation.
-func (b *Backend) ResultStore() storage.ResultStore {
-	return b.resultStore
 }
 
 // HumanRequestStore returns the PostgreSQL human request store implementation.

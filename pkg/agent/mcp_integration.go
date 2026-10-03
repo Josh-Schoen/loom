@@ -38,6 +38,10 @@ type MCPServerConfig struct {
 	// AutoClose determines if the client should be closed when agent is done
 	// Default: false (client lifecycle managed externally)
 	AutoClose bool
+
+	// Logger receives registration events and is handed to every tool
+	// adapter (backpressure freezes, resource-wait parks). Nil = no-op.
+	Logger *zap.Logger
 }
 
 // RegisterMCPTools connects to an MCP server and registers all its tools with the agent.
@@ -75,12 +79,12 @@ func (a *Agent) RegisterMCPTools(ctx context.Context, config MCPServerConfig) er
 		return fmt.Errorf("MCP client must be initialized before registering tools (call client.Initialize first)")
 	}
 
-	// Get logger (use agent's tracer logger if available, otherwise create new one)
-	logger := zap.NewNop()
-	if a.tracer != nil {
-		// Tracer might have a logger we can use
-		// For now, just use nop logger
-		logger = zap.NewNop()
+	logger := config.Logger
+	if logger == nil {
+		// Fall back to the process-global logger, not a nop: adapter
+		// lifecycle events (park entry/exit, session-handle release
+		// attempts and skips) must stay visible in production logs.
+		logger = zap.L()
 	}
 
 	logger.Info("registering MCP tools",
@@ -93,43 +97,12 @@ func (a *Agent) RegisterMCPTools(ctx context.Context, config MCPServerConfig) er
 		return fmt.Errorf("failed to list MCP tools from server %s: %w", config.Name, err)
 	}
 
-	// Determine truncation config based on agent memory profile
-	truncationConfig := adapter.TruncationConfig{
-		MaxResultBytes: 4096, // Default: 4KB
-		MaxResultRows:  25,   // Default: 25 rows
-		Enabled:        true,
-	}
-
-	// Check if this is a data-intensive workload by examining backend type
-	if a.backend != nil {
-		backendName := a.backend.Name()
-		// Data warehouse backends need higher limits
-		if backendName == "teradata" || backendName == "teradata-mcp" ||
-			backendName == "postgres" || backendName == "snowflake" ||
-			backendName == "bigquery" || backendName == "redshift" {
-			truncationConfig.MaxResultBytes = 40000 // 40KB for data-intensive (2x base limit)
-			truncationConfig.MaxResultRows = 500    // 500 rows
-			logger.Info("using data-intensive truncation config",
-				zap.Int("max_bytes", truncationConfig.MaxResultBytes),
-				zap.Int("max_rows", truncationConfig.MaxResultRows))
-		}
-	}
-
-	// Convert MCP tools to shuttle.Tool with appropriate truncation
+	// Convert MCP tools to shuttle.Tool. Results ride whole — the §5.1
+	// threshold at compile/persist is the only size bound (HLD §4).
 	tools := make([]shuttle.Tool, len(mcpTools))
 	for i, mcpTool := range mcpTools {
-		mcpAdapter := adapter.NewMCPToolAdapterWithConfig(config.Client, mcpTool, config.Name, truncationConfig)
-
-		// CRITICAL: Inject storage backends for progressive disclosure
-		// This enables SQL results to go directly to SQLResultStore (queryable)
-		// instead of SharedMemoryStore (unqueryable json_object)
-		if a.sqlResultStore != nil {
-			mcpAdapter.SetSQLResultStore(a.sqlResultStore)
-		}
-		if a.sharedMemory != nil {
-			mcpAdapter.SetSharedMemory(a.sharedMemory)
-		}
-
+		mcpAdapter := adapter.NewMCPToolAdapter(config.Client, mcpTool, config.Name)
+		mcpAdapter.SetLogger(logger)
 		tools[i] = mcpAdapter
 	}
 
@@ -140,6 +113,13 @@ func (a *Agent) RegisterMCPTools(ctx context.Context, config MCPServerConfig) er
 			zap.String("tool", tool.Name()),
 			zap.String("backend", tool.Backend()),
 		)
+	}
+
+	// Surface the server's usage guidance alongside its tools (issue #336).
+	// Gated on at least one registered tool, matching RegisterMCPServer:
+	// guidance for a server that contributed nothing is prompt noise.
+	if len(tools) > 0 {
+		a.attachMCPServerInstructions(config.Name, config.Client.Instructions())
 	}
 
 	// Warn about tool count bloat
@@ -204,35 +184,13 @@ func (a *Agent) RegisterMCPServer(ctx context.Context, mcpMgr *manager.Manager, 
 		return fmt.Errorf("failed to get server config: %w", err)
 	}
 
-	logger := zap.NewNop()
+	logger := mcpMgr.Logger()
 	logger.Info("Registering MCP server tools", zap.String("server", serverName))
 
 	// List all available tools
 	allTools, err := client.ListTools(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to list tools: %w", err)
-	}
-
-	// Determine truncation config based on agent backend
-	truncationConfig := adapter.TruncationConfig{
-		MaxResultBytes: 4096, // Default: 4KB
-		MaxResultRows:  25,   // Default: 25 rows
-		Enabled:        true,
-	}
-
-	// Check if this is a data-intensive workload
-	if a.backend != nil {
-		backendName := a.backend.Name()
-		// Data warehouse backends need higher limits
-		if backendName == "teradata" || backendName == "teradata-mcp" ||
-			backendName == "postgres" || backendName == "snowflake" ||
-			backendName == "bigquery" || backendName == "redshift" {
-			truncationConfig.MaxResultBytes = 16384 // 16KB for data-intensive
-			truncationConfig.MaxResultRows = 100    // 100 rows
-			logger.Info("using data-intensive truncation config",
-				zap.Int("max_bytes", truncationConfig.MaxResultBytes),
-				zap.Int("max_rows", truncationConfig.MaxResultRows))
-		}
 	}
 
 	// Filter tools based on config
@@ -243,22 +201,19 @@ func (a *Agent) RegisterMCPServer(ctx context.Context, mcpMgr *manager.Manager, 
 		}
 	}
 
-	// Register filtered tools with appropriate truncation
+	// Register filtered tools. Results ride whole (HLD §4).
 	for _, tool := range toolsToRegister {
-		mcpAdapter := adapter.NewMCPToolAdapterWithConfig(client, tool, serverName, truncationConfig)
-
-		// CRITICAL: Inject storage backends for progressive disclosure
-		if a.sqlResultStore != nil {
-			mcpAdapter.SetSQLResultStore(a.sqlResultStore)
-		}
-		if a.sharedMemory != nil {
-			mcpAdapter.SetSharedMemory(a.sharedMemory)
-		}
-
+		mcpAdapter := adapter.NewMCPToolAdapter(client, tool, serverName)
+		mcpAdapter.SetLogger(logger)
 		a.RegisterTool(mcpAdapter)
 		logger.Debug("registered MCP tool",
 			zap.String("server", serverName),
 			zap.String("tool", tool.Name))
+	}
+
+	// Surface the server's usage guidance alongside its tools (issue #336).
+	if len(toolsToRegister) > 0 {
+		a.attachMCPServerInstructions(serverName, client.Instructions())
 	}
 
 	totalTools := a.ToolCount()
@@ -286,26 +241,7 @@ func (a *Agent) RegisterMCPTool(ctx context.Context, mcpMgr *manager.Manager, se
 		return fmt.Errorf("server %s not found: %w", serverName, err)
 	}
 
-	logger := zap.NewNop()
-
-	// Determine truncation config based on agent backend
-	truncationConfig := adapter.TruncationConfig{
-		MaxResultBytes: 4096, // Default: 4KB
-		MaxResultRows:  25,   // Default: 25 rows
-		Enabled:        true,
-	}
-
-	// Check if this is a data-intensive workload
-	if a.backend != nil {
-		backendName := a.backend.Name()
-		// Data warehouse backends need higher limits
-		if backendName == "teradata" || backendName == "teradata-mcp" ||
-			backendName == "postgres" || backendName == "snowflake" ||
-			backendName == "bigquery" || backendName == "redshift" {
-			truncationConfig.MaxResultBytes = 16384 // 16KB for data-intensive
-			truncationConfig.MaxResultRows = 100    // 100 rows
-		}
-	}
+	logger := mcpMgr.Logger()
 
 	// Get tool definition
 	tools, err := client.ListTools(ctx)
@@ -316,18 +252,13 @@ func (a *Agent) RegisterMCPTool(ctx context.Context, mcpMgr *manager.Manager, se
 	// Find the specific tool
 	for _, tool := range tools {
 		if tool.Name == toolName {
-			mcpAdapter := adapter.NewMCPToolAdapterWithConfig(client, tool, serverName, truncationConfig)
-
-			// CRITICAL: Inject storage backends for progressive disclosure
-			if a.sqlResultStore != nil {
-				mcpAdapter.SetSQLResultStore(a.sqlResultStore)
-			}
-			if a.sharedMemory != nil {
-				mcpAdapter.SetSharedMemory(a.sharedMemory)
-			}
-
+			mcpAdapter := adapter.NewMCPToolAdapter(client, tool, serverName)
+			mcpAdapter.SetLogger(logger)
 			shuttleTool := mcpAdapter
 			a.RegisterTool(shuttleTool)
+
+			// Surface the server's usage guidance alongside its tool (issue #336).
+			a.attachMCPServerInstructions(serverName, client.Instructions())
 
 			logger.Info("Registered MCP tool",
 				zap.String("server", serverName),

@@ -19,6 +19,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -63,6 +64,7 @@ var (
 	questionTypes string
 	mode          string
 	isolate       bool
+	useOccurredAt bool
 )
 
 func main() {
@@ -93,7 +95,7 @@ func downloadCmd() *cobra.Command {
 
 	cmd := &cobra.Command{
 		Use:   "download",
-		Short: "Download LongMemEval dataset files from GitHub",
+		Short: "Download LongMemEval dataset files from Hugging Face",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if len(datasets) == 0 {
 				datasets = []string{"oracle"}
@@ -140,16 +142,25 @@ func runCmd() *cobra.Command {
 The server's agent configuration determines how memory works —
 graph memory, context window, LLM provider, etc.
 
-Three benchmark modes:
+Four benchmark modes:
 
-  multi-session (default):
+  multi-session:
     Creates a separate agent session per haystack conversation, ending
     each one before starting the next. Messages are persisted to the DB
     and become FTS5-searchable. The question is asked in a fresh session —
     the agent must use graph_memory + conversation_memory to recall across
-    prior sessions. Most faithful simulation of real-world Loom usage.
+    prior sessions. Each session is fed as one blob message.
 
-  ingest:
+  conversation:
+    Replays every haystack turn, in order, into ONE continuous session —
+    user turns as user messages and the pre-written assistant turns
+    recorded verbatim (generation-free), never regenerated. Drives the
+    memory pipeline as a live chat would: salience accumulates across turns
+    and context compression fires as the thread grows. Most faithful
+    simulation of real-world Loom usage. Requires server.allow_assistant_override
+    (and server.allow_time_override for date anchoring).
+
+  ingest (default):
     Feeds all conversation sessions through the agent in a single session
     via Weave so it builds up memory (graph memory, conversation history,
     etc.), then asks the question in the same session.
@@ -169,8 +180,9 @@ Three benchmark modes:
 	cmd.Flags().IntVar(&limit, "limit", 0, "Max entries to process (0 = all)")
 	cmd.Flags().IntVar(&offset, "offset", 0, "Start from entry N (0-indexed)")
 	cmd.Flags().StringVar(&questionTypes, "types", "", "Comma-separated question types to include (empty = all)")
-	cmd.Flags().StringVar(&mode, "mode", "ingest", "Run mode: ingest (default), multi-session, or context-stuffing")
+	cmd.Flags().StringVar(&mode, "mode", "ingest", "Run mode: ingest (default), multi-session, conversation, or context-stuffing")
 	cmd.Flags().BoolVar(&isolate, "isolate", true, "Create a fresh agent per entry for graph memory isolation (default: true)")
+	cmd.Flags().BoolVar(&useOccurredAt, "occurred-at", true, "Send haystack/question dates as WeaveRequest.occurred_at so memories anchor at historical dates (requires server.allow_time_override: true)")
 
 	return cmd
 }
@@ -341,16 +353,18 @@ func runBenchmark(cmd *cobra.Command, args []string) error {
 		zap.Int("entries", len(entries)),
 		zap.Int("concurrency", concurrency),
 		zap.Bool("isolate", isolate),
+		zap.Bool("occurred_at", useOccurredAt),
 	)
 
 	// Create runner (connects to running Loom server via gRPC)
 	runner, err := NewRunner(RunConfig{
-		Mode:        RunMode(mode),
-		ServerAddr:  serverAddr,
-		AgentID:     agentID,
-		Concurrency: concurrency,
-		Verbose:     verbose,
-		Isolate:     isolate,
+		Mode:          RunMode(mode),
+		ServerAddr:    serverAddr,
+		AgentID:       agentID,
+		Concurrency:   concurrency,
+		Verbose:       verbose,
+		Isolate:       isolate,
+		UseOccurredAt: useOccurredAt,
 	}, logger)
 	if err != nil {
 		return err
@@ -371,18 +385,21 @@ func runBenchmark(cmd *cobra.Command, args []string) error {
 
 	// Run benchmark and collect results
 	resultCh := make(chan EntryResult, len(entries))
+	runErrCh := make(chan error, 1)
 	startTime := time.Now()
 
 	go func() {
-		if err := runner.Run(ctx, entries, resultCh); err != nil {
-			logger.Error("runner error", zap.Error(err))
-		}
+		runErrCh <- runner.Run(ctx, entries, resultCh)
 		close(resultCh)
 	}()
 
 	var results []EntryResult
 	for r := range resultCh {
 		results = append(results, r)
+	}
+	runErr := <-runErrCh
+	if runErr != nil {
+		logger.Error("runner error", zap.Error(runErr))
 	}
 
 	elapsed := time.Since(startTime)
@@ -407,6 +424,14 @@ func runBenchmark(cmd *cobra.Command, args []string) error {
 	// Print summary
 	summary := Summarize(results, mode, serverAddr)
 	PrintSummary(summary)
+
+	// An aborted run (e.g. the server rejects occurred_at) must exit
+	// non-zero so callers don't mistake a results file full of failed rows
+	// for a completed run. A user interrupt (SIGINT/SIGTERM) still exits
+	// cleanly with whatever finished.
+	if runErr != nil && !errors.Is(runErr, context.Canceled) {
+		return fmt.Errorf("benchmark run aborted: %w", runErr)
+	}
 
 	return nil
 }

@@ -20,7 +20,9 @@ import (
 
 	loomv1 "github.com/teradata-labs/loom/gen/go/loom/v1"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/test/bufconn"
 	"google.golang.org/protobuf/types/known/emptypb"
 )
@@ -41,35 +43,48 @@ type scheduleMockServer struct {
 	gotExecs   *loomv1.ListWorkflowExecutionsRequest
 	gotCreate  *loomv1.ScheduleWorkflowRequest
 	gotUpdate  *loomv1.UpdateScheduledWorkflowRequest
-	gotCancel  *loomv1.CancelWorkflowExecutionRequest
+	gotGet     *loomv1.GetScheduledWorkflowRequest
+	gotGetExec *loomv1.GetWorkflowExecutionRequest
+	gotCancel  *loomv1.CancelScheduledExecutionRequest
 
 	// cancelResult is what the fake reports back; false models an execution
 	// that had already finished.
 	cancelResult bool
+
+	// cancelErr, when set, is returned instead of a response — the server does
+	// this for an execution ID it has never seen.
+	cancelErr error
 }
 
-func (m *scheduleMockServer) CancelWorkflowExecution(_ context.Context, req *loomv1.CancelWorkflowExecutionRequest) (*loomv1.CancelWorkflowExecutionResponse, error) {
+func (m *scheduleMockServer) CancelScheduledExecution(_ context.Context, req *loomv1.CancelScheduledExecutionRequest) (*loomv1.CancelScheduledExecutionResponse, error) {
 	m.gotCancel = req
+	if m.cancelErr != nil {
+		return nil, m.cancelErr
+	}
 	if !m.cancelResult {
-		return &loomv1.CancelWorkflowExecutionResponse{
-			Cancelled: false,
-			Message:   "execution is not running",
+		return &loomv1.CancelScheduledExecutionResponse{
+			Canceled: false,
+			Message:  "execution already finished before the request",
 		}, nil
 	}
-	return &loomv1.CancelWorkflowExecutionResponse{
-		Cancelled: true,
-		Message:   "cancellation signalled",
+	return &loomv1.CancelScheduledExecutionResponse{
+		Canceled: true,
+		Message:  "cancellation signaled",
 	}, nil
 }
 
 func (m *scheduleMockServer) ListScheduledWorkflows(_ context.Context, req *loomv1.ListScheduledWorkflowsRequest) (*loomv1.ListScheduledWorkflowsResponse, error) {
 	m.gotList = req
-	return &loomv1.ListScheduledWorkflowsResponse{
+	resp := &loomv1.ListScheduledWorkflowsResponse{
 		Schedules: []*loomv1.ScheduledWorkflow{
 			{Id: "sched-1", WorkflowName: "daily-report"},
 			{Id: "sched-2", WorkflowName: "hourly-sync"},
 		},
-	}, nil
+	}
+	if req.PageSize > 0 {
+		resp.NextPageToken = "list-page-2"
+	}
+	return resp, nil
 }
 
 func (m *scheduleMockServer) GetScheduleHistory(_ context.Context, req *loomv1.GetScheduleHistoryRequest) (*loomv1.GetScheduleHistoryResponse, error) {
@@ -125,6 +140,16 @@ func (m *scheduleMockServer) UpdateScheduledWorkflow(_ context.Context, req *loo
 	}, nil
 }
 
+func (m *scheduleMockServer) GetScheduledWorkflow(_ context.Context, req *loomv1.GetScheduledWorkflowRequest) (*loomv1.ScheduledWorkflow, error) {
+	m.gotGet = req
+	return &loomv1.ScheduledWorkflow{Id: req.ScheduleId, WorkflowName: "daily-report"}, nil
+}
+
+func (m *scheduleMockServer) GetWorkflowExecution(_ context.Context, req *loomv1.GetWorkflowExecutionRequest) (*loomv1.WorkflowExecution, error) {
+	m.gotGetExec = req
+	return &loomv1.WorkflowExecution{Id: req.ExecutionId, Status: "success"}, nil
+}
+
 // setupScheduleServer stands up the recording mock over bufconn and returns a
 // client wired to it.
 func setupScheduleServer(t *testing.T) (*Client, *scheduleMockServer) {
@@ -165,7 +190,7 @@ func TestListSchedules(t *testing.T) {
 	c, mock := setupScheduleServer(t)
 
 	for _, enabledOnly := range []bool{true, false} {
-		schedules, err := c.ListSchedules(context.Background(), enabledOnly)
+		schedules, _, err := c.ListSchedules(context.Background(), enabledOnly, 0, "")
 		if err != nil {
 			t.Fatalf("ListSchedules(%v): %v", enabledOnly, err)
 		}
@@ -175,6 +200,28 @@ func TestListSchedules(t *testing.T) {
 		if mock.gotList.EnabledOnly != enabledOnly {
 			t.Errorf("server saw EnabledOnly=%v, want %v", mock.gotList.EnabledOnly, enabledOnly)
 		}
+	}
+}
+
+// pageSize and pageToken must reach the server, and the server's next page
+// token must come back to the caller, even though the server does not yet
+// page this list — the wiring has to exist before the server-side behaviour
+// does, or this method needs a breaking signature change later.
+func TestListSchedulesPaging(t *testing.T) {
+	c, mock := setupScheduleServer(t)
+
+	_, next, err := c.ListSchedules(context.Background(), false, 10, "page-1-token")
+	if err != nil {
+		t.Fatalf("ListSchedules: %v", err)
+	}
+	if mock.gotList.PageSize != 10 {
+		t.Errorf("server saw PageSize=%d, want 10", mock.gotList.PageSize)
+	}
+	if mock.gotList.PageToken != "page-1-token" {
+		t.Errorf("server saw PageToken=%q, want page-1-token", mock.gotList.PageToken)
+	}
+	if next != "list-page-2" {
+		t.Errorf("next page token = %q, want list-page-2", next)
 	}
 }
 
@@ -303,6 +350,42 @@ func TestUpdateScheduleLeavesNilPartsAlone(t *testing.T) {
 	}
 }
 
+// GetSchedule is a one-line passthrough, but the same rationale the PR uses
+// for every other method applies here too: a test that only checked the
+// return value would pass even if ScheduleId were dropped on the way out.
+func TestGetSchedule(t *testing.T) {
+	c, mock := setupScheduleServer(t)
+
+	sched, err := c.GetSchedule(context.Background(), "sched-42")
+	if err != nil {
+		t.Fatalf("GetSchedule: %v", err)
+	}
+	if sched.Id != "sched-42" {
+		t.Errorf("Id = %q, want sched-42", sched.Id)
+	}
+	if mock.gotGet.ScheduleId != "sched-42" {
+		t.Errorf("server saw ScheduleId=%q, want sched-42", mock.gotGet.ScheduleId)
+	}
+}
+
+// Same rationale as TestGetSchedule: GetWorkflowExecution is a one-line
+// passthrough, and nothing else in this file verifies ExecutionId reaches
+// the wire.
+func TestGetWorkflowExecution(t *testing.T) {
+	c, mock := setupScheduleServer(t)
+
+	exec, err := c.GetWorkflowExecution(context.Background(), "exec-42")
+	if err != nil {
+		t.Fatalf("GetWorkflowExecution: %v", err)
+	}
+	if exec.Id != "exec-42" {
+		t.Errorf("Id = %q, want exec-42", exec.Id)
+	}
+	if mock.gotGetExec.ExecutionId != "exec-42" {
+		t.Errorf("server saw ExecutionId=%q, want exec-42", mock.gotGetExec.ExecutionId)
+	}
+}
+
 func TestListWorkflowExecutions(t *testing.T) {
 	c, mock := setupScheduleServer(t)
 
@@ -355,7 +438,7 @@ func TestWrapBorrowsConnection(t *testing.T) {
 		t.Fatal("Wrap returned nil for a non-nil conn")
 	}
 
-	if _, err := sdk.ListSchedules(context.Background(), false); err != nil {
+	if _, _, err := sdk.ListSchedules(context.Background(), false, 0, ""); err != nil {
 		t.Fatalf("ListSchedules through a wrapped conn: %v", err)
 	}
 
@@ -364,7 +447,7 @@ func TestWrapBorrowsConnection(t *testing.T) {
 	}
 
 	// The conn must still work after the SDK was closed.
-	if _, err := sdk.ListSchedules(context.Background(), false); err != nil {
+	if _, _, err := sdk.ListSchedules(context.Background(), false, 0, ""); err != nil {
 		t.Errorf("conn was closed by the borrower: %v", err)
 	}
 }
@@ -375,44 +458,86 @@ func TestWrapNilConn(t *testing.T) {
 	}
 }
 
-// Cancel must forward the reason — the history entry depends on it to read as an
-// operator stop rather than a crash.
-func TestCancelExecution(t *testing.T) {
-	c, mock := setupScheduleServer(t)
-	mock.cancelResult = true
+// The three outcomes the wrapper has to keep distinct. Only one of them is an
+// error, and the caller's UI branches on all three, so collapsing any pair
+// would make the client lie about what happened to the run.
+//
+// The reason must also reach the server: the history entry depends on it to
+// read as an operator stop rather than a crash.
+func TestCancelScheduledExecution(t *testing.T) {
+	tests := []struct {
+		name         string
+		executionID  string
+		reason       string
+		cancelResult bool
+		cancelErr    error
+		wantCanceled bool
+		wantMessage  bool
+		wantCode     codes.Code
+		wantErr      bool
+	}{
+		{
+			name:         "signaled",
+			executionID:  "exec-1",
+			reason:       "operator stop",
+			cancelResult: true,
+			wantCanceled: true,
+			wantMessage:  true,
+		},
+		{
+			name:         "already finished is not an error",
+			executionID:  "exec-done",
+			reason:       "",
+			cancelResult: false,
+			wantCanceled: false,
+			wantMessage:  true,
+		},
+		{
+			name:        "unknown id surfaces as NotFound",
+			executionID: "exec-never-existed",
+			reason:      "operator stop",
+			cancelErr: status.Error(codes.NotFound,
+				"no scheduled execution, in flight or in history"),
+			wantCanceled: false,
+			wantErr:      true,
+			wantCode:     codes.NotFound,
+		},
+	}
 
-	cancelled, msg, err := c.CancelExecution(context.Background(), "exec-1", "operator stop")
-	if err != nil {
-		t.Fatalf("CancelExecution: %v", err)
-	}
-	if !cancelled {
-		t.Error("cancelled = false, want true")
-	}
-	if msg == "" {
-		t.Error("message is empty; callers show it directly")
-	}
-	if mock.gotCancel.ExecutionId != "exec-1" {
-		t.Errorf("ExecutionId = %q", mock.gotCancel.ExecutionId)
-	}
-	if mock.gotCancel.Reason != "operator stop" {
-		t.Errorf("Reason = %q, want it forwarded", mock.gotCancel.Reason)
-	}
-}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c, mock := setupScheduleServer(t)
+			mock.cancelResult = tt.cancelResult
+			mock.cancelErr = tt.cancelErr
 
-// An already-finished execution comes back as cancelled=false with no error.
-// Treating that as a failure would have the UI apologise for a race it won.
-func TestCancelExecutionAlreadyFinished(t *testing.T) {
-	c, mock := setupScheduleServer(t)
-	mock.cancelResult = false
+			canceled, msg, err := c.CancelScheduledExecution(context.Background(), tt.executionID, tt.reason)
 
-	cancelled, msg, err := c.CancelExecution(context.Background(), "exec-done", "")
-	if err != nil {
-		t.Fatalf("an already-finished execution must not error: %v", err)
-	}
-	if cancelled {
-		t.Error("cancelled = true for a finished execution")
-	}
-	if msg == "" {
-		t.Error("message is empty; it is the only thing distinguishing this case")
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("CancelScheduledExecution: want an error, got nil")
+				}
+				if got := status.Code(err); got != tt.wantCode {
+					t.Errorf("status.Code = %v, want %v", got, tt.wantCode)
+				}
+			} else if err != nil {
+				t.Fatalf("CancelScheduledExecution: %v", err)
+			}
+
+			if canceled != tt.wantCanceled {
+				t.Errorf("canceled = %v, want %v", canceled, tt.wantCanceled)
+			}
+			if tt.wantMessage && msg == "" {
+				t.Error("message is empty; callers show it directly")
+			}
+
+			// The request reaches the server even in the error case, so the
+			// forwarding assertion holds for every row.
+			if mock.gotCancel.GetExecutionId() != tt.executionID {
+				t.Errorf("ExecutionId = %q, want %q", mock.gotCancel.GetExecutionId(), tt.executionID)
+			}
+			if mock.gotCancel.GetReason() != tt.reason {
+				t.Errorf("Reason = %q, want %q forwarded", mock.gotCancel.GetReason(), tt.reason)
+			}
+		})
 	}
 }

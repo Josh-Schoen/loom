@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/teradata-labs/loom/internal/sqlitedriver"
 	"github.com/teradata-labs/loom/pkg/config"
 	"github.com/teradata-labs/loom/pkg/observability"
 )
@@ -86,6 +87,25 @@ type Stats struct {
 	DeletedFiles   int
 }
 
+// ValidateSessionID rejects session IDs that could escape the artifacts
+// directory when joined into a filesystem path. Session IDs are normally
+// server-generated UUIDs; path separators or traversal sequences indicate
+// hostile input from an API caller.
+func ValidateSessionID(sessionID string) error {
+	if sessionID == "" || sessionID == "." || strings.Contains(sessionID, "..") {
+		return fmt.Errorf("invalid session ID %q", sessionID)
+	}
+	for _, r := range sessionID {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9',
+			r == '-', r == '_', r == '.':
+		default:
+			return fmt.Errorf("invalid session ID %q: character %q not allowed", sessionID, r)
+		}
+	}
+	return nil
+}
+
 // GetArtifactDir returns the artifact directory for a given context.
 // Directory structure:
 //   - No session + user: $LOOM_DATA_DIR/artifacts/user/
@@ -103,6 +123,10 @@ func GetArtifactDir(sessionID string, source SourceType) (string, error) {
 		}
 		// Generated artifacts without session (legacy or temp)
 		return filepath.Join(artifactsDir, "temp"), nil
+	}
+
+	if err := ValidateSessionID(sessionID); err != nil {
+		return "", err
 	}
 
 	// Session-based artifacts
@@ -123,6 +147,9 @@ func GetArtifactDir(sessionID string, source SourceType) (string, error) {
 func GetScratchpadDir(sessionID string) (string, error) {
 	if sessionID == "" {
 		return "", fmt.Errorf("session ID is required for scratchpad")
+	}
+	if err := ValidateSessionID(sessionID); err != nil {
+		return "", err
 	}
 	baseDir := config.GetLoomDataDir()
 	return filepath.Join(baseDir, "artifacts", "sessions", sessionID, "scratchpad"), nil
@@ -212,20 +239,17 @@ type SQLiteStore struct {
 // NewSQLiteStore creates a new SQLite-backed artifact store.
 // It reuses the existing loom.db database and creates the artifacts table if needed.
 func NewSQLiteStore(dbPath string, tracer observability.Tracer) (*SQLiteStore, error) {
-	// Open database (reuse existing session DB connection pattern)
-	db, err := sql.Open("sqlite3", dbPath)
+	// Open database (reuse existing session DB connection pattern).
+	// WAL, foreign_keys, and busy_timeout ride in the DSN so every pooled
+	// connection gets them; busy_timeout and foreign_keys are per-connection
+	// settings that a post-open db.Exec would set on only one connection.
+	db, err := sql.Open("sqlite3", sqlitedriver.DSN(dbPath, sqlitedriver.Options{
+		BusyTimeoutMS: 5000,
+		WAL:           true,
+		ForeignKeys:   true,
+	}))
 	if err != nil {
 		return nil, fmt.Errorf("failed to open database: %w", err)
-	}
-
-	// Enable WAL mode for better concurrency
-	if _, err := db.Exec("PRAGMA journal_mode=WAL"); err != nil {
-		return nil, fmt.Errorf("failed to enable WAL mode: %w", err)
-	}
-
-	// Enable foreign keys
-	if _, err := db.Exec("PRAGMA foreign_keys=ON"); err != nil {
-		return nil, fmt.Errorf("failed to enable foreign keys: %w", err)
 	}
 
 	store := &SQLiteStore{

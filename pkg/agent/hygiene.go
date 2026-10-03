@@ -68,21 +68,16 @@ func (a *Agent) runEndOfTurnHygiene(ctx context.Context, session *Session, retry
 	}
 
 	if outcome != nil && outcome.ShouldRetry && outcome.InjectionMessage != "" {
-		// Append the synthetic message to the session so the LLM sees it
-		// on the next turn. The role is "user" because the LLM treats it
-		// as input to act on, not as a system directive.
-		msg := Message{
-			Role:      "user",
+		// Append the synthetic message to the session so the LLM sees it on
+		// the next turn as user-turn content (folded in
+		// normalizeWireRoles), but persisted under its own role so it is
+		// never mistaken for something the human typed.
+		a.appendMessage(ctx, session, Message{
+			Role:      "hygiene_injection",
 			Content:   outcome.InjectionMessage,
-			AgentID:   a.id,
+			AgentID:   a.GetID(),
 			Timestamp: time.Now(),
-		}
-		session.AddMessage(ctx, msg)
-		if err := a.memory.PersistMessage(ctx, session.ID, msg); err != nil {
-			zap.L().Warn("failed to persist hygiene fixup message",
-				zap.String("session", session.ID),
-				zap.Error(err))
-		}
+		}, false)
 		*retryCount++
 		return true, outcome
 	}

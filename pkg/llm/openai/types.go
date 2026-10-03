@@ -29,17 +29,29 @@ type ChatCompletionRequest struct {
 	Tools               []Tool                 `json:"tools,omitempty"`
 	ToolChoice          interface{}            `json:"tool_choice,omitempty"` // "auto", "none", or {"type": "function", "function": {"name": "..."}}
 	Stream              bool                   `json:"stream,omitempty"`
+	StreamOptions       *StreamOptions         `json:"stream_options,omitempty"`
 	User                string                 `json:"user,omitempty"`
 	ResponseFormat      map[string]interface{} `json:"response_format,omitempty"`
 }
 
 // ChatMessage represents a message in the conversation.
+// StreamOptions requests a final usage chunk during streaming so token and
+// prompt-cache accounting is available (OpenAI/litellm stream_options).
+type StreamOptions struct {
+	IncludeUsage bool `json:"include_usage,omitempty"`
+}
+
 type ChatMessage struct {
 	Role       string      `json:"role"` // "system", "user", "assistant", "tool"
 	Content    interface{} `json:"content,omitempty"`
 	Name       string      `json:"name,omitempty"`
 	ToolCalls  []ToolCall  `json:"tool_calls,omitempty"`
 	ToolCallID string      `json:"tool_call_id,omitempty"` // For tool role messages
+
+	// ReasoningContent carries the reasoning trace that reasoning models
+	// (DeepSeek, Qwen, ...) return through OpenAI-compatible gateways such as
+	// LiteLLM. Response-only: omitempty keeps it off outgoing requests.
+	ReasoningContent string `json:"reasoning_content,omitempty"`
 }
 
 // ToolCall represents a function call from the assistant.
@@ -91,6 +103,52 @@ type ChatCompletionUsage struct {
 	PromptTokens     int `json:"prompt_tokens"`
 	CompletionTokens int `json:"completion_tokens"`
 	TotalTokens      int `json:"total_tokens"`
+	// Prompt-cache accounting. litellm forwards Anthropic usage as these two
+	// top-level fields; some gateways use the OpenAI-style
+	// prompt_tokens_details.cached_tokens instead — read both.
+	CacheReadInputTokens     int `json:"cache_read_input_tokens,omitempty"`
+	CacheCreationInputTokens int `json:"cache_creation_input_tokens,omitempty"`
+	PromptTokensDetails      *struct {
+		CachedTokens int `json:"cached_tokens,omitempty"`
+	} `json:"prompt_tokens_details,omitempty"`
+}
+
+// CacheRead returns the prompt-cache read tokens from whichever field the
+// gateway populated.
+func (u ChatCompletionUsage) CacheRead() int {
+	if u.CacheReadInputTokens > 0 {
+		return u.CacheReadInputTokens
+	}
+	if u.PromptTokensDetails != nil {
+		return u.PromptTokensDetails.CachedTokens
+	}
+	return 0
+}
+
+// UncachedPromptTokens returns the prompt tokens that were neither read from
+// nor written to the prompt cache. OpenAI-compatible prompt_tokens INCLUDES
+// both cache buckets (OpenAI's cached_tokens, and litellm's Anthropic-shaped
+// cache_read/cache_creation fields); loom's Usage.InputTokens excludes them,
+// matching Anthropic and Bedrock, so this is what InputTokens must carry.
+// Clamped at zero for a gateway that reports the buckets outside prompt_tokens.
+func (u ChatCompletionUsage) UncachedPromptTokens() int {
+	return max(0, u.PromptTokens-u.CacheRead()-u.CacheCreationInputTokens)
+}
+
+// UncachedTotalTokens is total_tokens with the same cache buckets removed, so
+// Usage.TotalTokens = InputTokens + OutputTokens as on Anthropic and Bedrock.
+func (u ChatCompletionUsage) UncachedTotalTokens() int {
+	return max(0, u.TotalTokens-(u.PromptTokens-u.UncachedPromptTokens()))
+}
+
+// MeteredTokens is what OpenAI-style TPM limits count for the call: the raw,
+// cache-inclusive total_tokens (prompt_tokens + completion_tokens when a
+// gateway omits total_tokens). Carried as Usage.RateLimitTokens.
+func (u ChatCompletionUsage) MeteredTokens() int {
+	if u.TotalTokens > 0 {
+		return u.TotalTokens
+	}
+	return u.PromptTokens + u.CompletionTokens
 }
 
 // OpenAIError represents an error from the OpenAI API.

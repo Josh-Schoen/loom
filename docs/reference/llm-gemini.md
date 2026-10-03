@@ -2,7 +2,7 @@
 
 Technical reference for connecting Loom to Google Gemini via the Google AI Studio API.
 
-**Version**: v1.2.0
+**Version**: v1.3.0
 
 **Status**: ✅ Implemented. Supports text, vision, tool calling, and streaming.
 
@@ -65,7 +65,7 @@ The Gemini provider connects Loom to Google's Gemini models through the Google A
 - Token-by-token streaming via Server-Sent Events (SSE)
 - Implicit caching (automatic since May 2025; cached tokens tracked in usage metadata)
 - Cost calculation per model
-- Client-side rate limiting (shared singleton across all Gemini client instances)
+- Client-side rate limiting (shared per model + rate-limit config)
 
 **Source code**: `pkg/llm/gemini/client.go`, `pkg/llm/gemini/types.go`
 
@@ -188,28 +188,21 @@ HTTP client timeout in seconds for API requests.
 
 ## Available Models
 
-### Gemini 3 Preview Models
-
-These models are in preview (as of 2026-03) and are used as defaults. They are supported in the client and cost calculator but are not yet in the GA model catalog dropdown.
+Source of truth: `pkg/llm/catalog/catalog.go` (`BuildCatalog()`). All 7 Gemini entries below have `ShowInDropdown: true`. The 2.5 family is GA; the 3.x entries are preview endpoints that the catalog includes (verified against OpenRouter traffic on 2026-04-22). The default model when none is configured is `gemini-3-flash-preview` (`pkg/llm/factory/factory.go`).
 
 | Model ID | Name | Context Window | Max Output | Input Cost (per 1M) | Output Cost (per 1M) | Capabilities |
 |----------|------|----------------|------------|---------------------|----------------------|--------------|
-| `gemini-3-pro-preview` | Gemini 3 Pro | 1,048,576 | 65,536 | $2.00-$4.00 (tiered) | $12.00-$18.00 (tiered) | text, vision, tool-use, thinking, image-gen |
-| `gemini-3-flash-preview` | Gemini 3 Flash | 1,048,576 | 65,536 | Free during preview | Free during preview | text, vision, tool-use, thinking |
-
-### GA Model Catalog (registered in model registry)
-
-These GA models appear in Loom's model picker dropdown:
-
-| Model ID | Name | Context Window | Max Output | Input Cost (per 1M) | Output Cost (per 1M) | Capabilities |
-|----------|------|----------------|------------|---------------------|----------------------|--------------|
-| `gemini-2.5-pro` | Gemini 2.5 Pro | 1,048,576 | 65,536 | $1.25 (low tier) | $10.00 (low tier) | text, vision, tool-use, thinking |
+| `gemini-3.1-pro-preview` | Gemini 3.1 Pro (Preview) | 1,048,576 | 65,536 | $2.00 | $12.00 | text, vision, tool-use, thinking |
+| `gemini-3.1-flash-lite-preview` | Gemini 3.1 Flash-Lite (Preview) | 1,048,576 | 32,768 | $0.25 | $1.50 | text, vision, tool-use, thinking |
+| `gemini-3-pro-preview` | Gemini 3 Pro (Preview) | 1,048,576 | 65,536 | $2.00 | $12.00 | text, vision, tool-use, thinking |
+| `gemini-3-flash-preview` | Gemini 3 Flash (Preview) | 1,048,576 | 32,768 | $0.50 | $3.00 | text, vision, tool-use, thinking |
+| `gemini-2.5-pro` | Gemini 2.5 Pro | 1,048,576 | 65,536 | $1.25 | $10.00 | text, vision, tool-use, thinking |
 | `gemini-2.5-flash` | Gemini 2.5 Flash | 1,048,576 | 65,536 | $0.30 | $2.50 | text, vision, tool-use, thinking |
 | `gemini-2.5-flash-lite` | Gemini 2.5 Flash-Lite | 1,048,576 | 32,768 | $0.10 | $0.40 | text, vision, tool-use |
 
-**Note on tiered pricing**: Gemini 2.5 Pro and Gemini 3 Pro have tiered pricing based on prompt length (above/below 200k tokens). The `calculateCost()` function in `client.go` uses mid-range averages: $1.875/$12.50 for 2.5 Pro, $3.00/$15.00 for 3 Pro.
+**Catalog vs. runtime cost calculator**: The table above shows catalog pricing. The `calculateCost()` function in `pkg/llm/gemini/client.go` is a separate code path with its own (in some cases tiered/averaged) rates — see [Cost Estimation](#cost-estimation). Notably, `calculateCost()` does not have entries for the `gemini-3.1-*` IDs and falls back to `gemini-2.5-flash` pricing ($0.30/$2.50) for them.
 
-**Pricing source**: Comments in `pkg/llm/gemini/client.go`. Check [ai.google.dev/pricing](https://ai.google.dev/pricing) for current rates.
+**Pricing source**: Catalog (`pkg/llm/catalog/catalog.go`) and runtime comments in `pkg/llm/gemini/client.go`. Check [ai.google.dev/pricing](https://ai.google.dev/pricing) for current rates.
 
 
 ## Features
@@ -284,7 +277,7 @@ llm:
   rate_limit:
     disabled: false
     requests_per_second: 2.0
-    tokens_per_minute: 40000
+    tokens_per_minute: 40000   # observational only: reported in metrics, NOT enforced
     burst_capacity: 5
     min_delay_ms: 300
     max_retries: 5
@@ -446,8 +439,8 @@ func main() {
         Timeout:     120 * time.Second,
         RateLimiterConfig: llm.RateLimiterConfig{
             Enabled:           true,
-            RequestsPerSecond: 2.0,
-            TokensPerMinute:   40000,
+            RequestsPerSecond: 2.0,   // enforced: paces request admission
+            TokensPerMinute:   40000, // observational only: reported in metrics, NOT enforced
         },
     })
 
@@ -470,14 +463,14 @@ Cost is calculated per-request in `calculateCost()` using per-million-token rate
 | `gemini-2.5-flash` | $0.30 | $2.50 | ~$0.00155 |
 | `gemini-2.5-flash-lite` | $0.10 | $0.40 | ~$0.00030 |
 
-Unknown models default to `gemini-2.5-flash` pricing ($0.30/$2.50).
+The `gemini-3.1-pro-preview` and `gemini-3.1-flash-lite-preview` catalog IDs are not in `calculateCost()` and fall through to the default. Unknown models default to `gemini-2.5-flash` pricing ($0.30/$2.50).
 
 **Note**: The mid-range averages differ from the model catalog's low-tier prices. The catalog shows $1.25/$10.00 for 2.5 Pro (low tier, prompts up to 200k tokens). The cost calculator uses the mid-range average ($1.875/$12.50) to better reflect mixed workloads.
 
 
 ## Rate Limiting
 
-The Gemini provider uses a **global singleton rate limiter** shared across all Gemini client instances in the process. This is initialized once via `sync.Once`.
+The Gemini provider uses a **shared rate limiter**: clients on the same model with the same rate-limit values share one limiter; a different model or different values gets its own (a warning is logged when two configs share one quota boundary).
 
 Rate limiting is optional and controlled by the `RateLimiterConfig` passed in the `Config` struct. When enabled via YAML:
 
@@ -487,7 +480,7 @@ llm:
   rate_limit:
     disabled: false
     requests_per_second: 2.0
-    tokens_per_minute: 40000
+    tokens_per_minute: 40000   # observational only: reported in metrics, NOT enforced
     burst_capacity: 5
     min_delay_ms: 300
     max_retries: 5
@@ -496,6 +489,8 @@ llm:
 ```
 
 Both `Chat` and `ChatStream` methods respect the rate limiter. Token usage is recorded for the rate limiter's metrics after streaming completes.
+
+**Note**: `tokens_per_minute` is observational only today — token consumption is tracked and reported in rate-limiter metrics, but never enforced. Only `requests_per_second`, `burst_capacity`, and `min_delay_ms` gate requests; size `requests_per_second` against your TPM quota.
 
 
 ## Error Codes
@@ -571,7 +566,7 @@ error reading stream: unexpected EOF
 
 7. **No call IDs**: Gemini does not provide function call IDs in its response. The reversed tool name is used as the call ID.
 
-8. **Global rate limiter**: The rate limiter is a process-wide singleton. All Gemini client instances share the same rate limiter, initialized from the first client that enables it.
+8. **Shared rate limiter**: Clients on the same model with the same rate-limit values share one limiter. Differing values on the same model are honored separately (their combined rate can exceed the quota; a warning is logged).
 
 9. **Cached tokens and rate limits**: Gemini's implicit caching provides cost savings, but cached tokens still count against rate limits.
 

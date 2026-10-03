@@ -22,20 +22,15 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/teradata-labs/loom/pkg/llm"
+	"github.com/teradata-labs/loom/pkg/llm/catalog"
 	"github.com/teradata-labs/loom/pkg/llm/openai"
 	llmtypes "github.com/teradata-labs/loom/pkg/llm/types"
 	"github.com/teradata-labs/loom/pkg/shuttle"
-)
-
-// Global singleton rate limiter shared across all Azure OpenAI clients
-var (
-	globalRateLimiter     *llm.RateLimiter
-	globalRateLimiterOnce sync.Once
 )
 
 // Client implements the LLMProvider interface for Azure OpenAI.
@@ -62,6 +57,7 @@ type Client struct {
 
 	// Rate limiter
 	rateLimiter *llm.RateLimiter
+	capacity    llm.CapacityObserver
 
 	// Tool name mapping: sanitized name → original name
 	// Azure OpenAI requires tool names to match ^[a-zA-Z0-9_.\-]+$
@@ -94,6 +90,10 @@ type Config struct {
 	Temperature       float64       // Default: 1.0
 	Timeout           time.Duration // Default: 60s
 	RateLimiterConfig llm.RateLimiterConfig
+	// CapacityObserver, when set, receives ratelimit telemetry harvested
+	// from every response (headers on success, Retry-After on 429). The LLM
+	// slot scheduler is the intended consumer. nil is legal.
+	CapacityObserver llm.CapacityObserver
 }
 
 // NewClient creates a new Azure OpenAI client.
@@ -135,7 +135,7 @@ func NewClient(config Config) (*Client, error) {
 	// Initialize rate limiter if enabled
 	var rateLimiter *llm.RateLimiter
 	if config.RateLimiterConfig.Enabled {
-		rateLimiter = getOrCreateGlobalRateLimiter(config.RateLimiterConfig)
+		rateLimiter = llm.SharedRateLimiter("azure-openai|"+config.Endpoint+"|"+config.DeploymentID, config.RateLimiterConfig)
 	}
 
 	// Strip "Bearer " prefix from Entra token if present, since we add it
@@ -153,18 +153,57 @@ func NewClient(config Config) (*Client, error) {
 		temperature:  config.Temperature,
 		modelName:    modelName,
 		rateLimiter:  rateLimiter,
+		capacity:     config.CapacityObserver,
 		httpClient: &http.Client{
 			Timeout: config.Timeout,
 		},
 	}, nil
 }
 
-// getOrCreateGlobalRateLimiter returns the global rate limiter, creating it if necessary.
-func getOrCreateGlobalRateLimiter(config llm.RateLimiterConfig) *llm.RateLimiter {
-	globalRateLimiterOnce.Do(func() {
-		globalRateLimiter = llm.NewRateLimiter(config)
-	})
-	return globalRateLimiter
+// observeCapacity harvests ratelimit telemetry from a response and forwards
+// it to the configured CapacityObserver. Azure states, on every successful
+// response: x-ratelimit-limit-tokens, x-ratelimit-remaining-tokens
+// (per-minute window), and x-ratelimit-reset-tokens (seconds to window
+// reset).
+//
+// This hook carries ONLY the Azure-specific header calibration. Throttle and
+// success observations (the AIMD fallback) are provider-agnostic and are
+// driven at the agent's LLM funnel from the call outcome — the 429 surfaces
+// there as an llm.ThrottleError. Only 2xx responses count as calibration
+// sources: a 4xx/5xx without headers proves nothing about capacity.
+func (c *Client) observeCapacity(resp *http.Response) {
+	if c.capacity == nil || resp == nil {
+		return
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return
+	}
+	limit := headerInt64(resp.Header, "x-ratelimit-limit-tokens")
+	remaining := headerInt64(resp.Header, "x-ratelimit-remaining-tokens")
+	reset := headerSeconds(resp.Header, "x-ratelimit-reset-tokens")
+	if limit > 0 {
+		c.capacity.UpdateFromHeaders(limit, remaining, reset)
+	}
+}
+
+func headerInt64(h http.Header, key string) int64 {
+	v := h.Get(key)
+	if v == "" {
+		return -1
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil {
+		return -1
+	}
+	return n
+}
+
+func headerSeconds(h http.Header, key string) time.Duration {
+	n := headerInt64(h, key)
+	if n <= 0 {
+		return 0
+	}
+	return time.Duration(n) * time.Second
 }
 
 // Name returns the provider name.
@@ -237,40 +276,54 @@ func (c *Client) callAPI(ctx context.Context, req *openai.ChatCompletionRequest)
 		return nil, fmt.Errorf("failed to marshal request: %w", err)
 	}
 
-	// Create HTTP request
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", apiURL, bytes.NewReader(body))
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
-	}
-
-	// Set headers
-	httpReq.Header.Set("Content-Type", "application/json")
-
-	// Authentication: Use api-key OR Authorization header
-	if c.apiKey != "" {
-		// Option 1: API key authentication
-		httpReq.Header.Set("api-key", c.apiKey)
-	} else {
-		// Option 2: Microsoft Entra ID token
-		httpReq.Header.Set("Authorization", "Bearer "+c.entraToken)
+	// sendOnce builds and sends a fresh request. It must construct a new
+	// http.Request per attempt (a consumed body cannot be re-sent), and it
+	// surfaces HTTP 429 as an ERROR: httpClient.Do returns nil error for any
+	// HTTP status, so without this the rate limiter's retry never saw
+	// throttling and 429s went straight to the caller un-retried. The error
+	// carries the server-specified wait (Retry-After / retry-after-ms /
+	// x-ratelimit reset headers) so the limiter waits at least that long.
+	sendOnce := func(ctx context.Context) (interface{}, error) {
+		httpReq, err := http.NewRequestWithContext(ctx, "POST", apiURL, bytes.NewReader(body))
+		if err != nil {
+			return nil, fmt.Errorf("failed to create request: %w", err)
+		}
+		httpReq.Header.Set("Content-Type", "application/json")
+		// Authentication: Use api-key OR Authorization header
+		if c.apiKey != "" {
+			httpReq.Header.Set("api-key", c.apiKey)
+		} else {
+			httpReq.Header.Set("Authorization", "Bearer "+c.entraToken)
+		}
+		resp, err := c.httpClient.Do(httpReq)
+		if err != nil {
+			return nil, err
+		}
+		c.observeCapacity(resp)
+		if resp.StatusCode == http.StatusTooManyRequests {
+			respBody, _ := io.ReadAll(resp.Body)
+			_ = resp.Body.Close()
+			return nil, llm.NewThrottleError(
+				fmt.Errorf("API error (status 429): %s", string(respBody)),
+				llm.RetryAfterFromHeaders(resp.Header))
+		}
+		return resp, nil
 	}
 
 	// Send request with rate limiting if enabled
 	var httpResp *http.Response
 	if c.rateLimiter != nil {
-		result, err := c.rateLimiter.Do(ctx, func(ctx context.Context) (interface{}, error) {
-			return c.httpClient.Do(httpReq)
-		})
+		result, err := c.rateLimiter.Do(ctx, sendOnce)
 		if err != nil {
 			return nil, fmt.Errorf("HTTP request failed: %w", err)
 		}
 		httpResp = result.(*http.Response)
 	} else {
-		var err error
-		httpResp, err = c.httpClient.Do(httpReq)
+		result, err := sendOnce(ctx)
 		if err != nil {
 			return nil, fmt.Errorf("HTTP request failed: %w", err)
 		}
+		httpResp = result.(*http.Response)
 	}
 	defer func() { _ = httpResp.Body.Close() }()
 
@@ -368,29 +421,32 @@ func (c *Client) convertResponse(resp *openai.ChatCompletionResponse) *llmtypes.
 // Azure OpenAI pricing varies by region and deployment type.
 // These are approximate costs based on Pay-As-You-Go pricing.
 func (c *Client) calculateCost(inputTokens, outputTokens int) float64 {
-	// Pricing per million tokens (approximate, varies by region)
-	var inputCostPerM, outputCostPerM float64
-
-	switch c.modelName {
-	case "gpt-4o":
-		inputCostPerM = 2.50
-		outputCostPerM = 10.00
-	case "gpt-4o-mini":
-		inputCostPerM = 0.15
-		outputCostPerM = 0.60
-	case "gpt-4-turbo", "gpt-4-turbo-preview":
-		inputCostPerM = 10.00
-		outputCostPerM = 30.00
-	case "gpt-4", "gpt-4-0613":
-		inputCostPerM = 30.00
-		outputCostPerM = 60.00
-	case "gpt-35-turbo", "gpt-3.5-turbo": // Azure uses gpt-35-turbo naming
-		inputCostPerM = 0.50
-		outputCostPerM = 1.50
-	default:
-		// Default to gpt-4o pricing
-		inputCostPerM = 2.50
-		outputCostPerM = 10.00
+	// The catalog (pkg/llm/catalog) is the source of truth for pricing. Fall back
+	// to the provider-local rates below for deployment names it does not list
+	// (Azure routes by deployment name, which is often not a catalog model id).
+	inputCostPerM, outputCostPerM, ok := catalog.LookupPricing("azure-openai", c.modelName)
+	if !ok {
+		switch c.modelName {
+		case "gpt-4o":
+			inputCostPerM = 2.50
+			outputCostPerM = 10.00
+		case "gpt-4o-mini":
+			inputCostPerM = 0.15
+			outputCostPerM = 0.60
+		case "gpt-4-turbo", "gpt-4-turbo-preview":
+			inputCostPerM = 10.00
+			outputCostPerM = 30.00
+		case "gpt-4", "gpt-4-0613":
+			inputCostPerM = 30.00
+			outputCostPerM = 60.00
+		case "gpt-35-turbo", "gpt-3.5-turbo": // Azure uses gpt-35-turbo naming
+			inputCostPerM = 0.50
+			outputCostPerM = 1.50
+		default:
+			// Default to gpt-4o pricing
+			inputCostPerM = 2.50
+			outputCostPerM = 10.00
+		}
 	}
 
 	inputCost := float64(inputTokens) * inputCostPerM / 1_000_000
@@ -689,36 +745,51 @@ func (c *Client) ChatStream(ctx context.Context, messages []llmtypes.Message,
 		return nil, fmt.Errorf("failed to marshal request: %w", err)
 	}
 
-	// Create HTTP request
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", apiURL, bytes.NewReader(body))
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
-	}
-
-	// Set headers
-	httpReq.Header.Set("Content-Type", "application/json")
-	if c.apiKey != "" {
-		httpReq.Header.Set("api-key", c.apiKey)
-	} else {
-		httpReq.Header.Set("Authorization", "Bearer "+c.entraToken)
+	// sendOnce builds and sends a fresh request per attempt (a consumed body
+	// cannot be re-sent) and surfaces HTTP 429 as an ERROR so the rate
+	// limiter's retry actually sees throttling — httpClient.Do returns nil
+	// error for any HTTP status. The error carries the server-specified wait
+	// (Retry-After and friends) so the limiter waits at least that long.
+	sendOnce := func(ctx context.Context) (interface{}, error) {
+		httpReq, err := http.NewRequestWithContext(ctx, "POST", apiURL, bytes.NewReader(body))
+		if err != nil {
+			return nil, fmt.Errorf("failed to create request: %w", err)
+		}
+		httpReq.Header.Set("Content-Type", "application/json")
+		if c.apiKey != "" {
+			httpReq.Header.Set("api-key", c.apiKey)
+		} else {
+			httpReq.Header.Set("Authorization", "Bearer "+c.entraToken)
+		}
+		resp, err := c.httpClient.Do(httpReq)
+		if err != nil {
+			return nil, err
+		}
+		c.observeCapacity(resp)
+		if resp.StatusCode == http.StatusTooManyRequests {
+			respBody, _ := io.ReadAll(resp.Body)
+			_ = resp.Body.Close()
+			return nil, llm.NewThrottleError(
+				fmt.Errorf("API error (status 429): %s", string(respBody)),
+				llm.RetryAfterFromHeaders(resp.Header))
+		}
+		return resp, nil
 	}
 
 	// Send request with rate limiting if enabled
 	var httpResp *http.Response
 	if c.rateLimiter != nil {
-		result, err := c.rateLimiter.Do(ctx, func(ctx context.Context) (interface{}, error) {
-			return c.httpClient.Do(httpReq)
-		})
+		result, err := c.rateLimiter.Do(ctx, sendOnce)
 		if err != nil {
 			return nil, fmt.Errorf("HTTP request failed: %w", err)
 		}
 		httpResp = result.(*http.Response)
 	} else {
-		var err error
-		httpResp, err = c.httpClient.Do(httpReq)
+		result, err := sendOnce(ctx)
 		if err != nil {
 			return nil, fmt.Errorf("HTTP request failed: %w", err)
 		}
+		httpResp = result.(*http.Response)
 	}
 	defer func() { _ = httpResp.Body.Close() }()
 
@@ -771,6 +842,9 @@ func (c *Client) ChatStream(ctx context.Context, messages []llmtypes.Message,
 			}
 
 			if len(choice.Delta.ToolCalls) > 0 {
+				// Tool-call deltas never reach tokenCallback (text only);
+				// report them as stream activity.
+				llmtypes.NotifyStreamActivity(ctx)
 				for _, tcDelta := range choice.Delta.ToolCalls {
 					idx := tcDelta.Index
 					if _, exists := toolCallMap[idx]; !exists {
@@ -876,3 +950,10 @@ var _ llmtypes.LLMProvider = (*Client)(nil)
 
 // Ensure Client implements StreamingLLMProvider interface.
 var _ llmtypes.StreamingLLMProvider = (*Client)(nil)
+
+// SchedulerScope names this client's quota boundary for the LLM slot
+// scheduler: the same (endpoint, deployment) scope its rate limiter and
+// capacity telemetry use.
+func (c *Client) SchedulerScope() string {
+	return "azure-openai|" + c.endpoint + "|" + c.deploymentID
+}
