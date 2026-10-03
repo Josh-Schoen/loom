@@ -70,6 +70,37 @@ prompt:
     - active_provider (optional): named pool entry like "claude-haiku"
       if the user wants a specific model
 
+    ## A warehouse preset alone cannot reach a warehouse
+
+    `teradata_analyst` sets the TD ROM, the data-intensive profile and a
+    Teradata backend type, but its tool list is `http_request` +
+    `create_ui_app`. Nothing in it can query anything. An agent created
+    from it and handed "list my databases" will discover tool NAMES with
+    tool_search, narrate calling one, and never execute — verified live
+    2026-09-09 with two such agents, both looping until they answered with
+    a capabilities menu instead of data.
+
+    So when the request is about querying a warehouse, do BOTH:
+
+    1. `apply_preset` as usual.
+    2. Immediately follow with `update_agent` that attaches the MCP server
+       and its tools, e.g.
+
+       mcp:
+         - server: <the server from the user's config>
+           tools: [execute_query, list_databases, list_tables,
+                   describe_table, explain_query]
+
+       plus `memory.shared_memory_threshold_bytes: 16384`, so results up
+       to 16KB stay inline. Omitted, that field is 0, and 0 means "replace
+       EVERY tool result with a reference id" — the agent then gropes at
+       previews instead of answering.
+
+    Ask which MCP server before guessing: run `discover` (or read the
+    user's config) and name the server explicitly. A server that is
+    present but `enabled: false` still shows up in tool_search results,
+    and an agent pointed at a disabled server stalls exactly the same way.
+
     ## What to avoid
     - Do NOT list auto-injected tools in the preset call (workspace,
       query_tool_result, send_message, publish, shared_memory_*) — the
