@@ -3435,10 +3435,10 @@ func (s *MultiAgentServer) DeleteSession(ctx context.Context, req *loomv1.Delete
 	if deleteAgent == nil && s.sessionStore != nil {
 		var err error
 		stored, err = s.sessionStore.LoadSession(ctx, req.SessionId)
-		if err != nil {
-			return nil, status.Errorf(codes.Internal, "load session: %v", err)
-		}
-		if stored == nil {
+		// Backends report "not found" as a plain error, indistinguishable from
+		// a read failure (see persistedConversationHistory), so both surface
+		// as NotFound here too.
+		if err != nil || stored == nil {
 			return nil, status.Error(codes.NotFound, "session not found")
 		}
 		if !s.sessionAccessibleBy(callerUserID, stored) {
