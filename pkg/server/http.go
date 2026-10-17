@@ -68,6 +68,17 @@ type HTTPServer struct {
 	grpcAddr        string
 	corsConfig      CORSConfig
 	appHTMLProvider AppHTMLProvider
+
+	// gatewayMux serves the grpc-gateway routes. The SSE handler also uses it
+	// to map HTTP headers to gRPC metadata, so both paths see a request the
+	// same way.
+	gatewayMux *runtime.ServeMux
+
+	// streamInterceptor is the gRPC server's stream-interceptor chain
+	// (authentication, user identity). The SSE handler calls StreamWeave
+	// in-process rather than over gRPC, so it runs the chain itself. Nil
+	// means no interceptors (embedders and tests that configure none).
+	streamInterceptor grpc.StreamServerInterceptor
 }
 
 // NewHTTPServer creates an HTTP server that proxies to gRPC
@@ -86,12 +97,41 @@ func NewHTTPServerWithCORS(grpcServer *MultiAgentServer, httpAddr, grpcAddr stri
 		logger:     logger,
 		grpcAddr:   grpcAddr,
 		corsConfig: corsConfig,
+		gatewayMux: runtime.NewServeMux(
+			runtime.WithMarshalerOption(runtime.MIMEWildcard, &runtime.JSONPb{}),
+		),
 		httpServer: &http.Server{
 			Addr:         httpAddr,
 			ReadTimeout:  30 * time.Second,
 			WriteTimeout: 0, // No timeout for SSE
 			IdleTimeout:  120 * time.Second,
 		},
+	}
+}
+
+// SetStreamInterceptors installs the gRPC server's stream interceptors, in the
+// order the gRPC server chains them, so SSE StreamWeave requests are
+// authenticated and attributed to a user exactly like gRPC and gateway
+// requests. Must be called before Start(); not safe for concurrent use.
+func (h *HTTPServer) SetStreamInterceptors(interceptors ...grpc.StreamServerInterceptor) {
+	h.streamInterceptor = chainStreamInterceptors(interceptors)
+}
+
+// chainStreamInterceptors composes interceptors so the first is outermost,
+// matching grpc.ChainStreamInterceptor. Returns nil for an empty list.
+func chainStreamInterceptors(interceptors []grpc.StreamServerInterceptor) grpc.StreamServerInterceptor {
+	if len(interceptors) == 0 {
+		return nil
+	}
+	return func(srv any, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
+		next := handler
+		for i := len(interceptors) - 1; i >= 0; i-- {
+			interceptor, inner := interceptors[i], next
+			next = func(srv any, ss grpc.ServerStream) error {
+				return interceptor(srv, ss, info, inner)
+			}
+		}
+		return next(srv, ss)
 	}
 }
 
@@ -103,10 +143,8 @@ func (h *HTTPServer) SetAppHTMLProvider(p AppHTMLProvider) {
 
 // Start starts the HTTP server
 func (h *HTTPServer) Start(ctx context.Context) error {
-	// Create gRPC-gateway mux
-	mux := runtime.NewServeMux(
-		runtime.WithMarshalerOption(runtime.MIMEWildcard, &runtime.JSONPb{}),
-	)
+	// gRPC-gateway mux (built in the constructor; shared with the SSE handler)
+	mux := h.gatewayMux
 
 	// Connect to gRPC server
 	opts := []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())}
@@ -312,6 +350,10 @@ func (h *HTTPServer) handleOpenAPISpec(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(spec)
 }
 
+// streamWeaveFullMethod is StreamWeave's gRPC method name, as interceptors and
+// the gateway see it.
+const streamWeaveFullMethod = "/loom.v1.LoomService/StreamWeave"
+
 // handleStreamWeaveSSE handles SSE streaming for /v1/weave:stream
 func (h *HTTPServer) handleStreamWeaveSSE(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -326,77 +368,104 @@ func (h *HTTPServer) handleStreamWeaveSSE(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	// Set SSE headers
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("X-Accel-Buffering", "no") // Disable nginx buffering
-
-	// Flush headers immediately
-	if flusher, ok := w.(http.Flusher); ok {
-		flusher.Flush()
+	// Map HTTP headers to incoming gRPC metadata the way the gateway does
+	// (Authorization, Grpc-Metadata-* headers), so the interceptors below
+	// resolve identity from the same inputs as every other HTTP route.
+	ctx, err := runtime.AnnotateIncomingContext(r.Context(), h.gatewayMux, r, streamWeaveFullMethod,
+		runtime.WithHTTPPathPattern("/v1/weave:stream"))
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Invalid request: %v", err), http.StatusBadRequest)
+		return
 	}
 
-	ctx := withHTTPSlotOrigin(r.Context(), r)
-
-	// Create gRPC stream
+	// The context carries the client-asserted slot origin
+	// (X-Loom-Slot-Origin) as incoming gRPC metadata so interactive HTTP
+	// turns bypass door admission exactly like interactive gRPC turns.
 	stream := &sseStreamWrapper{
-		ctx:     ctx,
+		ctx:     withHTTPSlotOrigin(ctx, r),
 		writer:  w,
 		flusher: w.(http.Flusher),
 		logger:  h.logger,
 	}
 
-	// Emit periodic SSE heartbeats while StreamWeave runs. Some stages (e.g.
-	// pattern-selection / skill-decompose LLM calls) can run for tens of
-	// seconds without producing a single WeaveProgress event. Upstream
-	// proxies/load balancers with an idle-connection timeout (a common default
-	// is 60s) may kill an SSE connection that has been silent that long, which
-	// surfaces to the browser as a client-cancelled request and an empty
-	// response even though the agent was still working. A ~15s heartbeat
-	// keeps bytes flowing so those idle timeouts don't trigger.
-	heartbeatDone := make(chan struct{})
-	var heartbeatWg sync.WaitGroup
-	heartbeatWg.Add(1)
-	go func() {
-		defer heartbeatWg.Done()
-		ticker := time.NewTicker(15 * time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-heartbeatDone:
-				return
-			case <-ticker.C:
-				if err := stream.writeHeartbeat(); err != nil {
+	// SSE headers are written only once the interceptors admit the call, so
+	// an authentication failure is a plain HTTP error status, not a stream.
+	started := false
+	run := func(_ any, ss grpc.ServerStream) error {
+		stream.ctx = ss.Context()
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		w.Header().Set("X-Accel-Buffering", "no") // Disable nginx buffering
+		stream.flusher.Flush()
+		started = true
+
+		// Emit periodic SSE heartbeats while StreamWeave runs. Some stages (e.g.
+		// pattern-selection / skill-decompose LLM calls) can run for tens of
+		// seconds without producing a single WeaveProgress event. Upstream
+		// proxies/load balancers with an idle-connection timeout (a common default
+		// is 60s) may kill an SSE connection that has been silent that long, which
+		// surfaces to the browser as a client-cancelled request and an empty
+		// response even though the agent was still working. A ~15s heartbeat
+		// keeps bytes flowing so those idle timeouts don't trigger.
+		heartbeatDone := make(chan struct{})
+		var heartbeatWg sync.WaitGroup
+		heartbeatWg.Add(1)
+		go func() {
+			defer heartbeatWg.Done()
+			ticker := time.NewTicker(15 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-stream.ctx.Done():
 					return
+				case <-heartbeatDone:
+					return
+				case <-ticker.C:
+					if err := stream.writeHeartbeat(); err != nil {
+						return
+					}
 				}
 			}
-		}
-	}()
-	// Close the done channel to signal the goroutine, then wait for it to
-	// finish before returning so it cannot write to the ResponseWriter after
-	// ServeHTTP exits (which net/http forbids).
-	defer func() {
-		close(heartbeatDone)
-		heartbeatWg.Wait()
-	}()
+		}()
+		// Close the done channel to signal the goroutine, then wait for it to
+		// finish before returning so it cannot write to the ResponseWriter after
+		// ServeHTTP exits (which net/http forbids).
+		defer func() {
+			close(heartbeatDone)
+			heartbeatWg.Wait()
+		}()
 
-	// Execute StreamWeave
-	if err := h.grpcServer.StreamWeave(&req, stream); err != nil {
-		if isClientCanceled(err) {
-			// The client disconnected or cancelled the request (e.g. closed the
-			// tab/EventSource, navigated away, or hit a client-side timeout).
-			// This is routine SSE lifecycle, not a server failure, so it is
-			// logged at Info rather than Error to avoid false-positive alerts.
-			h.logger.Info("StreamWeave stopped: client disconnected", zap.Error(err))
-		} else {
-			h.logger.Error("StreamWeave failed", zap.Error(err))
-		}
-		// Send error as SSE event
-		stream.writeError(err)
+		return h.grpcServer.StreamWeave(&req, stream)
 	}
+
+	if h.streamInterceptor != nil {
+		err = h.streamInterceptor(h.grpcServer, stream, &grpc.StreamServerInfo{
+			FullMethod:     streamWeaveFullMethod,
+			IsServerStream: true,
+		}, run)
+	} else {
+		err = run(h.grpcServer, stream)
+	}
+	if err == nil {
+		return
+	}
+	if !started {
+		st, _ := status.FromError(err)
+		http.Error(w, st.Message(), runtime.HTTPStatusFromCode(st.Code()))
+		return
+	}
+	if isClientCanceled(err) {
+		// The client disconnected or cancelled the request (e.g. closed the
+		// tab/EventSource, navigated away, or hit a client-side timeout).
+		// This is routine SSE lifecycle, not a server failure, so it is
+		// logged at Info rather than Error to avoid false-positive alerts.
+		h.logger.Info("StreamWeave stopped: client disconnected", zap.Error(err))
+	} else {
+		h.logger.Error("StreamWeave failed", zap.Error(err))
+	}
+	// Send error as SSE event
+	stream.writeError(err)
 }
 
 // isClientCanceled reports whether err represents a client-initiated stream

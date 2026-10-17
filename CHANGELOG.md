@@ -53,6 +53,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 #### MCP tool adapter
 - The schema-lookup result cache no longer stores an empty answer (`{"columns":[]}`, `[]`, or an object whose array fields are all empty). A `describe_table` that found nothing — because the server was handed a name it could not resolve — was cached and then served to every later caller with the same arguments, so one bad lookup became "a table with no columns" for a whole fleet. The empty answer is still returned to the caller that got it; the next caller reaches the server again.
 
+### Security
+
+- **`/v1/weave:stream` (HTTP/SSE) now authenticates and identifies callers.** The SSE handler calls the service in-process and skipped the gRPC interceptors, so with `server.auth.enabled: true` SSE turns ran unauthenticated and, in every mode, without a user identity. `looms serve` now runs the same stream-interceptor chain on it (`HTTPServer.SetStreamInterceptors`), with headers mapped to metadata by the gateway's rules (`Authorization`, `Grpc-Metadata-*`), and writes SSE headers only once the call is admitted. Behavior change: SSE requests need the same credentials as gateway routes: `401` without a valid bearer token when auth is enabled, and `401` without `Grpc-Metadata-X-User-Id` on PostgreSQL storage with `require_user_id: true`; on SQLite storage they run as `default-user`. Embedders that install no interceptors keep the previous behavior. See `docs/reference/http-server.md#sse-authentication-and-identity`.
+
 ### Breaking Changes
 
 - **An undeclared `trigger.mode` now loads as `HYBRID`, not `MANUAL`.** With the mode enforced, the old default would have withheld from the model every skill that omits the field — in practice nearly all of them, since nothing read the mode before and no author chose `MANUAL` by writing nothing. `HYBRID` preserves how those skills behave today (the model may pull them; a slash command also invokes them). An embedder that wants a skill withheld must now declare `mode: MANUAL` on it.

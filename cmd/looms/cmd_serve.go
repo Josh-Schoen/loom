@@ -3625,6 +3625,9 @@ func runServe(cmd *cobra.Command, args []string) {
 		}
 
 		httpSrv = server.NewHTTPServerWithCORS(loomService, httpAddr, addr, logger, corsConfig)
+		// The SSE StreamWeave endpoint calls the service in-process, so it runs
+		// the same stream interceptors (authentication, user identity) itself.
+		httpSrv.SetStreamInterceptors(streamInterceptors...)
 
 		// Wire UI apps to HTTP endpoint for browser access
 		if uiRegistry != nil && uiRegistry.Count() > 0 {
