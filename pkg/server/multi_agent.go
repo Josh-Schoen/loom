@@ -19,6 +19,7 @@ import (
 	"github.com/teradata-labs/loom/internal/version"
 	"github.com/teradata-labs/loom/pkg/agent"
 	"github.com/teradata-labs/loom/pkg/artifacts"
+	"github.com/teradata-labs/loom/pkg/clienttools"
 	"github.com/teradata-labs/loom/pkg/communication"
 	"github.com/teradata-labs/loom/pkg/evals"
 	"github.com/teradata-labs/loom/pkg/llm/factory"
@@ -63,6 +64,12 @@ type MultiAgentServer struct {
 	// grounding, so honoring them is an explicit operator decision
 	// (server.allow_time_override). Set via SetAllowTimeOverride.
 	allowTimeOverride bool
+
+	// clientTools matches SubmitClientToolResult calls to the StreamWeave
+	// turns waiting on them; clientToolConfig is the operator's timeout policy
+	// (server.client_tools). See docs/architecture/client-tools.md.
+	clientTools      *clienttools.Broker
+	clientToolConfig clienttools.Config
 
 	defaultAgentID     string                           // Agent to use when no agent_id specified
 	patternBroadcaster *PatternEventBroadcaster         // Broadcasts pattern update events
@@ -267,6 +274,8 @@ func NewMultiAgentServer(agents map[string]*agent.Agent, store agent.SessionStor
 		llmConcurrencyLimit:               defaultLLMConcurrency,
 		llmSemaphore:                      make(chan struct{}, defaultLLMConcurrency),
 		weaveDedupe:                       newWeaveDeduper(),
+		clientTools:                       clienttools.NewBroker(),
+		clientToolConfig:                  clienttools.DefaultConfig(),
 		agentStates:                       make(map[string]*agentState),
 		traceStoreLocal:                   newTraceStore(1 * time.Hour), // Eagerly initialize trace store for GetTrace RPC
 	}
@@ -311,6 +320,20 @@ func (s *MultiAgentServer) SetAllowTimeOverride(allow bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.allowTimeOverride = allow
+}
+
+// SetClientToolConfig sets the timeout policy for client-executed tools
+// (server.client_tools). Non-positive fields keep their defaults.
+// This should be called after NewMultiAgentServer(), before serving.
+func (s *MultiAgentServer) SetClientToolConfig(cfg clienttools.Config) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if cfg.DefaultTimeout > 0 {
+		s.clientToolConfig.DefaultTimeout = cfg.DefaultTimeout
+	}
+	if cfg.MaxTimeout > 0 {
+		s.clientToolConfig.MaxTimeout = cfg.MaxTimeout
+	}
 }
 
 // SetLogger injects the logger for server operations.
@@ -808,6 +831,11 @@ func (s *MultiAgentServer) Weave(ctx context.Context, req *loomv1.WeaveRequest) 
 	if req.Query == "" {
 		return nil, status.Error(codes.InvalidArgument, "query is required")
 	}
+	// Client tool calls are handed back on the progress stream; unary Weave
+	// has no channel to deliver them on.
+	if len(req.GetClientTools()) > 0 {
+		return nil, status.Error(codes.InvalidArgument, "client_tools require StreamWeave")
+	}
 
 	// Idempotency dedupe (MCP 2026-07-28, D1): a re-issued request carrying
 	// the same key joins the original run instead of executing the turn twice.
@@ -1143,6 +1171,16 @@ func (s *MultiAgentServer) StreamWeave(req *loomv1.WeaveRequest, stream loomv1.L
 		}
 	}
 
+	// Validate client tools before anything with side effects (sub-agent
+	// spawn, context reset). A client tool may not shadow a tool the agent
+	// can already reach: a registered one or a builtin it could load.
+	clientToolSpecs, err := clienttools.Parse(req.GetClientTools(), func(name string) bool {
+		return ag.HasTool(name) || builtin.ByName(name) != nil
+	})
+	if err != nil {
+		return status.Error(codes.InvalidArgument, err.Error())
+	}
+
 	// Spawn workflow sub-agents if this is a workflow coordinator
 	if err := s.spawnWorkflowSubAgents(stream.Context(), ag, resolvedAgentID, sessionID); err != nil {
 		s.logger.Warn("Failed to spawn workflow sub-agents (workflow may run with limited functionality)",
@@ -1182,6 +1220,27 @@ func (s *MultiAgentServer) StreamWeave(req *loomv1.WeaveRequest, stream loomv1.L
 
 	// Create progress callback that sends events to channel
 	progressCallback := newProgressSender(progressChan, stream.Context().Done())
+
+	// Bind client tools to this call: advertised and resolved only through
+	// ctx, so they never reach another session, and handed back to this
+	// stream's caller when the agent calls them.
+	if len(clientToolSpecs) > 0 {
+		s.mu.RLock()
+		toolCfg := s.clientToolConfig
+		tracer := s.tracer
+		s.mu.RUnlock()
+		if tracer == nil {
+			tracer = observability.NewNoOpTracer()
+		}
+		ctx = shuttle.ContextWithCallScopedTools(ctx, clienttools.Bind(clientToolSpecs, clienttools.Call{
+			SessionID:   sessionID,
+			OwnerUserID: postgres.UserIDFromContext(stream.Context()),
+			Timeout:     toolCfg.Timeout(req.GetClientToolTimeoutSeconds()),
+			Broker:      s.clientTools,
+			Emit:        progressCallback,
+			Tracer:      tracer,
+		}))
+	}
 
 	// Execute agent with progress callback
 	go func() {
@@ -1232,6 +1291,7 @@ func (s *MultiAgentServer) StreamWeave(req *loomv1.WeaveRequest, stream loomv1.L
 
 			// Include tool lifecycle fields if present
 			applyToolLifecycleFields(protoProgress, event)
+			applyClientToolCall(protoProgress, event)
 
 			// Send to client
 			if err := stream.Send(protoProgress); err != nil {

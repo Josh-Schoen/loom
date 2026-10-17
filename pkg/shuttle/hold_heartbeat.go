@@ -42,11 +42,11 @@ type Heartbeater interface {
 	Heartbeat(ctx context.Context) error
 }
 
-// holdHeartbeatInterval is how often a still-pending hold pokes a Heartbeater
-// notifier. Shared by both hold origins — the ask resolver and contact_human —
-// so the two cannot drift. 30s sits comfortably inside common proxy read
+// HoldHeartbeatInterval is how often a still-pending hold pokes a Heartbeater
+// notifier. Shared by every hold origin — the ask resolver, contact_human, and
+// client-executed tools awaiting their caller — so they cannot drift. 30s sits comfortably inside common proxy read
 // timeouts while costing at most ~10 events over a default-length hold.
-const holdHeartbeatInterval = 30 * time.Second
+const HoldHeartbeatInterval = 30 * time.Second
 
 // holdBeater is the per-hold heartbeat bookkeeping shared by both waiters. It
 // is owned by the single goroutine running the hold — the turn's — and carries

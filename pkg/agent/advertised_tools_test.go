@@ -70,7 +70,7 @@ func registerSessionScopedTool(a *Agent, sessionID, name string) {
 // advertisedNames returns the ordered tool names the agent would advertise to
 // session on a provider call.
 func advertisedNames(a *Agent, session *Session) []string {
-	tools := a.advertisedTools(session)
+	tools := a.advertisedTools(context.Background(), session)
 	names := make([]string, len(tools))
 	for i, tl := range tools {
 		names[i] = tl.Name()
@@ -166,5 +166,33 @@ func TestAdvertisedTools_OtherSessionEventDoesNotChangeThisSession(t *testing.T)
 		if name == "b_only_tool" {
 			t.Fatalf("session A advertised session B's scoped tool: %v", after)
 		}
+	}
+}
+
+// Call-scoped tools (client tools a StreamWeave request declared) are
+// advertised only on the provider calls whose ctx carries them, merged into the
+// same name-sorted projection as registered tools. A ctx without them sees the
+// agent's tools unchanged, so one caller's tools never reach another session.
+func TestAdvertisedTools_CallScopedToolsOnlyForTheirCall(t *testing.T) {
+	a := newAdvertisedToolsAgent(t, "bravo", "zulu")
+	session := &Session{ID: "session-1"}
+
+	callCtx := shuttle.ContextWithCallScopedTools(context.Background(),
+		[]shuttle.Tool{namedStubTool{name: "mike"}, namedStubTool{name: "alpha"}})
+
+	tools := a.advertisedTools(callCtx, session)
+	got := make([]string, len(tools))
+	for i, tl := range tools {
+		got[i] = tl.Name()
+	}
+	if want := []string{"alpha", "bravo", "mike", "zulu"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("call with scoped tools advertised %v, want %v", got, want)
+	}
+
+	if got, want := advertisedNames(a, session), []string{"bravo", "zulu"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("call without scoped tools advertised %v, want %v", got, want)
+	}
+	if a.HasTool("mike") {
+		t.Fatal("call-scoped tools must never enter the shared registry")
 	}
 }

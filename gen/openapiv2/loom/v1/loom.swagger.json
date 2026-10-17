@@ -4435,9 +4435,9 @@
           "type": "string",
           "description": "Name of the client tool, as declared in WeaveRequest.client_tools."
         },
-        "arguments": {
-          "type": "object",
-          "description": "Arguments produced by the agent, shaped by the tool's input schema."
+        "argumentsJson": {
+          "type": "string",
+          "description": "Arguments produced by the agent as a JSON object, shaped by the tool's\ninput schema. Carried as a JSON string (like ToolDefinition.input_schema_json)\nso it reads the same on every transport, including the SSE stream."
         },
         "sessionId": {
           "type": "string",

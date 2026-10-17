@@ -32,6 +32,7 @@ import (
 	"github.com/teradata-labs/loom/internal/sqlitedriver"
 	"github.com/teradata-labs/loom/pkg/agent"
 	"github.com/teradata-labs/loom/pkg/artifacts"
+	"github.com/teradata-labs/loom/pkg/clienttools"
 	"github.com/teradata-labs/loom/pkg/communication"
 	loomconfig "github.com/teradata-labs/loom/pkg/config"
 	"github.com/teradata-labs/loom/pkg/embedding"
@@ -2567,6 +2568,12 @@ func runServe(cmd *cobra.Command, args []string) {
 		logger.Info("Clarification timeout configured",
 			zap.Int("channel_send_timeout_ms", config.Server.Clarification.ChannelSendTimeoutMs))
 	}
+
+	// Wait policy for client-executed tools (WeaveRequest.client_tools).
+	loomService.SetClientToolConfig(clienttools.Config{
+		DefaultTimeout: time.Duration(config.Server.ClientTools.DefaultTimeoutSeconds) * time.Second,
+		MaxTimeout:     time.Duration(config.Server.ClientTools.MaxTimeoutSeconds) * time.Second,
+	})
 
 	// Set LLM concurrency limit. Bounds in-flight LLM calls across the whole
 	// server: 1 fully serialises (recommended for a single local Ollama slot),

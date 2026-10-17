@@ -1,10 +1,12 @@
 # Client-Executed Tools
 
-**Status:** 📋 Planned. The API is defined in `proto/loom/v1/loom.proto`
-(`WeaveRequest.client_tools`, `WeaveRequest.client_tool_timeout_seconds`,
-`WeaveProgress.client_tool_call`, `SubmitClientToolResult`). The server does
-not implement it yet: `SubmitClientToolResult` returns `UNIMPLEMENTED`, and
-`client_tools` on a request is ignored.
+**Status:** ⚠️ Partial. Implemented in the multi-agent server (`looms serve`):
+`pkg/clienttools`, call-scoped tool resolution in `pkg/shuttle` and
+`pkg/agent`, wiring in `pkg/server`. gRPC `StreamWeave` clients work end to
+end. Clients on the HTTP/SSE endpoint cannot yet answer calls (see
+[Constraints](#constraints-and-limitations)). The single-agent server
+(`loom-standalone`) rejects `client_tools` with `UNIMPLEMENTED`. API reference:
+`docs/reference/streaming.md#client-executed-tools`.
 **Relates to:** HITL holds and heartbeats (`pkg/shuttle/hold_heartbeat.go`,
 `docs/architecture/hitl-park-and-resume.md`)
 
@@ -124,14 +126,23 @@ way to send data back on it.
   existing tool definition (name, description, `input_schema_json`). Names are
   unique within the list and must not collide with the agent's tools.
 - **`WeaveProgress.client_tool_call`** (`ClientToolCall`): `tool_call_id`,
-  `tool_name`, `arguments` (`Struct`), `session_id`, `timeout_seconds`.
+  `tool_name`, `arguments_json`, `session_id`, `timeout_seconds`.
   `session_id` is always set because the client needs it to answer, even when
-  the request did not name a session.
+  the request did not name a session. Arguments are a JSON string rather than
+  a `Struct` because the SSE endpoint encodes frames with `encoding/json`,
+  which renders a `Struct` as its internal oneof representation; a string
+  reads the same on gRPC, the gateway, and SSE.
 - **`SubmitClientToolResultRequest`**: `session_id`, `tool_call_id`, and either
   `success = true` with `output` (`Value`) or `success = false` with
   `error_code` and `error_message`.
-- **Pending call table** (server, planned): keyed by
-  `(session_id, tool_call_id)`, value is the channel the held turn waits on.
+- **Call-scoped tool set** (`shuttle.ContextWithCallScopedTools`): the
+  client tools, bound to one call, carried on that call's `context.Context`.
+  The agent's advertised-tool projection appends them; the executor resolves
+  them before its shared registry. They never enter the agent's `Registry`,
+  which is shared by every session of the agent.
+- **Pending call table** (`clienttools.Broker`): keyed by
+  `(session_id, tool_call_id)`; each entry holds the owning user id and a
+  1-buffered channel the held turn waits on.
 
 **Invariants**
 
@@ -171,7 +182,24 @@ gRPC and REST.
 **Alternative considered**: a new bidirectional `StreamWeave` variant. Works
 for gRPC only; rejected.
 
-### Decision 3: Reuse `ToolDefinition`
+### Decision 3: Carry client tools on the call context
+
+**Chosen**: a per-call tool set on `context.Context`, consulted by the
+advertised-tool projection and the executor.
+
+**Rationale**: the agent's tool `Registry` is shared by every session of the
+agent and holds one definition per name. Registering client tools there would
+offer one caller's tools to other sessions, and two callers declaring the same
+name with different schemas would overwrite each other. The existing
+per-session advertisement ledger scopes visibility but still shares the one
+definition per name. A context-scoped set has neither problem and disappears
+with the call.
+
+**Alternative considered**: register on the agent and unregister when the
+call ends. Rejected for the cross-session exposure during the call and the
+name collisions above.
+
+### Decision 4: Reuse `ToolDefinition`
 
 **Chosen**: reuse the existing message.
 
@@ -180,7 +208,7 @@ JSON Schema input), `RegisterTool` uses it, and clients can produce it without
 a new type. The rich-metadata fields (use cases, conflicts) are optional and
 can be left empty.
 
-### Decision 4: Approval belongs to the client
+### Decision 5: Approval belongs to the client
 
 **Rationale**: only the client knows what a tool does on its side (adding a
 reminder vs. submitting a form in a logged-in browser) and only it can show
@@ -192,7 +220,9 @@ result (`error_code = "DECLINED_BY_USER"` by convention).
 ## Concurrency Model
 
 - Each held call blocks the turn goroutine on a per-call channel, as HITL holds
-  do. Hold heartbeats keep the SSE stream alive while waiting.
+  do. Heartbeats (every `shuttle.HoldHeartbeatInterval`, 30s) are emitted from
+  that same goroutine as droppable progress events, so a slow consumer can
+  never stall the wait.
 - `SubmitClientToolResult` runs on a different goroutine (its own RPC). It
   removes the entry from the pending table under a mutex and then sends on the
   channel, so two concurrent submissions for one id resolve exactly once.
@@ -213,9 +243,11 @@ result (`error_code = "DECLINED_BY_USER"` by convention).
 | Unknown / answered id | — | `accepted = false`, `error` set |
 | `client_tools` on unary `Weave` | — | `INVALID_ARGUMENT` |
 | Name collides with agent tool | — | `INVALID_ARGUMENT` |
+| `tool_call_id` already pending in the session | failed tool result, `CLIENT_TOOL_DUPLICATE_CALL` | — |
 
-Each client tool call should be traced like a server tool call, with the wait
-time recorded as a span attribute.
+Each call runs inside the agent's `agent.tool_execution` span and opens a
+`client_tool.execute` span recording the tool name, call id, timeout, wait
+time, and outcome.
 
 ---
 
@@ -224,9 +256,10 @@ time recorded as a span attribute.
 - **Trust boundary.** Arguments come from the model; the client validates them
   against the schema it declared before acting. Results come from the client;
   the server treats them as untrusted tool output.
-- **Session binding.** A result is accepted only for a call pending in the
-  named session, under the server's existing authentication. Guessing a
-  `tool_call_id` from another session gives nothing.
+- **Owner binding.** A result is accepted only for a call pending in the named
+  session and only from the user identity whose stream received the call.
+  Every rejection returns the same reason, so a submitter cannot probe for
+  other users' calls.
 - **No shadowing.** Rejecting name collisions stops a client from replacing a
   server tool's behavior.
 - **High-risk clients.** Browser tools that act in a logged-in session are the
@@ -237,11 +270,19 @@ time recorded as a span attribute.
 
 ## Constraints and Limitations
 
+- **SSE identity gap.** The `/v1/weave:stream` SSE handler calls `StreamWeave`
+  directly and does not run the gRPC interceptors (JWT authentication and
+  `x-user-id` extraction), so its stream carries no user identity, while
+  `SubmitClientToolResult` over the HTTP gateway does. Owner binding therefore
+  rejects results for calls made on SSE streams. Resolving this means giving
+  the SSE handler the same identity resolution as the gRPC path, which also
+  closes the wider gap of SSE turns running unauthenticated when
+  `server.auth.enabled` is true.
 - `StreamWeave` only; unary `Weave` cannot carry client tools.
 - A turn holds server resources while waiting; `client_tool_timeout_seconds`
   bounds this and servers may cap it.
 - Client tools are not available to sub-agents or workflows spawned during the
-  call unless the implementation forwards them; the first version does not.
+  call.
 - If the stream drops, pending calls fail; the client cannot resume them on a
   new stream.
 

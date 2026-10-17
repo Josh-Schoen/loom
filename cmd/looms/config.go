@@ -19,9 +19,11 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/spf13/viper"
 	loomv1 "github.com/teradata-labs/loom/gen/go/loom/v1"
+	"github.com/teradata-labs/loom/pkg/clienttools"
 	loomconfig "github.com/teradata-labs/loom/pkg/config"
 	"github.com/teradata-labs/loom/pkg/shuttle"
 	"github.com/zalando/go-keyring"
@@ -205,6 +207,7 @@ type ServerConfig struct {
 	AllowTimeOverride bool                `mapstructure:"allow_time_override"` // Honor WeaveRequest.occurred_at for replayed/imported conversations (default: false)
 	TLS               TLSConfig           `mapstructure:"tls"`
 	Clarification     ClarificationConfig `mapstructure:"clarification"` // Clarification question timeouts
+	ClientTools       ClientToolsConfig   `mapstructure:"client_tools"`  // Client-executed tool wait policy
 	CORS              CORSServerConfig    `mapstructure:"cors"`          // CORS configuration for HTTP endpoints
 	Auth              AuthConfig          `mapstructure:"auth"`          // Endpoint authentication (Supabase JWT)
 }
@@ -252,6 +255,18 @@ type ClarificationConfig struct {
 
 	// ChannelSendTimeoutMs is the timeout for sending to answer channel (default: 100)
 	ChannelSendTimeoutMs int `mapstructure:"channel_send_timeout_ms"`
+}
+
+// ClientToolsConfig holds the wait policy for client-executed tools
+// (WeaveRequest.client_tools): how long a held turn waits for the caller's
+// SubmitClientToolResult.
+type ClientToolsConfig struct {
+	// DefaultTimeoutSeconds applies when a request sets no
+	// client_tool_timeout_seconds (default: 300)
+	DefaultTimeoutSeconds int `mapstructure:"default_timeout_seconds"`
+
+	// MaxTimeoutSeconds caps any requested timeout (default: 900)
+	MaxTimeoutSeconds int `mapstructure:"max_timeout_seconds"`
 }
 
 // TLSConfig holds TLS/HTTPS configuration for the server.
@@ -1115,6 +1130,8 @@ func setDefaults() {
 	// Clarification defaults
 	viper.SetDefault("server.clarification.rpc_timeout_seconds", 5)
 	viper.SetDefault("server.clarification.channel_send_timeout_ms", 100)
+	viper.SetDefault("server.client_tools.default_timeout_seconds", int(clienttools.DefaultTimeout/time.Second))
+	viper.SetDefault("server.client_tools.max_timeout_seconds", int(clienttools.DefaultMaxTimeout/time.Second))
 
 	// CORS defaults (permissive for development, MUST be configured for production)
 	// SECURITY WARNING: Defaults to wildcard origins for best DX - change in production!

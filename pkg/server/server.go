@@ -120,6 +120,9 @@ func (s *Server) Weave(ctx context.Context, req *loomv1.WeaveRequest) (*loomv1.W
 	if req.Query == "" {
 		return nil, status.Error(codes.InvalidArgument, "query is required")
 	}
+	if err := rejectClientTools(req); err != nil {
+		return nil, err
+	}
 
 	// Replay/import support: validate occurred_at and thread it through the
 	// context so persisted rows anchor at the conversation's historical time.
@@ -198,6 +201,9 @@ func (s *Server) StreamWeave(req *loomv1.WeaveRequest, stream loomv1.LoomService
 	// Validate query
 	if req.Query == "" {
 		return status.Error(codes.InvalidArgument, "query cannot be empty")
+	}
+	if err := rejectClientTools(req); err != nil {
+		return err
 	}
 
 	// Replay/import support: validate occurred_at and thread it through the
@@ -448,6 +454,47 @@ func applyToolLifecycleFields(proto *loomv1.WeaveProgress, event agent.ProgressE
 			proto.ToolResult = v
 		}
 	}
+}
+
+// rejectClientTools refuses client_tools on the single-agent Server, which
+// does not implement them (MultiAgentServer does). Rejecting is better than
+// ignoring: a caller that declared tools would otherwise wait on calls the
+// agent was never offered.
+func rejectClientTools(req *loomv1.WeaveRequest) error {
+	if len(req.GetClientTools()) > 0 {
+		return status.Error(codes.Unimplemented, "client_tools are not supported by this server")
+	}
+	return nil
+}
+
+// applyClientToolCall populates WeaveProgress.client_tool_call when the event
+// hands a client tool call to the caller.
+func applyClientToolCall(proto *loomv1.WeaveProgress, event agent.ProgressEvent) {
+	call := event.ClientToolCall
+	if call == nil {
+		return
+	}
+	proto.ClientToolCall = &loomv1.ClientToolCall{
+		ToolCallId:     call.ToolCallID,
+		ToolName:       call.ToolName,
+		ArgumentsJson:  argumentsJSON(call.Arguments),
+		SessionId:      call.SessionID,
+		TimeoutSeconds: types.SafeInt32(int(call.Timeout.Seconds())),
+	}
+}
+
+// argumentsJSON renders tool arguments as a JSON object. Model-produced
+// arguments come from JSON, so marshaling fails only for values that never
+// could; those render as an empty object rather than dropping the frame.
+func argumentsJSON(args map[string]interface{}) string {
+	if args == nil {
+		return "{}"
+	}
+	raw, err := json.Marshal(args)
+	if err != nil {
+		return "{}"
+	}
+	return string(raw)
 }
 
 // CreateSession creates a new conversation session.

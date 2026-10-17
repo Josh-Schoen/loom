@@ -252,7 +252,7 @@ func TestAskResolver_NilNotifierWithHeartbeatDoesNotPanic(t *testing.T) {
 func TestNewHITLAskResolver_DefaultsHeartbeatInterval(t *testing.T) {
 	r, ok := NewHITLAskResolver(NewInMemoryHumanRequestStore(), 0, 0, nil).(*hitlAskResolver)
 	require.True(t, ok)
-	require.Equal(t, holdHeartbeatInterval, r.heartbeat)
+	require.Equal(t, HoldHeartbeatInterval, r.heartbeat)
 	require.Equal(t, 300*time.Second, r.timeout)
 	require.Equal(t, time.Second, r.poll)
 }

@@ -741,11 +741,13 @@ func (a *Agent) registerSessionTool(sessionID string, name string) {
 
 // advertisedTools is the per-session tool projection offered on a provider call:
 // every registered tool that is base (not session-scoped) or present in this
-// session's ledger, with skill-excluded and permission-hidden tools removed and
-// the result name-sorted for a deterministic order that is byte-stable across
-// consecutive calls unless this session's own ledger changed. Re-derived per
-// provider call so a mid-turn registration surfaces on the same turn.
-func (a *Agent) advertisedTools(session *Session) []shuttle.Tool {
+// session's ledger, plus the call-scoped tools ctx carries (see
+// shuttle.ContextWithCallScopedTools), with skill-excluded and
+// permission-hidden tools removed and the result name-sorted for a
+// deterministic order that is byte-stable across consecutive calls unless this
+// session's own ledger changed. Re-derived per provider call so a mid-turn
+// registration surfaces on the same turn.
+func (a *Agent) advertisedTools(ctx context.Context, session *Session) []shuttle.Tool {
 	all := a.tools.ListTools()
 
 	sessionID := a.id
@@ -763,6 +765,10 @@ func (a *Agent) advertisedTools(session *Session) []shuttle.Tool {
 		}
 	}
 	a.mu.RUnlock()
+
+	// Call-scoped tools never share a name with a registered tool (callers
+	// validate that up front); they are appended, not merged.
+	out = append(out, shuttle.CallScopedTools(ctx)...)
 
 	out = a.applySkillExcludedTools(out, session)
 	out = a.applyPermissionToolFilter(out)
@@ -995,6 +1001,11 @@ func (a *Agent) evaluateLazyTools(msg string) {
 // ToolCount returns the number of registered tools.
 func (a *Agent) ToolCount() int {
 	return a.tools.Count()
+}
+
+// HasTool reports whether a tool with this name is registered.
+func (a *Agent) HasTool(name string) bool {
+	return a.tools.IsRegistered(name)
 }
 
 // ListTools returns a list of all registered tool names.
@@ -2390,7 +2401,7 @@ func (a *Agent) runConversationLoop(ctx Context) (*Response, error) {
 		// Re-derive the advertised tools for this provider call so a mid-turn
 		// registration (skill load, progressive disclosure) surfaces on the
 		// same turn. Circuit-breaker-disabled tools stay filtered across turns.
-		tools := a.advertisedTools(session)
+		tools := a.advertisedTools(ctx, session)
 		tools = recovery.activeTools(tools)
 
 		// KERNEL accounting (HLD §2; blueprint A6): the serialized bytes of the
@@ -2426,7 +2437,7 @@ func (a *Agent) runConversationLoop(ctx Context) (*Response, error) {
 					zap.Int("estimate_tokens", estimate),
 					zap.Int("target_tokens", target))
 				messages = session.GetMessages()
-				tools = a.advertisedTools(session)
+				tools = a.advertisedTools(ctx, session)
 				tools = recovery.activeTools(tools)
 				segMem.SetAdvertisedToolsBytes(advertisedToolsBytes(tools))
 			}
@@ -2461,7 +2472,7 @@ func (a *Agent) runConversationLoop(ctx Context) (*Response, error) {
 				// (HLD §4.5): its tools leave KERNEL. The resend is a recompile,
 				// so recompute BOTH messages and the advertised tool set.
 				messages = session.GetMessages()
-				tools = a.advertisedTools(session)
+				tools = a.advertisedTools(ctx, session)
 				tools = recovery.activeTools(tools)
 				if segMem2, ok := session.SegmentedMem.(*SegmentedMemory); ok && segMem2 != nil {
 					segMem2.SetAdvertisedToolsBytes(advertisedToolsBytes(tools))
@@ -2912,7 +2923,11 @@ func (a *Agent) dispatchOneCall(ctx Context, session *Session, toolCall ToolCall
 	toolSpan.SetAttribute("tool_name", toolCall.Name)
 
 	// Execute with self-correction (circuit breaker + SQL correction)
-	result, err := a.executeToolWithSelfCorrection(ctx, toolCall.Name, toolCall.Input, session.ID)
+	result, err := a.executeToolWithSelfCorrection(&contextWithValue{
+		Context: ctx,
+		key:     shuttle.ToolCallIDContextKey(),
+		val:     toolCall.ID,
+	}, toolCall.Name, toolCall.Input, session.ID)
 
 	// Tier 1: if tool CB fired, disable tool and inject synthetic result.
 	if err != nil && strings.Contains(err.Error(), "circuit breaker open") && st.recovery != nil {

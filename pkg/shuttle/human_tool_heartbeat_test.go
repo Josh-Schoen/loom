@@ -142,5 +142,5 @@ func TestContactHuman_HeartbeatIsOptInByCapability(t *testing.T) {
 // origins cannot drift.
 func TestNewContactHumanTool_DefaultsHeartbeatInterval(t *testing.T) {
 	tool := NewContactHumanTool(ContactHumanConfig{})
-	require.Equal(t, holdHeartbeatInterval, tool.heartbeat)
+	require.Equal(t, HoldHeartbeatInterval, tool.heartbeat)
 }

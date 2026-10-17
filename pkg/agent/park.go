@@ -1132,7 +1132,7 @@ func (a *Agent) completeParkedBatch(ctx Context, sess *Session, batch Message, r
 	}
 	resumeExecCount := 0
 	var resumeExecs []ToolExecution
-	tools := a.advertisedTools(sess)
+	tools := a.advertisedTools(ctx, sess)
 	var recovery *recoveryOrchestrator
 	_, span := ctx.Tracer().StartSpan(ctx, "agent.resume_batch")
 	defer ctx.Tracer().EndSpan(span)

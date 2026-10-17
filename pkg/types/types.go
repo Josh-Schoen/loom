@@ -423,6 +423,25 @@ type HITLRequestInfo struct {
 	Context map[string]interface{}
 }
 
+// ClientToolCallInfo describes a tool call handed to the caller for execution
+// (a client-executed tool declared on the request).
+type ClientToolCallInfo struct {
+	// ToolCallID identifies the call; the caller echoes it with the result.
+	ToolCallID string
+
+	// ToolName is the client tool's name as the caller declared it.
+	ToolName string
+
+	// Arguments are the model-produced arguments for the call.
+	Arguments map[string]interface{}
+
+	// SessionID is the session the call belongs to.
+	SessionID string
+
+	// Timeout is how long the server waits for the result.
+	Timeout time.Duration
+}
+
 // ProgressEvent represents a progress update during agent execution.
 type ProgressEvent struct {
 	// Stage is the current execution stage
@@ -494,6 +513,11 @@ type ProgressEvent struct {
 
 	// ToolCallID is a unique identifier correlating started/completed events for the same tool call
 	ToolCallID string
+
+	// ClientToolCall is set when a client-executed tool's call is handed to the
+	// caller. The turn is held until the caller returns the result or the call
+	// times out.
+	ClientToolCall *ClientToolCallInfo
 }
 
 // ProgressCallback is called when agent execution progress occurs.

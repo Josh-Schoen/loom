@@ -866,8 +866,10 @@ message ClientToolCall {
   // Name of the client tool, as declared in WeaveRequest.client_tools.
   string tool_name = 2;
 
-  // Arguments produced by the agent, shaped by the tool's input schema.
-  google.protobuf.Struct arguments = 3;
+  // Arguments produced by the agent as a JSON object, shaped by the tool's
+  // input schema. Carried as a JSON string (like ToolDefinition.input_schema_json)
+  // so it reads the same on every transport, including the SSE stream.
+  string arguments_json = 3;
 
   // Session the call belongs to. Required by SubmitClientToolResult; set even
   // when the request did not name a session.

@@ -21,6 +21,7 @@ Technical specification for real-time streaming in Loom via StreamWeave and Subs
 - [Cancellation](#cancellation)
 - [Performance](#performance)
 - [Examples](#examples)
+- [Client-Executed Tools](#client-executed-tools)
 - [SubscribeToSession RPC](#subscribetosession-rpc)
 - [Comparison: Weave vs StreamWeave vs SubscribeToSession](#comparison-weave-vs-streamweave-vs-subscribetosession)
 - [Comparison: Weave vs StreamWeave](#comparison-weave-vs-streamweave)
@@ -352,6 +353,22 @@ Context window state after the response. Reports how full the context window is.
 - `context_tokens_max` (int64): Context token budget (max context window)
 - `rom` (string): ROM identifier loaded (empty if none)
 - `tools_loaded` (repeated string): Tool names currently registered on the agent
+
+
+#### client_tool_call
+
+**Type**: `ClientToolCall`
+**Required**: No (only when the agent calls a tool declared in `WeaveRequest.client_tools`)
+**Available since**: Unreleased (after v1.4.0)
+
+A tool call the server hands to the caller for execution. The turn is held until the caller posts the result with `SubmitClientToolResult` or the call times out. See [Client-Executed Tools](#client-executed-tools).
+
+**Fields**:
+- `tool_call_id` (string): Identifier to echo back in `SubmitClientToolResult`. Equals the `tool_call_id` on the tool lifecycle events of the same call.
+- `tool_name` (string): Client tool name, as declared in `client_tools`.
+- `arguments_json` (string): Model-produced arguments as a JSON object.
+- `session_id` (string): Session the call belongs to. Set even when the request named no session.
+- `timeout_seconds` (int32): Seconds the server waits for the result.
 
 
 ## Execution Stages
@@ -1013,6 +1030,117 @@ func debugStream(stream loomv1.LoomService_StreamWeaveClient, logger *zap.Logger
     }
 }
 ```
+
+
+## Client-Executed Tools
+
+**Available since**: Unreleased (after v1.4.0)
+**Server support**: `looms serve` (multi-agent server). The single-agent server used by `loom-standalone` rejects `client_tools` with `UNIMPLEMENTED`.
+
+A `StreamWeave` caller can offer tools it executes itself (device APIs, a browser session, local files). The agent sees them as ordinary tools for that call only. When the agent calls one, the server sends a `client_tool_call` frame, waits for `SubmitClientToolResult`, and gives the result to the agent as the tool result. Design: [`docs/architecture/client-tools.md`](../architecture/client-tools.md).
+
+### Request Fields
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `client_tools` | `repeated ToolDefinition` | empty | Tools the caller runs. Uses `name`, `description`, `input_schema_json`. |
+| `client_tool_timeout_seconds` | `int32` | `server.client_tools.default_timeout_seconds` | Wait per call. Capped at `server.client_tools.max_timeout_seconds`. |
+
+**Constraints** (violations return `INVALID_ARGUMENT` before the agent runs):
+- `name` must match `^[A-Za-z0-9_-]{1,64}$` and be unique in the list.
+- `name` must not equal a tool registered on the agent or a builtin tool name.
+- `input_schema_json` must be empty (no parameters) or a JSON Schema whose top-level `type` is `"object"`.
+- Unary `Weave` rejects a non-empty `client_tools`.
+
+Client tools are not registered on the agent. A later call in the same session does not see them unless it declares them again. Tool admission policies (`gated-allowlist`, `denylist`, `ask`) apply to client tool calls the same way they apply to server tools.
+
+### SubmitClientToolResult RPC
+
+```proto
+rpc SubmitClientToolResult(SubmitClientToolResultRequest) returns (SubmitClientToolResultResponse)
+// HTTP: POST /v1/sessions/{session_id}/client-tool-results
+```
+
+**Request**:
+- `session_id` (string, required): `client_tool_call.session_id`.
+- `tool_call_id` (string, required): `client_tool_call.tool_call_id`.
+- `success` (bool): Whether the tool ran.
+- `output` (`google.protobuf.Value`): Tool output when `success` is true.
+- `error_code` (string): Failure code when `success` is false (for example `DECLINED_BY_USER`). Defaults to `CLIENT_TOOL_FAILED` when empty.
+- `error_message` (string): Failure description.
+
+**Response**:
+- `accepted` (bool): True when the result reached the waiting turn.
+- `error` (string): Why it was not accepted.
+
+A result is accepted once per `tool_call_id`, and only from the user identity whose stream received the call. A submission for an unknown, already answered, timed-out, or other user's call returns `accepted: false` with the same `error` text in every case.
+
+**Errors**:
+
+| Code | Condition |
+|------|-----------|
+| `INVALID_ARGUMENT` | `session_id` or `tool_call_id` is empty |
+
+### What the Agent Receives
+
+| Outcome | Tool result |
+|---------|-------------|
+| `success: true` | Success with `output` as data |
+| `success: false` | Failure with the client's `error_code` and `error_message` |
+| No result within the timeout, or the stream ends first | Failure with code `CLIENT_TOOL_TIMEOUT` |
+| `tool_call_id` already pending in the session | Failure with code `CLIENT_TOOL_DUPLICATE_CALL` |
+
+While a call waits, the server sends a heartbeat frame every 30 seconds: stage `EXECUTION_STAGE_TOOL_EXECUTION`, no `client_tool_call`, no tool lifecycle flags. Heartbeats carry no state and may be dropped under backpressure.
+
+### Configuration
+
+```yaml
+server:
+  client_tools:
+    default_timeout_seconds: 300   # wait when a request sets no timeout (default: 300)
+    max_timeout_seconds: 900       # cap on any requested timeout (default: 900)
+```
+
+### Example (HTTP/SSE)
+
+Declare the tool on the stream:
+
+```bash
+curl -N -X POST http://localhost:5006/v1/weave:stream \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "Remind me to buy milk tomorrow at 9",
+    "client_tools": [{
+      "name": "device_add_reminder",
+      "description": "Adds a reminder on the user'"'"'s phone.",
+      "input_schema_json": "{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"string\"},\"due\":{\"type\":\"string\",\"format\":\"date-time\"}},\"required\":[\"title\"]}"
+    }]
+  }'
+```
+
+The hand-off frame (other fields omitted):
+
+```
+data: {"stage":4,"progress":50,"message":"Waiting for the client to run device_add_reminder","tool_name":"device_add_reminder","client_tool_call":{"tool_call_id":"toolu_01","tool_name":"device_add_reminder","arguments_json":"{\"due\":\"2026-10-18T09:00:00Z\",\"title\":\"Buy milk\"}","session_id":"sess_abc123","timeout_seconds":300}}
+```
+
+Post the result on a second connection:
+
+```bash
+curl -X POST http://localhost:5006/v1/sessions/sess_abc123/client-tool-results \
+  -H "Content-Type: application/json" \
+  -d '{"tool_call_id": "toolu_01", "success": true, "output": {"reminder_id": "rem-123"}}'
+```
+
+```json
+{"accepted":true}
+```
+
+### Limitations
+
+- ⚠️ **Identity on the SSE endpoint.** `/v1/weave:stream` is served by a custom handler that does not run the gRPC interceptors, so the stream carries no user identity while `SubmitClientToolResult` over the HTTP gateway does. Because results are bound to the stream's user, an SSE stream's calls cannot currently be answered over the gateway. gRPC `StreamWeave` clients are not affected.
+- Client tools are not forwarded to sub-agents or workflow agents spawned during the call.
+- A pending call fails when its stream ends; it cannot be resumed on a new stream.
 
 
 ## SubscribeToSession RPC

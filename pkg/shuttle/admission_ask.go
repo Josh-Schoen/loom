@@ -130,7 +130,7 @@ type hitlAskResolver struct {
 // store poll interval (default 1s, mirroring ContactHumanConfig). notifier is
 // fired once the pending request is stored so the hold surfaces on the progress
 // stream; a nil notifier disables the emit (the hold is unaffected). A notifier
-// that also implements Heartbeater is poked every holdHeartbeatInterval while
+// that also implements Heartbeater is poked every HoldHeartbeatInterval while
 // the hold is still pending, so a byte-silent hold cannot trip a proxy's
 // inactivity timeout; one that does not is never heartbeaten.
 func NewHITLAskResolver(store HumanRequestStore, timeout, poll time.Duration, notifier Notifier) AskResolver {
@@ -145,7 +145,7 @@ func NewHITLAskResolver(store HumanRequestStore, timeout, poll time.Duration, no
 		timeout:   timeout,
 		poll:      poll,
 		notifier:  notifier,
-		heartbeat: holdHeartbeatInterval,
+		heartbeat: HoldHeartbeatInterval,
 	}
 }
 

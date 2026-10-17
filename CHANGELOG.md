@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Client-executed tools API (proto only)** — `WeaveRequest.client_tools` / `client_tool_timeout_seconds`, `WeaveProgress.client_tool_call`, and the `SubmitClientToolResult` RPC (`POST /v1/sessions/{session_id}/client-tool-results`) let a `StreamWeave` caller offer tools it executes itself (device APIs, browser, local files). Additive; `buf breaking` passes. Server support is not implemented yet: the RPC returns `UNIMPLEMENTED` and `client_tools` is ignored. Design: `docs/architecture/client-tools.md`.
+- **Client-executed tools** — a `StreamWeave` caller can declare tools it executes itself (`WeaveRequest.client_tools`; device APIs, browser, local files). The agent is offered them for that call only; a call is handed to the caller as `WeaveProgress.client_tool_call` and the turn holds until `SubmitClientToolResult` (`POST /v1/sessions/{session_id}/client-tool-results`) returns the result or `client_tool_timeout_seconds` elapses (`CLIENT_TOOL_TIMEOUT`). Results are accepted once and only from the stream's user. Timeout policy: `server.client_tools.default_timeout_seconds` (300) / `max_timeout_seconds` (900). Implemented in `looms serve`; the single-agent server rejects `client_tools` with `UNIMPLEMENTED`. Known limitation: calls made on the HTTP/SSE `/v1/weave:stream` endpoint cannot yet be answered, because that handler does not establish a user identity. Reference: `docs/reference/streaming.md#client-executed-tools`; design: `docs/architecture/client-tools.md`.
 
 ## [1.4.0] - 2026-08-12
 

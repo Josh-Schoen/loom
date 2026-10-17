@@ -159,7 +159,7 @@ func NewContactHumanTool(config ContactHumanConfig) *ContactHumanTool {
 		pollInterval: config.PollInterval,
 		tracer:       config.Tracer,
 		logger:       config.Logger,
-		heartbeat:    holdHeartbeatInterval,
+		heartbeat:    HoldHeartbeatInterval,
 		now:          time.Now,
 	}
 }

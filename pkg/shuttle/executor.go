@@ -252,7 +252,7 @@ func (e *Executor) Preflight(ctx context.Context, toolName string, params map[st
 	// or the caller's key spelling would decide whether a binding matches."
 	// Checking raw params here would let Preflight and Execute reach opposite
 	// verdicts on one call, which is precisely what the pre-scan may not do.
-	tool, ok := e.registry.Get(toolName)
+	tool, ok := e.lookupTool(ctx, toolName)
 	if !ok {
 		dynamicTool, err := e.tryDynamicRegistration(ctx, toolName)
 		if err != nil || dynamicTool == nil {
@@ -287,9 +287,20 @@ func (e *Executor) Preflight(ctx context.Context, toolName string, params map[st
 	return e.admissionChain.Preflight(req)
 }
 
+// lookupTool resolves a tool by name without dynamic registration.
+// Call-scoped tools (see ContextWithCallScopedTools) resolve first: they exist
+// only for this call and never enter the shared registry. Admission governs
+// them exactly like registered tools.
+func (e *Executor) lookupTool(ctx context.Context, toolName string) (Tool, bool) {
+	if tool, ok := callScopedTool(ctx, toolName); ok {
+		return tool, true
+	}
+	return e.registry.Get(toolName)
+}
+
 // Execute executes a tool by name with the given parameters.
 func (e *Executor) Execute(ctx context.Context, toolName string, params map[string]interface{}) (result *Result, err error) {
-	tool, ok := e.registry.Get(toolName)
+	tool, ok := e.lookupTool(ctx, toolName)
 	if !ok {
 		// Tool not found locally, try dynamic registration
 		dynamicTool, err := e.tryDynamicRegistration(ctx, toolName)

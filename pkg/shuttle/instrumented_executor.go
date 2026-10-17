@@ -69,7 +69,7 @@ func (e *InstrumentedExecutor) Execute(ctx context.Context, toolName string, par
 	}
 
 	// Get tool info for additional context
-	if tool, ok := e.executor.registry.Get(toolName); ok {
+	if tool, ok := e.executor.lookupTool(ctx, toolName); ok {
 		span.SetAttribute("tool.backend", tool.Backend())
 		span.SetAttribute("tool.description", tool.Description())
 	}
