@@ -42,6 +42,7 @@ const (
 	LoomService_CreatePattern_FullMethodName               = "/loom.v1.LoomService/CreatePattern"
 	LoomService_StreamPatternUpdates_FullMethodName        = "/loom.v1.LoomService/StreamPatternUpdates"
 	LoomService_AnswerClarificationQuestion_FullMethodName = "/loom.v1.LoomService/AnswerClarificationQuestion"
+	LoomService_SubmitClientToolResult_FullMethodName      = "/loom.v1.LoomService/SubmitClientToolResult"
 	LoomService_CreateSession_FullMethodName               = "/loom.v1.LoomService/CreateSession"
 	LoomService_GetSession_FullMethodName                  = "/loom.v1.LoomService/GetSession"
 	LoomService_ListSessions_FullMethodName                = "/loom.v1.LoomService/ListSessions"
@@ -149,6 +150,12 @@ type LoomServiceClient interface {
 	// AnswerClarificationQuestion provides an answer to a clarification question asked by an agent.
 	// Used by TUI and other clients to respond to EventQuestionAsked progress events.
 	AnswerClarificationQuestion(ctx context.Context, in *AnswerClarificationRequest, opts ...grpc.CallOption) (*AnswerClarificationResponse, error)
+	// SubmitClientToolResult returns the result of a client tool call to the
+	// turn that is waiting on it. A client receives the call as
+	// WeaveProgress.client_tool_call on the StreamWeave stream of a request that
+	// declared the tool in WeaveRequest.client_tools, runs it locally, and posts
+	// the outcome here. Each tool_call_id is accepted exactly once.
+	SubmitClientToolResult(ctx context.Context, in *SubmitClientToolResultRequest, opts ...grpc.CallOption) (*SubmitClientToolResultResponse, error)
 	// CreateSession creates a new conversation session.
 	CreateSession(ctx context.Context, in *CreateSessionRequest, opts ...grpc.CallOption) (*Session, error)
 	// GetSession retrieves session details.
@@ -419,6 +426,16 @@ func (c *loomServiceClient) AnswerClarificationQuestion(ctx context.Context, in 
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(AnswerClarificationResponse)
 	err := c.cc.Invoke(ctx, LoomService_AnswerClarificationQuestion_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *loomServiceClient) SubmitClientToolResult(ctx context.Context, in *SubmitClientToolResultRequest, opts ...grpc.CallOption) (*SubmitClientToolResultResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(SubmitClientToolResultResponse)
+	err := c.cc.Invoke(ctx, LoomService_SubmitClientToolResult_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -1286,6 +1303,12 @@ type LoomServiceServer interface {
 	// AnswerClarificationQuestion provides an answer to a clarification question asked by an agent.
 	// Used by TUI and other clients to respond to EventQuestionAsked progress events.
 	AnswerClarificationQuestion(context.Context, *AnswerClarificationRequest) (*AnswerClarificationResponse, error)
+	// SubmitClientToolResult returns the result of a client tool call to the
+	// turn that is waiting on it. A client receives the call as
+	// WeaveProgress.client_tool_call on the StreamWeave stream of a request that
+	// declared the tool in WeaveRequest.client_tools, runs it locally, and posts
+	// the outcome here. Each tool_call_id is accepted exactly once.
+	SubmitClientToolResult(context.Context, *SubmitClientToolResultRequest) (*SubmitClientToolResultResponse, error)
 	// CreateSession creates a new conversation session.
 	CreateSession(context.Context, *CreateSessionRequest) (*Session, error)
 	// GetSession retrieves session details.
@@ -1487,6 +1510,9 @@ func (UnimplementedLoomServiceServer) StreamPatternUpdates(*StreamPatternUpdates
 }
 func (UnimplementedLoomServiceServer) AnswerClarificationQuestion(context.Context, *AnswerClarificationRequest) (*AnswerClarificationResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method AnswerClarificationQuestion not implemented")
+}
+func (UnimplementedLoomServiceServer) SubmitClientToolResult(context.Context, *SubmitClientToolResultRequest) (*SubmitClientToolResultResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method SubmitClientToolResult not implemented")
 }
 func (UnimplementedLoomServiceServer) CreateSession(context.Context, *CreateSessionRequest) (*Session, error) {
 	return nil, status.Error(codes.Unimplemented, "method CreateSession not implemented")
@@ -1872,6 +1898,24 @@ func _LoomService_AnswerClarificationQuestion_Handler(srv interface{}, ctx conte
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(LoomServiceServer).AnswerClarificationQuestion(ctx, req.(*AnswerClarificationRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LoomService_SubmitClientToolResult_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SubmitClientToolResultRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LoomServiceServer).SubmitClientToolResult(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LoomService_SubmitClientToolResult_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LoomServiceServer).SubmitClientToolResult(ctx, req.(*SubmitClientToolResultRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -3293,6 +3337,10 @@ var LoomService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "AnswerClarificationQuestion",
 			Handler:    _LoomService_AnswerClarificationQuestion_Handler,
+		},
+		{
+			MethodName: "SubmitClientToolResult",
+			Handler:    _LoomService_SubmitClientToolResult_Handler,
 		},
 		{
 			MethodName: "CreateSession",

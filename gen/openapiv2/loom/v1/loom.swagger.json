@@ -2093,6 +2093,46 @@
         ]
       }
     },
+    "/v1/sessions/{sessionId}/client-tool-results": {
+      "post": {
+        "summary": "SubmitClientToolResult returns the result of a client tool call to the\nturn that is waiting on it. A client receives the call as\nWeaveProgress.client_tool_call on the StreamWeave stream of a request that\ndeclared the tool in WeaveRequest.client_tools, runs it locally, and posts\nthe outcome here. Each tool_call_id is accepted exactly once.",
+        "operationId": "LoomService_SubmitClientToolResult",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/v1SubmitClientToolResultResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "sessionId",
+            "description": "Session the call belongs to (ClientToolCall.session_id).",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/LoomServiceSubmitClientToolResultBody"
+            }
+          }
+        ],
+        "tags": [
+          "LoomService"
+        ]
+      }
+    },
     "/v1/sessions/{sessionId}/history": {
       "get": {
         "summary": "GetConversationHistory retrieves conversation history for a session.",
@@ -3431,6 +3471,31 @@
       },
       "description": "StopAgentRequest stops an agent."
     },
+    "LoomServiceSubmitClientToolResultBody": {
+      "type": "object",
+      "properties": {
+        "toolCallId": {
+          "type": "string",
+          "description": "Call being answered (ClientToolCall.tool_call_id)."
+        },
+        "success": {
+          "type": "boolean",
+          "description": "Whether the tool ran successfully."
+        },
+        "output": {
+          "description": "Tool output when success is true."
+        },
+        "errorCode": {
+          "type": "string",
+          "description": "Machine-readable failure code when success is false\n(e.g. \"PERMISSION_DENIED\", \"DECLINED_BY_USER\")."
+        },
+        "errorMessage": {
+          "type": "string",
+          "description": "Human-readable failure description when success is false."
+        }
+      },
+      "description": "SubmitClientToolResultRequest carries the outcome of a client tool call."
+    },
     "LoomServiceSwitchModelBody": {
       "type": "object",
       "properties": {
@@ -4358,6 +4423,33 @@
         }
       },
       "description": "CertificateInfo provides information about the active certificate."
+    },
+    "v1ClientToolCall": {
+      "type": "object",
+      "properties": {
+        "toolCallId": {
+          "type": "string",
+          "description": "Identifier to echo back in SubmitClientToolResultRequest.tool_call_id.\nMatches WeaveProgress.tool_call_id on the tool lifecycle events for the\nsame call."
+        },
+        "toolName": {
+          "type": "string",
+          "description": "Name of the client tool, as declared in WeaveRequest.client_tools."
+        },
+        "arguments": {
+          "type": "object",
+          "description": "Arguments produced by the agent, shaped by the tool's input schema."
+        },
+        "sessionId": {
+          "type": "string",
+          "description": "Session the call belongs to. Required by SubmitClientToolResult; set even\nwhen the request did not name a session."
+        },
+        "timeoutSeconds": {
+          "type": "integer",
+          "format": "int32",
+          "description": "Seconds the server will wait for the result before failing the call."
+        }
+      },
+      "description": "ClientToolCall is a tool call the server hands to the client for execution."
     },
     "v1CollaborationMetrics": {
       "type": "object",
@@ -8795,6 +8887,20 @@
       "default": "STORAGE_LOCATION_UNSPECIFIED",
       "description": "StorageLocation indicates where data is stored.\n\n - STORAGE_LOCATION_MEMORY: In-memory shared storage\n - STORAGE_LOCATION_DISK: Disk overflow cache\n - STORAGE_LOCATION_DATABASE: Queryable SQL storage"
     },
+    "v1SubmitClientToolResultResponse": {
+      "type": "object",
+      "properties": {
+        "accepted": {
+          "type": "boolean",
+          "description": "True when the result was delivered to the waiting turn. False when no call\nwith this id is pending in the session (unknown, already answered, timed\nout, or the stream ended)."
+        },
+        "error": {
+          "type": "string",
+          "description": "Reason the result was not accepted."
+        }
+      },
+      "description": "SubmitClientToolResultResponse acknowledges a client tool result."
+    },
     "v1SubscribeRequest": {
       "type": "object",
       "properties": {
@@ -10056,6 +10162,10 @@
         "contextState": {
           "$ref": "#/definitions/v1ContextState",
           "title": "Context window state (included in completion event)"
+        },
+        "clientToolCall": {
+          "$ref": "#/definitions/v1ClientToolCall",
+          "description": "Set when the agent called one of the request's client_tools. The turn is\nheld until the caller posts SubmitClientToolResult for\nclient_tool_call.tool_call_id or the call times out. Consumers that did\nnot declare client tools never receive this field."
         }
       },
       "description": "WeaveProgress streams incremental updates during execution."
@@ -10115,6 +10225,19 @@
           "type": "string",
           "format": "date-time",
           "description": "Historical arrival time for replayed or imported conversations (optional).\nWhen set, every message persisted during this call — the user turn, the\nassistant reply, and tool rows — carries this timestamp instead of the\nserver wall clock, so temporal grounding (compiled-view arrival stamps,\ngraph-memory extraction anchoring) reflects when the conversation\nactually happened rather than when it was ingested.\n\nServers reject this field unless server.allow_time_override is enabled\n(FAILED_PRECONDITION), and reject values in the future beyond a small\nclock-skew allowance (INVALID_ARGUMENT). Live conversations should leave\nit unset."
+        },
+        "clientTools": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "$ref": "#/definitions/v1ToolDefinition"
+          },
+          "description": "Tools the caller executes itself (optional). Each definition is offered to\nthe agent for this call only, alongside its server-side tools. When the\nagent calls one, the server does not execute it: it emits a WeaveProgress\nwith client_tool_call set and holds the turn until the caller answers with\nSubmitClientToolResult or client_tool_timeout_seconds elapses.\n\nUse this for capabilities only the client has: device APIs on a phone,\na browser session, local files or apps on a desktop. Approval and safety\nchecks for these tools belong to the client.\n\nOnly StreamWeave can carry client tools, because the call is delivered on\nthe stream; Weave rejects a non-empty list (INVALID_ARGUMENT). Names must\nbe unique and must not collide with the agent's own tools\n(INVALID_ARGUMENT)."
+        },
+        "clientToolTimeoutSeconds": {
+          "type": "integer",
+          "format": "int32",
+          "description": "How long the server waits for each client tool result, in seconds\n(default: 300). Servers may cap this value. A call that times out is\nreturned to the agent as a failed tool result with error code\nCLIENT_TOOL_TIMEOUT."
         }
       },
       "description": "WeaveRequest initiates a query execution."

@@ -95,6 +95,20 @@ service LoomService {
     };
   }
 
+  // Client-executed tools
+
+  // SubmitClientToolResult returns the result of a client tool call to the
+  // turn that is waiting on it. A client receives the call as
+  // WeaveProgress.client_tool_call on the StreamWeave stream of a request that
+  // declared the tool in WeaveRequest.client_tools, runs it locally, and posts
+  // the outcome here. Each tool_call_id is accepted exactly once.
+  rpc SubmitClientToolResult(SubmitClientToolResultRequest) returns (SubmitClientToolResultResponse) {
+    option (google.api.http) = {
+      post: "/v1/sessions/{session_id}/client-tool-results"
+      body: "*"
+    };
+  }
+
   // CreateSession creates a new conversation session.
   rpc CreateSession(CreateSessionRequest) returns (Session) {
     option (google.api.http) = {
@@ -694,6 +708,28 @@ message WeaveRequest {
   // clock-skew allowance (INVALID_ARGUMENT). Live conversations should leave
   // it unset.
   google.protobuf.Timestamp occurred_at = 11;
+
+  // Tools the caller executes itself (optional). Each definition is offered to
+  // the agent for this call only, alongside its server-side tools. When the
+  // agent calls one, the server does not execute it: it emits a WeaveProgress
+  // with client_tool_call set and holds the turn until the caller answers with
+  // SubmitClientToolResult or client_tool_timeout_seconds elapses.
+  //
+  // Use this for capabilities only the client has: device APIs on a phone,
+  // a browser session, local files or apps on a desktop. Approval and safety
+  // checks for these tools belong to the client.
+  //
+  // Only StreamWeave can carry client tools, because the call is delivered on
+  // the stream; Weave rejects a non-empty list (INVALID_ARGUMENT). Names must
+  // be unique and must not collide with the agent's own tools
+  // (INVALID_ARGUMENT).
+  repeated ToolDefinition client_tools = 12;
+
+  // How long the server waits for each client tool result, in seconds
+  // (default: 300). Servers may cap this value. A call that times out is
+  // returned to the agent as a failed tool result with error code
+  // CLIENT_TOOL_TIMEOUT.
+  int32 client_tool_timeout_seconds = 13;
 }
 
 // WeaveResponse contains the execution result.
@@ -812,6 +848,33 @@ message WeaveProgress {
 
   // Context window state (included in completion event)
   ContextState context_state = 21;
+
+  // Set when the agent called one of the request's client_tools. The turn is
+  // held until the caller posts SubmitClientToolResult for
+  // client_tool_call.tool_call_id or the call times out. Consumers that did
+  // not declare client tools never receive this field.
+  ClientToolCall client_tool_call = 22;
+}
+
+// ClientToolCall is a tool call the server hands to the client for execution.
+message ClientToolCall {
+  // Identifier to echo back in SubmitClientToolResultRequest.tool_call_id.
+  // Matches WeaveProgress.tool_call_id on the tool lifecycle events for the
+  // same call.
+  string tool_call_id = 1;
+
+  // Name of the client tool, as declared in WeaveRequest.client_tools.
+  string tool_name = 2;
+
+  // Arguments produced by the agent, shaped by the tool's input schema.
+  google.protobuf.Struct arguments = 3;
+
+  // Session the call belongs to. Required by SubmitClientToolResult; set even
+  // when the request did not name a session.
+  string session_id = 4;
+
+  // Seconds the server will wait for the result before failing the call.
+  int32 timeout_seconds = 5;
 }
 
 // HITLRequestInfo carries information about a human-in-the-loop request.
@@ -1199,6 +1262,39 @@ message AnswerClarificationRequest {
 
   // Agent ID (optional, for multi-agent scenarios)
   string agent_id = 4;
+}
+
+// SubmitClientToolResultRequest carries the outcome of a client tool call.
+message SubmitClientToolResultRequest {
+  // Session the call belongs to (ClientToolCall.session_id).
+  string session_id = 1;
+
+  // Call being answered (ClientToolCall.tool_call_id).
+  string tool_call_id = 2;
+
+  // Whether the tool ran successfully.
+  bool success = 3;
+
+  // Tool output when success is true.
+  google.protobuf.Value output = 4;
+
+  // Machine-readable failure code when success is false
+  // (e.g. "PERMISSION_DENIED", "DECLINED_BY_USER").
+  string error_code = 5;
+
+  // Human-readable failure description when success is false.
+  string error_message = 6;
+}
+
+// SubmitClientToolResultResponse acknowledges a client tool result.
+message SubmitClientToolResultResponse {
+  // True when the result was delivered to the waiting turn. False when no call
+  // with this id is pending in the session (unknown, already answered, timed
+  // out, or the stream ended).
+  bool accepted = 1;
+
+  // Reason the result was not accepted.
+  string error = 2;
 }
 
 // AnswerClarificationResponse acknowledges the answer.

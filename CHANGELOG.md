@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Client-executed tools API (proto only)** — `WeaveRequest.client_tools` / `client_tool_timeout_seconds`, `WeaveProgress.client_tool_call`, and the `SubmitClientToolResult` RPC (`POST /v1/sessions/{session_id}/client-tool-results`) let a `StreamWeave` caller offer tools it executes itself (device APIs, browser, local files). Additive; `buf breaking` passes. Server support is not implemented yet: the RPC returns `UNIMPLEMENTED` and `client_tools` is ignored. Design: `docs/architecture/client-tools.md`.
+
 ## [1.4.0] - 2026-08-12
 
 ### Breaking Changes
