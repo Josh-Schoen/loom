@@ -1138,7 +1138,7 @@ curl -X POST http://localhost:5006/v1/sessions/sess_abc123/client-tool-results \
 
 ### Limitations
 
-- ⚠️ **Identity on the SSE endpoint.** `/v1/weave:stream` is served by a custom handler that does not run the gRPC interceptors, so the stream carries no user identity while `SubmitClientToolResult` over the HTTP gateway does. Because results are bound to the stream's user, an SSE stream's calls cannot currently be answered over the gateway. gRPC `StreamWeave` clients are not affected.
+- Results are bound to the stream's user identity. Send the same credentials on the stream and on `SubmitClientToolResult` (the same `Authorization` bearer token, or the same `Grpc-Metadata-X-User-Id` header when auth is disabled). See [SSE Authentication and Identity](http-server.md#sse-authentication-and-identity).
 - Client tools are not forwarded to sub-agents or workflow agents spawned during the call.
 - A pending call fails when its stream ends; it cannot be resumed on a new stream.
 

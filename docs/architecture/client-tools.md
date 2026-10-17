@@ -1,11 +1,10 @@
 # Client-Executed Tools
 
-**Status:** ⚠️ Partial. Implemented in the multi-agent server (`looms serve`):
+**Status:** ✅ Implemented in the multi-agent server (`looms serve`):
 `pkg/clienttools`, call-scoped tool resolution in `pkg/shuttle` and
-`pkg/agent`, wiring in `pkg/server`. gRPC `StreamWeave` clients work end to
-end. Clients on the HTTP/SSE endpoint cannot yet answer calls (see
-[Constraints](#constraints-and-limitations)). The single-agent server
-(`loom-standalone`) rejects `client_tools` with `UNIMPLEMENTED`. API reference:
+`pkg/agent`, wiring in `pkg/server`, on both gRPC and the HTTP/SSE endpoint.
+The single-agent server (`loom-standalone`) rejects `client_tools` with
+`UNIMPLEMENTED`. API reference:
 `docs/reference/streaming.md#client-executed-tools`.
 **Relates to:** HITL holds and heartbeats (`pkg/shuttle/hold_heartbeat.go`,
 `docs/architecture/hitl-park-and-resume.md`)
@@ -270,14 +269,12 @@ time, and outcome.
 
 ## Constraints and Limitations
 
-- **SSE identity gap.** The `/v1/weave:stream` SSE handler calls `StreamWeave`
-  directly and does not run the gRPC interceptors (JWT authentication and
-  `x-user-id` extraction), so its stream carries no user identity, while
-  `SubmitClientToolResult` over the HTTP gateway does. Owner binding therefore
-  rejects results for calls made on SSE streams. Resolving this means giving
-  the SSE handler the same identity resolution as the gRPC path, which also
-  closes the wider gap of SSE turns running unauthenticated when
-  `server.auth.enabled` is true.
+- **Identity on every transport.** Owner binding requires the stream and the
+  submission to resolve to the same user. The `/v1/weave:stream` SSE handler
+  calls `StreamWeave` in-process, so it runs the gRPC stream-interceptor chain
+  itself (JWT authentication, `x-user-id`), with HTTP headers mapped to
+  metadata by grpc-gateway's own rules; an SSE stream and a gateway submission
+  from the same client therefore carry the same identity.
 - `StreamWeave` only; unary `Weave` cannot carry client tools.
 - A turn holds server resources while waiting; `client_tool_timeout_seconds`
   bounds this and servers may cap it.

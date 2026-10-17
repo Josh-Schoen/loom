@@ -7,9 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **`/v1/weave:stream` (HTTP/SSE) now authenticates and identifies callers** — the SSE handler calls the service in-process and previously skipped the gRPC interceptors, so with `server.auth.enabled: true` SSE turns ran unauthenticated and, in every mode, without a user identity. `looms serve` now runs the same stream-interceptor chain on it, with headers mapped to metadata by the gateway's rules (`Authorization`, `Grpc-Metadata-*`). Behavior change: SSE requests now need the same credentials as gateway routes — `401` without a valid bearer token when auth is enabled, and `401` without `Grpc-Metadata-X-User-Id` on PostgreSQL storage with `require_user_id: true`; on SQLite storage they run as `default-user`. Sessions created earlier with no owner stay reachable when ownership enforcement is off. See `docs/reference/http-server.md#sse-authentication-and-identity`.
+
 ### Added
 
-- **Client-executed tools** — a `StreamWeave` caller can declare tools it executes itself (`WeaveRequest.client_tools`; device APIs, browser, local files). The agent is offered them for that call only; a call is handed to the caller as `WeaveProgress.client_tool_call` and the turn holds until `SubmitClientToolResult` (`POST /v1/sessions/{session_id}/client-tool-results`) returns the result or `client_tool_timeout_seconds` elapses (`CLIENT_TOOL_TIMEOUT`). Results are accepted once and only from the stream's user. Timeout policy: `server.client_tools.default_timeout_seconds` (300) / `max_timeout_seconds` (900). Implemented in `looms serve`; the single-agent server rejects `client_tools` with `UNIMPLEMENTED`. Known limitation: calls made on the HTTP/SSE `/v1/weave:stream` endpoint cannot yet be answered, because that handler does not establish a user identity. Reference: `docs/reference/streaming.md#client-executed-tools`; design: `docs/architecture/client-tools.md`.
+- **Client-executed tools** — a `StreamWeave` caller can declare tools it executes itself (`WeaveRequest.client_tools`; device APIs, browser, local files). The agent is offered them for that call only; a call is handed to the caller as `WeaveProgress.client_tool_call` and the turn holds until `SubmitClientToolResult` (`POST /v1/sessions/{session_id}/client-tool-results`) returns the result or `client_tool_timeout_seconds` elapses (`CLIENT_TOOL_TIMEOUT`). Results are accepted once and only from the stream's user. Timeout policy: `server.client_tools.default_timeout_seconds` (300) / `max_timeout_seconds` (900). Implemented in `looms serve`; the single-agent server rejects `client_tools` with `UNIMPLEMENTED`. Reference: `docs/reference/streaming.md#client-executed-tools`; design: `docs/architecture/client-tools.md`.
 
 ## [1.4.0] - 2026-08-12
 

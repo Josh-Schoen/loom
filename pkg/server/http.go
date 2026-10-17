@@ -22,6 +22,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 )
 
 // CORSConfig holds CORS configuration
@@ -63,6 +64,17 @@ type HTTPServer struct {
 	grpcAddr        string
 	corsConfig      CORSConfig
 	appHTMLProvider AppHTMLProvider
+
+	// gatewayMux serves the grpc-gateway routes. The SSE handler also uses it
+	// to map HTTP headers to gRPC metadata, so both paths see a request the
+	// same way.
+	gatewayMux *runtime.ServeMux
+
+	// streamInterceptor is the gRPC server's stream-interceptor chain
+	// (authentication, user identity). The SSE handler calls StreamWeave
+	// in-process rather than over gRPC, so it runs the chain itself. Nil
+	// means no interceptors (embedders and tests that configure none).
+	streamInterceptor grpc.StreamServerInterceptor
 }
 
 // NewHTTPServer creates an HTTP server that proxies to gRPC
@@ -81,6 +93,9 @@ func NewHTTPServerWithCORS(grpcServer *MultiAgentServer, httpAddr, grpcAddr stri
 		logger:     logger,
 		grpcAddr:   grpcAddr,
 		corsConfig: corsConfig,
+		gatewayMux: runtime.NewServeMux(
+			runtime.WithMarshalerOption(runtime.MIMEWildcard, &runtime.JSONPb{}),
+		),
 		httpServer: &http.Server{
 			Addr:         httpAddr,
 			ReadTimeout:  30 * time.Second,
@@ -96,12 +111,36 @@ func (h *HTTPServer) SetAppHTMLProvider(p AppHTMLProvider) {
 	h.appHTMLProvider = p
 }
 
+// SetStreamInterceptors installs the gRPC server's stream interceptors, in the
+// order the gRPC server chains them, so SSE StreamWeave requests are
+// authenticated and attributed to a user exactly like gRPC and gateway
+// requests. Must be called before Start(); not safe for concurrent use.
+func (h *HTTPServer) SetStreamInterceptors(interceptors ...grpc.StreamServerInterceptor) {
+	h.streamInterceptor = chainStreamInterceptors(interceptors)
+}
+
+// chainStreamInterceptors composes interceptors so the first is outermost,
+// matching grpc.ChainStreamInterceptor. Returns nil for an empty list.
+func chainStreamInterceptors(interceptors []grpc.StreamServerInterceptor) grpc.StreamServerInterceptor {
+	if len(interceptors) == 0 {
+		return nil
+	}
+	return func(srv any, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
+		next := handler
+		for i := len(interceptors) - 1; i >= 0; i-- {
+			interceptor, inner := interceptors[i], next
+			next = func(srv any, ss grpc.ServerStream) error {
+				return interceptor(srv, ss, info, inner)
+			}
+		}
+		return next(srv, ss)
+	}
+}
+
 // Start starts the HTTP server
 func (h *HTTPServer) Start(ctx context.Context) error {
-	// Create gRPC-gateway mux
-	mux := runtime.NewServeMux(
-		runtime.WithMarshalerOption(runtime.MIMEWildcard, &runtime.JSONPb{}),
-	)
+	// gRPC-gateway mux (built in the constructor; shared with the SSE handler)
+	mux := h.gatewayMux
 
 	// Connect to gRPC server
 	opts := []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())}
@@ -335,6 +374,10 @@ func withHTTPSlotOrigin(ctx context.Context, r *http.Request) context.Context {
 	return metadata.NewIncomingContext(ctx, md)
 }
 
+// streamWeaveFullMethod is StreamWeave's gRPC method name, as interceptors and
+// the gateway see it.
+const streamWeaveFullMethod = "/loom.v1.LoomService/StreamWeave"
+
 // handleStreamWeaveSSE handles SSE streaming for /v1/weave:stream
 func (h *HTTPServer) handleStreamWeaveSSE(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -349,33 +392,59 @@ func (h *HTTPServer) handleStreamWeaveSSE(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	// Set SSE headers
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("X-Accel-Buffering", "no") // Disable nginx buffering
-
-	// Flush headers immediately
-	if flusher, ok := w.(http.Flusher); ok {
-		flusher.Flush()
+	// Map HTTP headers to incoming gRPC metadata the way the gateway does
+	// (Authorization, Grpc-Metadata-* headers), so the interceptors below
+	// resolve identity from the same inputs as every other HTTP route.
+	ctx, err := runtime.AnnotateIncomingContext(r.Context(), h.gatewayMux, r, streamWeaveFullMethod,
+		runtime.WithHTTPPathPattern("/v1/weave:stream"))
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Invalid request: %v", err), http.StatusBadRequest)
+		return
 	}
 
-	// Create gRPC stream. The context carries the client-asserted slot
-	// origin (X-Loom-Slot-Origin) as incoming gRPC metadata so interactive
-	// HTTP turns bypass door admission exactly like interactive gRPC turns.
+	// The context carries the client-asserted slot origin
+	// (X-Loom-Slot-Origin) as incoming gRPC metadata so interactive HTTP
+	// turns bypass door admission exactly like interactive gRPC turns.
 	stream := &sseStreamWrapper{
-		ctx:     withHTTPSlotOrigin(r.Context(), r),
+		ctx:     withHTTPSlotOrigin(ctx, r),
 		writer:  w,
 		flusher: w.(http.Flusher),
 		logger:  h.logger,
 	}
 
-	// Execute StreamWeave
-	if err := h.grpcServer.StreamWeave(&req, stream); err != nil {
-		h.logger.Error("StreamWeave failed", zap.Error(err))
-		// Send error as SSE event
-		h.sendSSEError(w, stream.flusher, err)
+	// SSE headers are written only once the interceptors admit the call, so
+	// an authentication failure is a plain HTTP error status, not a stream.
+	started := false
+	run := func(_ any, ss grpc.ServerStream) error {
+		stream.ctx = ss.Context()
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		w.Header().Set("X-Accel-Buffering", "no") // Disable nginx buffering
+		stream.flusher.Flush()
+		started = true
+		return h.grpcServer.StreamWeave(&req, stream)
 	}
+
+	if h.streamInterceptor != nil {
+		err = h.streamInterceptor(h.grpcServer, stream, &grpc.StreamServerInfo{
+			FullMethod:     streamWeaveFullMethod,
+			IsServerStream: true,
+		}, run)
+	} else {
+		err = run(h.grpcServer, stream)
+	}
+	if err == nil {
+		return
+	}
+	if !started {
+		st, _ := status.FromError(err)
+		http.Error(w, st.Message(), runtime.HTTPStatusFromCode(st.Code()))
+		return
+	}
+	h.logger.Error("StreamWeave failed", zap.Error(err))
+	// Send error as SSE event
+	h.sendSSEError(w, stream.flusher, err)
 }
 
 // sseStreamWrapper implements loomv1.LoomService_StreamWeaveServer for SSE

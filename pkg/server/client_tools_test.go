@@ -23,10 +23,12 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap/zaptest"
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
@@ -34,6 +36,7 @@ import (
 
 	loomv1 "github.com/teradata-labs/loom/gen/go/loom/v1"
 	"github.com/teradata-labs/loom/pkg/agent"
+	"github.com/teradata-labs/loom/pkg/clienttools"
 	llmtypes "github.com/teradata-labs/loom/pkg/llm/types"
 	"github.com/teradata-labs/loom/pkg/shuttle"
 	"github.com/teradata-labs/loom/pkg/storage/postgres"
@@ -384,4 +387,131 @@ func TestStreamWeaveSSE_ClientToolCallFrame(t *testing.T) {
 
 	_, results := llm.snapshot()
 	assert.Contains(t, strings.Join(results, "\n"), "rem-sse")
+}
+
+// sseClientToolRun posts a client-tool StreamWeave to the SSE handler with the
+// given headers and answers the hand-off as submitter. It returns the HTTP
+// status and whether the result was accepted.
+func sseClientToolRun(t *testing.T, h *HTTPServer, srv *MultiAgentServer, headers map[string]string, submitter context.Context) (int, bool) {
+	t.Helper()
+	ts := httptest.NewServer(http.HandlerFunc(h.handleStreamWeaveSSE))
+	defer ts.Close()
+
+	body, err := json.Marshal(map[string]interface{}{
+		"query":        "remind me",
+		"client_tools": []map[string]interface{}{{"name": reminderToolName}},
+	})
+	require.NoError(t, err)
+	req, err := http.NewRequest(http.MethodPost, ts.URL, bytes.NewReader(body))
+	require.NoError(t, err)
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+
+	accepted := false
+	scanner := bufio.NewScanner(resp.Body)
+	for scanner.Scan() {
+		line := strings.TrimPrefix(scanner.Text(), "data: ")
+		if line == scanner.Text() {
+			continue
+		}
+		var frame struct {
+			ClientToolCall *struct {
+				ToolCallID string `json:"tool_call_id"`
+				SessionID  string `json:"session_id"`
+			} `json:"client_tool_call"`
+		}
+		require.NoError(t, json.Unmarshal([]byte(line), &frame))
+		if frame.ClientToolCall == nil {
+			continue
+		}
+		// A submitter that is not the owner is rejected; answer as the owner
+		// afterwards only if the test's submitter was refused, so the turn ends.
+		res, err := srv.SubmitClientToolResult(submitter, &loomv1.SubmitClientToolResultRequest{
+			SessionId: frame.ClientToolCall.SessionID, ToolCallId: frame.ClientToolCall.ToolCallID, Success: true,
+		})
+		require.NoError(t, err)
+		accepted = res.GetAccepted()
+		if !accepted {
+			// End the held turn quickly; the stream's own identity is unknown
+			// here, so cancel by closing the connection.
+			return resp.StatusCode, false
+		}
+	}
+	return resp.StatusCode, accepted
+}
+
+// With the gRPC identity interceptor installed, an SSE stream is attributed
+// the same way a gateway call is: the default user when no identity is sent,
+// or the user forwarded in a Grpc-Metadata-X-User-Id header. Results from that
+// identity are accepted; results from anyone else are not.
+func TestStreamWeaveSSE_IdentityMatchesGateway(t *testing.T) {
+	userIDCfg := UserIDConfig{DefaultUserID: "default-user"}
+	tests := []struct {
+		name      string
+		headers   map[string]string
+		submitter string
+		accepted  bool
+	}{
+		{"default identity", nil, "default-user", true},
+		{"default identity, other submitter", nil, "mallory", false},
+		{"forwarded user", map[string]string{"Grpc-Metadata-X-User-Id": "alice"}, "alice", true},
+		{"forwarded user, default submitter", map[string]string{"Grpc-Metadata-X-User-Id": "alice"}, "default-user", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv, _, _ := newClientToolServer(t)
+			srv.SetClientToolConfig(clienttools.Config{DefaultTimeout: 2 * time.Second})
+			h := NewHTTPServer(srv, "", "", zaptest.NewLogger(t))
+			h.SetStreamInterceptors(UserIDStreamInterceptor(userIDCfg))
+
+			code, accepted := sseClientToolRun(t, h, srv, tt.headers,
+				postgres.ContextWithUserID(context.Background(), tt.submitter))
+			assert.Equal(t, http.StatusOK, code)
+			assert.Equal(t, tt.accepted, accepted)
+		})
+	}
+}
+
+// An interceptor that rejects the call (e.g. a missing bearer token when auth
+// is enabled) yields a plain HTTP error and the agent never runs.
+func TestStreamWeaveSSE_InterceptorRejectionIsHTTPError(t *testing.T) {
+	srv, llm, _ := newClientToolServer(t)
+	h := NewHTTPServer(srv, "", "", zaptest.NewLogger(t))
+	h.SetStreamInterceptors(func(any, grpc.ServerStream, *grpc.StreamServerInfo, grpc.StreamHandler) error {
+		return status.Error(codes.Unauthenticated, "authorization bearer token required")
+	})
+	ts := httptest.NewServer(http.HandlerFunc(h.handleStreamWeaveSSE))
+	defer ts.Close()
+
+	resp, err := http.Post(ts.URL, "application/json", strings.NewReader(`{"query":"hi"}`))
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+
+	assert.Equal(t, http.StatusUnauthorized, resp.StatusCode)
+	assert.NotEqual(t, "text/event-stream", resp.Header.Get("Content-Type"))
+	advertised, _ := llm.snapshot()
+	assert.Empty(t, advertised, "the agent must not run")
+}
+
+func TestChainStreamInterceptors_Order(t *testing.T) {
+	var order []string
+	mk := func(name string) grpc.StreamServerInterceptor {
+		return func(srv any, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
+			order = append(order, name)
+			return handler(srv, ss)
+		}
+	}
+	assert.Nil(t, chainStreamInterceptors(nil))
+
+	chain := chainStreamInterceptors([]grpc.StreamServerInterceptor{mk("first"), mk("second")})
+	err := chain(nil, &clientStream{ctx: context.Background()}, &grpc.StreamServerInfo{}, func(any, grpc.ServerStream) error {
+		order = append(order, "handler")
+		return nil
+	})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"first", "second", "handler"}, order)
 }

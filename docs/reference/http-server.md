@@ -267,6 +267,20 @@ curl -X POST http://localhost:5006/v1/sessions \
 
 CORS headers will be present in response.
 
+### SSE Authentication and Identity
+
+**Changed in**: Unreleased (after v1.4.0). Earlier versions ran `/v1/weave:stream` without authentication or user identity.
+
+`/v1/weave:stream` calls the service in-process, so `looms serve` runs the gRPC stream interceptors on it itself. HTTP headers are mapped to gRPC metadata with the same rules as the gateway routes:
+
+| Header | Effect |
+|--------|--------|
+| `Authorization: Bearer <jwt>` | Verified when `server.auth.enabled: true`; the token subject becomes the user. |
+| `Grpc-Metadata-X-User-Id: <id>` | Legacy user identity when auth is disabled (as on gateway routes). |
+| neither | SQLite storage: `default-user`. PostgreSQL storage: `storage.postgres.default_user_id`, or `401 Unauthorized` when `storage.postgres.require_user_id` is true. Always `401` when `server.auth.enabled` is true. |
+
+A rejected request returns a plain HTTP error status before any SSE headers are written; the agent does not run.
+
 ### SSE Streaming
 
 ```bash
