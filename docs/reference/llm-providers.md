@@ -22,6 +22,9 @@ Reference for all supported LLM providers and their configuration.
 ### Planned Providers
 - [Google Vertex AI](#9-google-vertex-ai) - GCP integration (Planned)
 
+### Development and Testing
+- [Scripted](llm-scripted.md) - Answers from a YAML script, no model or API key; for client development and integration tests (not a model provider)
+
 ### Reference
 - [Provider Comparison](#provider-comparison) - Feature matrix and benchmarks
 - [Configuration Reference](#configuration-reference) - Common and provider-specific parameters

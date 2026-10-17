@@ -806,3 +806,30 @@ tools:
 	assert.Equal(t, "render_grant_read_sql", b.SourceTool)
 	assert.Equal(t, "stmt", b.StmtParam)
 }
+
+func TestValidate_ScriptedProvider(t *testing.T) {
+	scriptPath := filepath.Join(t.TempDir(), "demo.yaml")
+	require.NoError(t, os.WriteFile(scriptPath, []byte("default_reply: hi\n"), 0o600))
+	badPath := filepath.Join(t.TempDir(), "bad.yaml")
+	require.NoError(t, os.WriteFile(badPath, []byte("rules: []\n"), 0o600))
+
+	withScript := func(path string) *Config {
+		return &Config{
+			Server:  ServerConfig{Port: 60051},
+			LLM:     LLMConfig{Provider: "scripted", ScriptedScriptPath: path},
+			Storage: StorageBackendConfig{Backend: "sqlite", SQLite: SQLiteConfig{Path: "/tmp/test.db"}},
+		}
+	}
+
+	assert.NoError(t, withScript(scriptPath).Validate())
+
+	err := withScript("").Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "llm.scripted_script_path is required")
+
+	err = withScript(badPath).Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "at least one rule or a default_reply")
+
+	assert.Equal(t, "demo", scriptedModelName(scriptPath))
+}

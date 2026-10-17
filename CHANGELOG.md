@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Scripted LLM provider** (`llm.provider: scripted`, `llm.scripted_script_path`) — answers from a YAML script of regex-matched rules (text replies or tool calls, with templates over the user message and tool results) instead of a model, so `looms serve` runs end to end with no API key and deterministic replies for client development and tests. Streams through the existing loadtest mock provider. Server-level only. Reference: `docs/reference/llm-scripted.md`.
 - **Client-executed tools** — a `StreamWeave` caller can declare tools it executes itself (`WeaveRequest.client_tools`; device APIs, browser, local files). The agent is offered them for that call only; a call is handed to the caller as `WeaveProgress.client_tool_call` and the turn holds until `SubmitClientToolResult` (`POST /v1/sessions/{session_id}/client-tool-results`) returns the result or `client_tool_timeout_seconds` elapses (`CLIENT_TOOL_TIMEOUT`). Results are accepted once and only from the stream's user. Timeout policy: `server.client_tools.default_timeout_seconds` (300) / `max_timeout_seconds` (900). Implemented in `looms serve`; the single-agent server rejects `client_tools` with `UNIMPLEMENTED`. Reference: `docs/reference/streaming.md#client-executed-tools`; design: `docs/architecture/client-tools.md`.
 
 ## [1.4.0] - 2026-08-12

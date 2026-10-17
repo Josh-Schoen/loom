@@ -25,6 +25,7 @@ import (
 	loomv1 "github.com/teradata-labs/loom/gen/go/loom/v1"
 	"github.com/teradata-labs/loom/pkg/clienttools"
 	loomconfig "github.com/teradata-labs/loom/pkg/config"
+	"github.com/teradata-labs/loom/pkg/llm/scripted"
 	"github.com/teradata-labs/loom/pkg/shuttle"
 	"github.com/zalando/go-keyring"
 	"gopkg.in/yaml.v3"
@@ -374,6 +375,10 @@ type LLMConfig struct {
 	LiteLLMAPIKey       string            `mapstructure:"litellm_api_key"` // From CLI/env/keyring only
 	LiteLLMModel        string            `mapstructure:"litellm_model"`
 	LiteLLMExtraHeaders map[string]string `mapstructure:"litellm_extra_headers"`
+
+	// Scripted-specific: path to the YAML script the scripted provider answers
+	// from (no model, no API key; for client development and tests).
+	ScriptedScriptPath string `mapstructure:"scripted_script_path"`
 
 	// Common generation parameters
 	Temperature float64 `mapstructure:"temperature"`
@@ -1688,8 +1693,16 @@ func (c *Config) Validate() error {
 	case "litellm":
 		// endpoint and API key are optional — defaults apply
 
+	case scripted.ProviderName:
+		if c.LLM.ScriptedScriptPath == "" {
+			return fmt.Errorf("llm.scripted_script_path is required for the scripted provider")
+		}
+		if _, err := scripted.LoadFile(c.LLM.ScriptedScriptPath); err != nil {
+			return err
+		}
+
 	default:
-		return fmt.Errorf("unsupported LLM provider: %s (must be anthropic, bedrock, ollama, openai, azure-openai, mistral, gemini, huggingface, or litellm)", c.LLM.Provider)
+		return fmt.Errorf("unsupported LLM provider: %s (must be anthropic, bedrock, ollama, openai, azure-openai, mistral, gemini, huggingface, litellm, or scripted)", c.LLM.Provider)
 	}
 
 	// Door admission knobs: a negative value is a configuration error, not a

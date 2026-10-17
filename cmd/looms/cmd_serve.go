@@ -22,6 +22,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -51,6 +52,7 @@ import (
 	"github.com/teradata-labs/loom/pkg/llm/ollama"
 	"github.com/teradata-labs/loom/pkg/llm/openai"
 	llmscheduler "github.com/teradata-labs/loom/pkg/llm/scheduler"
+	"github.com/teradata-labs/loom/pkg/llm/scripted"
 	"github.com/teradata-labs/loom/pkg/mcp/apps"
 	"github.com/teradata-labs/loom/pkg/mcp/manager"
 	"github.com/teradata-labs/loom/pkg/memory"
@@ -730,9 +732,24 @@ func createProviderWithRateLimit(cfg LLMConfig, logger *zap.Logger) (agent.LLMPr
 			RateLimiterConfig: rlCfg,
 		}), nil
 
+	case scripted.ProviderName:
+		script, err := scripted.LoadFile(cfg.ScriptedScriptPath)
+		if err != nil {
+			return nil, err
+		}
+		logger.Warn("Using the scripted LLM provider: replies come from a script, not a model",
+			zap.String("script", cfg.ScriptedScriptPath))
+		return scripted.NewProvider(script, scriptedModelName(cfg.ScriptedScriptPath)), nil
+
 	default:
 		return nil, fmt.Errorf("unsupported LLM provider: %s", cfg.Provider)
 	}
+}
+
+// scriptedModelName reports the script file's base name as the scripted
+// provider's model, so logs and cost displays show which script answered.
+func scriptedModelName(scriptPath string) string {
+	return strings.TrimSuffix(filepath.Base(scriptPath), filepath.Ext(scriptPath))
 }
 
 // llmRoleDisplayName returns a short, human-readable name for an LLM role enum.
@@ -799,6 +816,8 @@ func getDefaultModelForProvider(cfg *Config) string {
 			return cfg.LLM.LiteLLMModel
 		}
 		return litellm.DefaultModel
+	case scripted.ProviderName:
+		return scriptedModelName(cfg.LLM.ScriptedScriptPath)
 	default:
 		return ""
 	}
