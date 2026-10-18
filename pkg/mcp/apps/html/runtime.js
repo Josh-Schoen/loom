@@ -1682,7 +1682,7 @@
     copyNodes(doc.body.firstChild, container);
   }
 
-  // --- text ---
+  // --- checklist ---
   // Checklist: rows people tick. A tick updates the page at once and is sent
   // to the host as a ui/notifications/checklist-changed notification
   // ({component_id, item_id, checked}); the host saves it (loom:
@@ -1830,6 +1830,7 @@
     return wrapper;
   }
 
+  // --- text ---
   function renderText(props) {
     const styleMap = {
       note: {
