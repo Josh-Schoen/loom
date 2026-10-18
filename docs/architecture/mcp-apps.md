@@ -72,13 +72,15 @@ Key methods:
 
 ### Registry (`pkg/mcp/apps/registry.go`)
 
-The `UIResourceRegistry` stores all apps in a `map[string]*UIResource` protected by `sync.RWMutex`. It manages both:
-- **Embedded apps** (4 built-in, registered at startup, cannot be deleted)
-- **Dynamic apps** (agent-created, up to 100, 50 MB total)
+The `UIResourceRegistry` keeps two maps under one `sync.RWMutex`:
+- **Embedded apps** (4 built-in, registered at startup, cannot be deleted), keyed by URI and shared by every user
+- **Dynamic apps** (agent-created), keyed by owner (user ID) and then name; up to 100 and 50 MB per owner
+
+Dynamic apps are owned so that, on a server shared by several people (for example a hosted assistant with many paired phones), one person's pages are neither visible to nor changeable by another. Keying by owner first makes per-owner limits and per-owner listing a single map lookup, and lets two owners use the same name without a global naming scheme. The cost is that the owner must be passed on every call: the owner-scoped methods take it explicitly, so a caller cannot forget it silently. The alternative of storing an owner field on a single URI-keyed map was rejected because names would collide across users and every listing would scan all users' apps.
 
 The registry provides:
-- MCP resource interface: `List()`, `Read(uri)`
-- gRPC server interface: `ListAppInfo()`, `GetAppHTML()`, `CreateApp()`, `UpdateApp()`, `DeleteApp()`
+- MCP resource interface: `List()`, `Read(uri)` — no user identity, so embedded apps plus `default-user`'s
+- gRPC server interface (owner-scoped): `ListAppInfo(owner)`, `GetAppHTML(owner, name)`, `CreateApp(owner, ...)`, `UpdateApp(owner, ...)`, `DeleteApp(owner, name)`, `AppSpec(owner, name)`
 - Change notifications: `SetOnChange(fn)` for cache invalidation
 
 ### App Template (`pkg/mcp/apps/html/app-template.html`)
@@ -164,8 +166,8 @@ These are compiled from hand-written HTML files embedded via `//go:embed`. They 
 Created at runtime through any API surface. Stored in the same registry map with `Dynamic: true`.
 
 **Capacity limits** (enforced atomically under write lock):
-- Max 100 dynamic apps
-- Max 50 MB total HTML bytes across all dynamic apps
+- Max 100 dynamic apps per owner
+- Max 50 MB total HTML bytes across one owner's dynamic apps
 
 **Atomic operations**: `CreateApp` and `UpdateApp` use a single write lock for the check-and-mutate sequence, preventing TOCTOU race conditions. The `upsertLocked()` helper performs the actual map mutation while the caller holds the lock.
 

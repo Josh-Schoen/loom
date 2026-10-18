@@ -65,7 +65,7 @@ port in plaintext.
 | `looms pair` | Issue a code; print a QR code, the link, the server URL, and the expiry. |
 | `looms pair --link-only` | Print only the link. |
 | `looms pair --ttl 5m` | Shorter lifetime (capped at `code_ttl_seconds`). |
-| `looms pair --user alice` | Device acts as `alice` (default: the server's default user). |
+| `looms pair --user alice` | Device acts as `alice` (default: the server's default user). Pages the assistant makes for `alice` are hers alone; see `mcp-apps.md#ownership`. |
 | `looms devices list` | Paired devices with status (`active` / `revoked`). |
 | `looms devices revoke <device-id>` | Disable a device token permanently. |
 

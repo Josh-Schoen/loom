@@ -13,6 +13,8 @@ import (
 
 	loomv1 "github.com/teradata-labs/loom/gen/go/loom/v1"
 	"github.com/teradata-labs/loom/pkg/mcp/apps"
+	"github.com/teradata-labs/loom/pkg/storage/postgres"
+	"github.com/teradata-labs/loom/pkg/types"
 	"go.uber.org/zap"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -33,12 +35,16 @@ var reservedAppNames = map[string]bool{
 // AppProvider provides UI app information to the gRPC server.
 // Implemented by UIResourceRegistry to avoid tight coupling between
 // the server package and the apps package internals.
+//
+// Every method takes the owner: the user ID of the caller (see appOwner).
+// Dynamic apps belong to the user who created them; an owner sees the
+// shared embedded apps and their own dynamic apps only.
 type AppProvider interface {
-	ListAppInfo() []apps.AppInfo
-	GetAppHTML(name string) ([]byte, *apps.AppInfo, error)
-	CreateApp(name, displayName, description string, html []byte, overwrite bool) (*apps.AppInfo, bool, error)
-	UpdateApp(name, displayName, description string, html []byte) (*apps.AppInfo, error)
-	DeleteApp(name string) error
+	ListAppInfo(owner string) []apps.AppInfo
+	GetAppHTML(owner, name string) ([]byte, *apps.AppInfo, error)
+	CreateApp(owner, name, displayName, description string, html []byte, overwrite bool) (*apps.AppInfo, bool, error)
+	UpdateApp(owner, name, displayName, description string, html []byte) (*apps.AppInfo, error)
+	DeleteApp(owner, name string) error
 }
 
 // AppSpecProvider is implemented by providers that also keep the spec an app
@@ -46,34 +52,45 @@ type AppProvider interface {
 // ticks) and an agent can read it back before updating. apps.UIResourceRegistry
 // implements it; providers that do not still work for everything else.
 type AppSpecProvider interface {
-	CreateAppWithSpec(name, displayName, description string, html, spec []byte, overwrite bool) (*apps.AppInfo, bool, error)
-	UpdateAppWithSpec(name, displayName, description string, html, spec []byte) (*apps.AppInfo, error)
-	AppSpec(name string) ([]byte, error)
+	CreateAppWithSpec(owner, name, displayName, description string, html, spec []byte, overwrite bool) (*apps.AppInfo, bool, error)
+	UpdateAppWithSpec(owner, name, displayName, description string, html, spec []byte) (*apps.AppInfo, error)
+	AppSpec(owner, name string) ([]byte, error)
+}
+
+// appOwner is the owner of the apps a request may see and change: the
+// caller's user ID, set by the identity interceptors (and carried into agent
+// turns, so tools see the user who sent the message). Without one it is
+// types.DefaultUserID, the identity of requests when none is configured.
+func appOwner(ctx context.Context) string {
+	if id := postgres.UserIDFromContext(ctx); id != "" {
+		return id
+	}
+	return types.DefaultUserID
 }
 
 // createAppFromSpec stores a compiled app, with its spec when the provider
 // keeps specs.
-func createAppFromSpec(provider AppProvider, name, displayName, description string, html []byte, spec *loomv1.UIAppSpec, overwrite bool) (*apps.AppInfo, bool, error) {
+func createAppFromSpec(provider AppProvider, owner, name, displayName, description string, html []byte, spec *loomv1.UIAppSpec, overwrite bool) (*apps.AppInfo, bool, error) {
 	if sp, ok := provider.(AppSpecProvider); ok {
 		specJSON, err := protojson.Marshal(spec)
 		if err != nil {
 			return nil, false, fmt.Errorf("marshal spec: %w", err)
 		}
-		return sp.CreateAppWithSpec(name, displayName, description, html, specJSON, overwrite)
+		return sp.CreateAppWithSpec(owner, name, displayName, description, html, specJSON, overwrite)
 	}
-	return provider.CreateApp(name, displayName, description, html, overwrite)
+	return provider.CreateApp(owner, name, displayName, description, html, overwrite)
 }
 
 // updateAppFromSpec is createAppFromSpec for updates.
-func updateAppFromSpec(provider AppProvider, name, displayName, description string, html []byte, spec *loomv1.UIAppSpec) (*apps.AppInfo, error) {
+func updateAppFromSpec(provider AppProvider, owner, name, displayName, description string, html []byte, spec *loomv1.UIAppSpec) (*apps.AppInfo, error) {
 	if sp, ok := provider.(AppSpecProvider); ok {
 		specJSON, err := protojson.Marshal(spec)
 		if err != nil {
 			return nil, fmt.Errorf("marshal spec: %w", err)
 		}
-		return sp.UpdateAppWithSpec(name, displayName, description, html, specJSON)
+		return sp.UpdateAppWithSpec(owner, name, displayName, description, html, specJSON)
 	}
-	return provider.UpdateApp(name, displayName, description, html)
+	return provider.UpdateApp(owner, name, displayName, description, html)
 }
 
 // AppCompiler compiles UIAppSpec to HTML. Separated from AppProvider to keep
@@ -108,7 +125,7 @@ func (s *MultiAgentServer) ListUIApps(ctx context.Context, req *loomv1.ListUIApp
 		return &loomv1.ListUIAppsResponse{}, nil
 	}
 
-	infos := provider.ListAppInfo()
+	infos := provider.ListAppInfo(appOwner(ctx))
 	protoApps := make([]*loomv1.UIApp, 0, len(infos))
 	for _, info := range infos {
 		protoApps = append(protoApps, appInfoToProto(&info))
@@ -138,7 +155,7 @@ func (s *MultiAgentServer) GetUIApp(ctx context.Context, req *loomv1.GetUIAppReq
 		return nil, status.Error(codes.NotFound, "no app provider configured")
 	}
 
-	content, info, err := provider.GetAppHTML(req.Name)
+	content, info, err := provider.GetAppHTML(appOwner(ctx), req.Name)
 	if err != nil {
 		return nil, status.Errorf(codes.NotFound, "app not found: %s", req.Name)
 	}
@@ -195,7 +212,7 @@ func (s *MultiAgentServer) CreateUIApp(ctx context.Context, req *loomv1.CreateUI
 	}
 
 	// Create app in registry
-	info, overwritten, err := createAppFromSpec(provider, req.Name, displayName, req.Description, html, req.Spec, req.Overwrite)
+	info, overwritten, err := createAppFromSpec(provider, appOwner(ctx), req.Name, displayName, req.Description, html, req.Spec, req.Overwrite)
 	if err != nil {
 		errMsg := err.Error()
 		switch {
@@ -253,7 +270,7 @@ func (s *MultiAgentServer) UpdateUIApp(ctx context.Context, req *loomv1.UpdateUI
 	}
 
 	// Update in registry
-	info, err := updateAppFromSpec(provider, req.Name, req.DisplayName, req.Description, html, req.Spec)
+	info, err := updateAppFromSpec(provider, appOwner(ctx), req.Name, req.DisplayName, req.Description, html, req.Spec)
 	if err != nil {
 		return nil, status.Errorf(codes.NotFound, "%v", err)
 	}
@@ -294,7 +311,7 @@ func (s *MultiAgentServer) SetUIAppChecklistItem(ctx context.Context, req *loomv
 	s.checklistMu.Lock()
 	defer s.checklistMu.Unlock()
 
-	specJSON, err := specProvider.AppSpec(req.GetName())
+	specJSON, err := specProvider.AppSpec(appOwner(ctx), req.GetName())
 	if err != nil {
 		if strings.Contains(err.Error(), "not found") {
 			return nil, status.Errorf(codes.NotFound, "%v", err)
@@ -313,7 +330,7 @@ func (s *MultiAgentServer) SetUIAppChecklistItem(ctx context.Context, req *loomv
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "recompile %s: %v", req.GetName(), err)
 	}
-	info, err := updateAppFromSpec(provider, req.GetName(), "", "", html, spec)
+	info, err := updateAppFromSpec(provider, appOwner(ctx), req.GetName(), "", "", html, spec)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "save %s: %v", req.GetName(), err)
 	}
@@ -362,7 +379,7 @@ func (s *MultiAgentServer) DeleteUIApp(ctx context.Context, req *loomv1.DeleteUI
 		return nil, status.Error(codes.FailedPrecondition, "no app provider configured")
 	}
 
-	if err := provider.DeleteApp(req.Name); err != nil {
+	if err := provider.DeleteApp(appOwner(ctx), req.Name); err != nil {
 		return nil, status.Errorf(codes.NotFound, "%v", err)
 	}
 

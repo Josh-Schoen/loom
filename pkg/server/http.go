@@ -50,10 +50,11 @@ func DefaultCORSConfig() CORSConfig {
 }
 
 // AppHTMLProvider provides HTML content for UI apps.
-// Used by the HTTP server to serve apps in the browser.
+// Used by the HTTP server to serve apps in the browser. owner is the
+// requester's user ID: they see the shared embedded apps and their own.
 type AppHTMLProvider interface {
-	AppNames() []string
-	AppHTML(name string) ([]byte, error)
+	AppNames(owner string) []string
+	AppHTML(owner, name string) ([]byte, error)
 }
 
 // HTTPServer wraps gRPC server with HTTP/REST+SSE endpoints
@@ -516,8 +517,8 @@ func (h *HTTPServer) handleApps(w http.ResponseWriter, r *http.Request) {
 	// "/apps/" -> index, "/apps/data-chart" -> individual app
 	name := strings.TrimPrefix(r.URL.Path, "/apps/")
 	if name == "" {
-		if h.authorizeHTTP(w, r, listUIAppsFullMethod) {
-			h.handleAppsIndex(w, r)
+		if ctx, ok := h.authorizeHTTP(w, r, listUIAppsFullMethod); ok {
+			h.handleAppsIndex(w, appOwner(ctx))
 		}
 		return
 	}
@@ -527,8 +528,8 @@ func (h *HTTPServer) handleApps(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Invalid app name", http.StatusBadRequest)
 		return
 	}
-	if h.authorizeHTTP(w, r, getUIAppFullMethod) {
-		h.handleAppHTML(w, r, name)
+	if ctx, ok := h.authorizeHTTP(w, r, getUIAppFullMethod); ok {
+		h.handleAppHTML(w, appOwner(ctx), name)
 	}
 }
 
@@ -540,26 +541,31 @@ const (
 )
 
 // authorizeHTTP runs the server's interceptor chain (authentication, user
-// identity) for a plain HTTP handler, as if the request were fullMethod. On
-// rejection it writes the mapped HTTP error and returns false. With no
-// interceptors configured every request is allowed, as before.
-func (h *HTTPServer) authorizeHTTP(w http.ResponseWriter, r *http.Request, fullMethod string) bool {
+// identity) for a plain HTTP handler, as if the request were fullMethod, and
+// returns the context the interceptors produced (carrying the caller's user
+// ID). On rejection it writes the mapped HTTP error and returns false. With
+// no interceptors configured every request is allowed, as before.
+func (h *HTTPServer) authorizeHTTP(w http.ResponseWriter, r *http.Request, fullMethod string) (context.Context, bool) {
 	if h.streamInterceptor == nil {
-		return true
+		return r.Context(), true
 	}
 	ctx, err := runtime.AnnotateIncomingContext(r.Context(), h.gatewayMux, r, fullMethod)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Invalid request: %v", err), http.StatusBadRequest)
-		return false
+		return nil, false
 	}
+	authorized := ctx
 	err = h.streamInterceptor(nil, &contextOnlyStream{ctx: ctx}, &grpc.StreamServerInfo{FullMethod: fullMethod},
-		func(any, grpc.ServerStream) error { return nil })
+		func(_ any, ss grpc.ServerStream) error {
+			authorized = ss.Context()
+			return nil
+		})
 	if err != nil {
 		st, _ := status.FromError(err)
 		http.Error(w, st.Message(), runtime.HTTPStatusFromCode(st.Code()))
-		return false
+		return nil, false
 	}
-	return true
+	return authorized, true
 }
 
 // contextOnlyStream carries a request context through stream interceptors
@@ -583,9 +589,9 @@ func isValidAppName(name string) bool {
 	return len(name) > 0
 }
 
-// handleAppsIndex serves an HTML index page listing all available apps.
-func (h *HTTPServer) handleAppsIndex(w http.ResponseWriter, _ *http.Request) {
-	names := h.appHTMLProvider.AppNames()
+// handleAppsIndex serves an HTML index page listing the apps owner can see.
+func (h *HTTPServer) handleAppsIndex(w http.ResponseWriter, owner string) {
+	names := h.appHTMLProvider.AppNames(owner)
 
 	// Build a simple HTML page with links
 	var sb strings.Builder
@@ -610,9 +616,10 @@ func (h *HTTPServer) handleAppsIndex(w http.ResponseWriter, _ *http.Request) {
 	_, _ = w.Write([]byte(sb.String()))
 }
 
-// handleAppHTML serves the raw HTML for a specific app with security headers.
-func (h *HTTPServer) handleAppHTML(w http.ResponseWriter, _ *http.Request, name string) {
-	content, err := h.appHTMLProvider.AppHTML(name)
+// handleAppHTML serves the raw HTML of an app owner can see, with security
+// headers.
+func (h *HTTPServer) handleAppHTML(w http.ResponseWriter, owner, name string) {
+	content, err := h.appHTMLProvider.AppHTML(owner, name)
 	if err != nil {
 		http.Error(w, "App not found", http.StatusNotFound)
 		return

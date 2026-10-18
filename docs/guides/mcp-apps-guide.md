@@ -388,7 +388,7 @@ Reduce data size, lower the component count, or split into multiple apps.
 
 ### "dynamic app limit reached"
 
-Maximum 100 dynamic apps. Delete unused apps with `loom_delete_app` to free slots.
+Maximum 100 dynamic apps per user. Delete unused apps with `loom_delete_app` to free slots.
 
 ### App not rendering in Claude Desktop
 

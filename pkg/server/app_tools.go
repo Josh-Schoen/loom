@@ -104,7 +104,7 @@ func (t *getUIAppTool) InputSchema() *shuttle.JSONSchema {
 	)
 }
 
-func (t *getUIAppTool) Execute(_ context.Context, params map[string]interface{}) (*shuttle.Result, error) {
+func (t *getUIAppTool) Execute(ctx context.Context, params map[string]interface{}) (*shuttle.Result, error) {
 	start := time.Now()
 	fail := func(code, msg string) (*shuttle.Result, error) {
 		return &shuttle.Result{
@@ -122,7 +122,7 @@ func (t *getUIAppTool) Execute(_ context.Context, params map[string]interface{})
 	if !ok {
 		return fail("PRECONDITION_FAILED", "this server does not keep app specs")
 	}
-	specJSON, err := specProvider.AppSpec(name)
+	specJSON, err := specProvider.AppSpec(appOwner(ctx), name)
 	if err != nil {
 		return fail("NOT_FOUND", err.Error())
 	}
@@ -302,7 +302,7 @@ func (t *createUIAppTool) Execute(ctx context.Context, params map[string]interfa
 	overwrite, _ := params["overwrite"].(bool)
 
 	// Create app
-	info, overwritten, err := createAppFromSpec(t.provider, name, displayName, description, html, spec, overwrite)
+	info, overwritten, err := createAppFromSpec(t.provider, appOwner(ctx), name, displayName, description, html, spec, overwrite)
 	if err != nil {
 		return &shuttle.Result{
 			Success:         false,
@@ -482,7 +482,7 @@ func (t *updateUIAppTool) Execute(ctx context.Context, params map[string]interfa
 	displayName, _ := params["display_name"].(string)
 	description, _ := params["description"].(string)
 
-	info, err := updateAppFromSpec(t.provider, name, displayName, description, html, spec)
+	info, err := updateAppFromSpec(t.provider, appOwner(ctx), name, displayName, description, html, spec)
 	if err != nil {
 		return &shuttle.Result{
 			Success:         false,
@@ -561,7 +561,7 @@ func (t *deleteUIAppTool) Execute(ctx context.Context, params map[string]interfa
 		}, nil
 	}
 
-	if err := t.provider.DeleteApp(name); err != nil {
+	if err := t.provider.DeleteApp(appOwner(ctx), name); err != nil {
 		return &shuttle.Result{
 			Success:         false,
 			Error:           &shuttle.Error{Code: "DELETE_FAILED", Message: fmt.Sprintf("delete failed: %v", err)},

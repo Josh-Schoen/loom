@@ -283,7 +283,7 @@ func TestUIResourceRegistry_AppNames(t *testing.T) {
 	_ = registry.Register(&UIResource{URI: "ui://loom/data-chart", Name: "Data Chart", HTML: []byte("a")})
 	_ = registry.Register(&UIResource{URI: "ui://loom/conversation-viewer", Name: "Conv Viewer", HTML: []byte("b")})
 
-	names := registry.AppNames()
+	names := registry.AppNames("")
 	require.Len(t, names, 2)
 	assert.Equal(t, "conversation-viewer", names[0])
 	assert.Equal(t, "data-chart", names[1])
@@ -291,7 +291,7 @@ func TestUIResourceRegistry_AppNames(t *testing.T) {
 
 func TestUIResourceRegistry_AppNames_Empty(t *testing.T) {
 	registry := NewUIResourceRegistry()
-	names := registry.AppNames()
+	names := registry.AppNames("")
 	assert.Empty(t, names)
 }
 
@@ -301,7 +301,7 @@ func TestUIResourceRegistry_AppHTML(t *testing.T) {
 	expected := []byte("<html>chart</html>")
 	_ = registry.Register(&UIResource{URI: "ui://loom/data-chart", Name: "Data Chart", HTML: expected})
 
-	html, err := registry.AppHTML("data-chart")
+	html, err := registry.AppHTML("", "data-chart")
 	require.NoError(t, err)
 	assert.Equal(t, expected, html)
 }
@@ -309,7 +309,7 @@ func TestUIResourceRegistry_AppHTML(t *testing.T) {
 func TestUIResourceRegistry_AppHTML_NotFound(t *testing.T) {
 	registry := NewUIResourceRegistry()
 
-	_, err := registry.AppHTML("nonexistent")
+	_, err := registry.AppHTML("", "nonexistent")
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "not found")
 }
@@ -334,7 +334,7 @@ func TestUIResourceRegistry_ListAppInfo(t *testing.T) {
 		HTML:        []byte("<html>viewer</html>"),
 	})
 
-	infos := registry.ListAppInfo()
+	infos := registry.ListAppInfo("")
 	require.Len(t, infos, 2)
 
 	// Sorted by name
@@ -362,7 +362,7 @@ func TestUIResourceRegistry_GetAppHTML(t *testing.T) {
 		Meta:        &protocol.UIResourceMeta{PrefersBorder: &prefersBorder},
 	})
 
-	html, info, err := registry.GetAppHTML("data-chart")
+	html, info, err := registry.GetAppHTML("", "data-chart")
 	require.NoError(t, err)
 	assert.Equal(t, expected, html)
 	assert.Equal(t, "data-chart", info.Name)
@@ -373,7 +373,7 @@ func TestUIResourceRegistry_GetAppHTML(t *testing.T) {
 func TestUIResourceRegistry_GetAppHTML_NotFound(t *testing.T) {
 	registry := NewUIResourceRegistry()
 
-	_, _, err := registry.GetAppHTML("nonexistent")
+	_, _, err := registry.GetAppHTML("", "nonexistent")
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "not found")
 }
@@ -712,7 +712,7 @@ func TestUIResourceRegistry_SetOnChange_ReplaceCallback(t *testing.T) {
 func TestUIResourceRegistry_CreateApp(t *testing.T) {
 	registry := NewUIResourceRegistry()
 
-	info, overwritten, err := registry.CreateApp("test-app", "Test App", "A test app", []byte("<html>test</html>"), false)
+	info, overwritten, err := registry.CreateApp("", "test-app", "Test App", "A test app", []byte("<html>test</html>"), false)
 	require.NoError(t, err)
 	assert.False(t, overwritten)
 	require.NotNil(t, info)
@@ -734,11 +734,11 @@ func TestUIResourceRegistry_CreateApp(t *testing.T) {
 func TestUIResourceRegistry_CreateApp_DuplicateWithoutOverwrite(t *testing.T) {
 	registry := NewUIResourceRegistry()
 
-	_, _, err := registry.CreateApp("test-app", "Test App", "desc", []byte("<html>v1</html>"), false)
+	_, _, err := registry.CreateApp("", "test-app", "Test App", "desc", []byte("<html>v1</html>"), false)
 	require.NoError(t, err)
 
 	// Second create without overwrite should fail
-	_, _, err = registry.CreateApp("test-app", "Test App v2", "desc", []byte("<html>v2</html>"), false)
+	_, _, err = registry.CreateApp("", "test-app", "Test App v2", "desc", []byte("<html>v2</html>"), false)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "already exists")
 }
@@ -746,11 +746,11 @@ func TestUIResourceRegistry_CreateApp_DuplicateWithoutOverwrite(t *testing.T) {
 func TestUIResourceRegistry_CreateApp_DuplicateWithOverwrite(t *testing.T) {
 	registry := NewUIResourceRegistry()
 
-	_, _, err := registry.CreateApp("test-app", "Test App", "desc", []byte("<html>v1</html>"), false)
+	_, _, err := registry.CreateApp("", "test-app", "Test App", "desc", []byte("<html>v1</html>"), false)
 	require.NoError(t, err)
 
 	// With overwrite=true, should succeed
-	info, _, err := registry.CreateApp("test-app", "Test App v2", "desc v2", []byte("<html>v2</html>"), true)
+	info, _, err := registry.CreateApp("", "test-app", "Test App v2", "desc v2", []byte("<html>v2</html>"), true)
 	require.NoError(t, err)
 	assert.Equal(t, "Test App v2", info.DisplayName)
 	assert.Equal(t, 1, registry.Count())
@@ -770,7 +770,7 @@ func TestUIResourceRegistry_CreateApp_RejectOverwriteEmbedded(t *testing.T) {
 	require.NoError(t, err)
 
 	// CreateApp should not overwrite embedded, even without overwrite flag
-	_, _, err = registry.CreateApp("embedded", "New", "desc", []byte("<html>new</html>"), false)
+	_, _, err = registry.CreateApp("", "embedded", "New", "desc", []byte("<html>new</html>"), false)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "cannot overwrite embedded app")
 }
@@ -781,11 +781,11 @@ func TestUIResourceRegistry_UpdateApp(t *testing.T) {
 	registry := NewUIResourceRegistry()
 
 	// First create a dynamic app
-	_, _, err := registry.CreateApp("my-app", "My App", "Original desc", []byte("<html>v1</html>"), false)
+	_, _, err := registry.CreateApp("", "my-app", "My App", "Original desc", []byte("<html>v1</html>"), false)
 	require.NoError(t, err)
 
 	// Update it
-	info, err := registry.UpdateApp("my-app", "My App Updated", "Updated desc", []byte("<html>v2</html>"))
+	info, err := registry.UpdateApp("", "my-app", "My App Updated", "Updated desc", []byte("<html>v2</html>"))
 	require.NoError(t, err)
 	require.NotNil(t, info)
 	assert.Equal(t, "My App Updated", info.DisplayName)
@@ -793,7 +793,7 @@ func TestUIResourceRegistry_UpdateApp(t *testing.T) {
 	assert.True(t, info.Dynamic)
 
 	// Verify stored content
-	html, _, err := registry.GetAppHTML("my-app")
+	html, _, err := registry.GetAppHTML("", "my-app")
 	require.NoError(t, err)
 	assert.Equal(t, []byte("<html>v2</html>"), html)
 }
@@ -801,7 +801,7 @@ func TestUIResourceRegistry_UpdateApp(t *testing.T) {
 func TestUIResourceRegistry_UpdateApp_NotFound(t *testing.T) {
 	registry := NewUIResourceRegistry()
 
-	_, err := registry.UpdateApp("nonexistent", "Name", "Desc", []byte("<html>x</html>"))
+	_, err := registry.UpdateApp("", "nonexistent", "Name", "Desc", []byte("<html>x</html>"))
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "not found")
 }
@@ -809,11 +809,11 @@ func TestUIResourceRegistry_UpdateApp_NotFound(t *testing.T) {
 func TestUIResourceRegistry_UpdateApp_KeepsExistingFields(t *testing.T) {
 	registry := NewUIResourceRegistry()
 
-	_, _, err := registry.CreateApp("my-app", "Original Name", "Original Desc", []byte("<html>v1</html>"), false)
+	_, _, err := registry.CreateApp("", "my-app", "Original Name", "Original Desc", []byte("<html>v1</html>"), false)
 	require.NoError(t, err)
 
 	// Update with empty displayName and description -- should keep existing
-	info, err := registry.UpdateApp("my-app", "", "", []byte("<html>v2</html>"))
+	info, err := registry.UpdateApp("", "my-app", "", "", []byte("<html>v2</html>"))
 	require.NoError(t, err)
 	assert.Equal(t, "Original Name", info.DisplayName)
 	assert.Equal(t, "Original Desc", info.Description)
@@ -831,7 +831,7 @@ func TestUIResourceRegistry_UpdateApp_RejectEmbedded(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	_, err = registry.UpdateApp("embedded", "New", "Desc", []byte("<html>new</html>"))
+	_, err = registry.UpdateApp("", "embedded", "New", "Desc", []byte("<html>new</html>"))
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "cannot update embedded app")
 }
@@ -841,11 +841,11 @@ func TestUIResourceRegistry_UpdateApp_RejectEmbedded(t *testing.T) {
 func TestUIResourceRegistry_DeleteApp(t *testing.T) {
 	registry := NewUIResourceRegistry()
 
-	_, _, err := registry.CreateApp("my-app", "My App", "desc", []byte("<html>v1</html>"), false)
+	_, _, err := registry.CreateApp("", "my-app", "My App", "desc", []byte("<html>v1</html>"), false)
 	require.NoError(t, err)
 	assert.Equal(t, 1, registry.Count())
 
-	err = registry.DeleteApp("my-app")
+	err = registry.DeleteApp("", "my-app")
 	require.NoError(t, err)
 	assert.Equal(t, 0, registry.Count())
 }
@@ -853,7 +853,7 @@ func TestUIResourceRegistry_DeleteApp(t *testing.T) {
 func TestUIResourceRegistry_DeleteApp_NotFound(t *testing.T) {
 	registry := NewUIResourceRegistry()
 
-	err := registry.DeleteApp("nonexistent")
+	err := registry.DeleteApp("", "nonexistent")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "not found")
 }
@@ -929,16 +929,16 @@ func TestUIResourceRegistry_ConcurrentNewMethods(t *testing.T) {
 			defer wg.Done()
 			switch i % 5 {
 			case 0:
-				names := registry.AppNames()
+				names := registry.AppNames("")
 				assert.Len(t, names, 2)
 			case 1:
-				_, err := registry.AppHTML("data-chart")
+				_, err := registry.AppHTML("", "data-chart")
 				assert.NoError(t, err)
 			case 2:
-				infos := registry.ListAppInfo()
+				infos := registry.ListAppInfo("")
 				assert.Len(t, infos, 2)
 			case 3:
-				_, _, err := registry.GetAppHTML("data-chart")
+				_, _, err := registry.GetAppHTML("", "data-chart")
 				assert.NoError(t, err)
 			case 4:
 				_, err := registry.Get("ui://loom/data-chart")

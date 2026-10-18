@@ -21,8 +21,8 @@ type mockHTMLProvider struct {
 	html  map[string][]byte
 }
 
-func (m *mockHTMLProvider) AppNames() []string { return m.names }
-func (m *mockHTMLProvider) AppHTML(name string) ([]byte, error) {
+func (m *mockHTMLProvider) AppNames(_ string) []string { return m.names }
+func (m *mockHTMLProvider) AppHTML(_, name string) ([]byte, error) {
 	h, ok := m.html[name]
 	if !ok {
 		return nil, fmt.Errorf("not found: %s", name)

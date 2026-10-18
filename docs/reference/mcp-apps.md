@@ -19,6 +19,7 @@ Declarative spec format for building interactive UI apps rendered as MCP resourc
   - [gRPC RPCs](#grpc-rpcs)
   - [MCP Tools](#mcp-tools)
   - [Agent Tools](#agent-tools)
+- [Ownership](#ownership)
 - [Persistence](#persistence)
 - [Checklist State](#checklist-state)
 - [HTTP Access Control](#http-access-control)
@@ -34,7 +35,7 @@ MCP Apps are standalone HTML documents compiled from a declarative JSON spec. Th
 
 Apps are served as MCP resources at `ui://loom/<name>` and via HTTP at `/apps/<name>`.
 
-There are 4 built-in (embedded) apps and up to 100 dynamic apps created at runtime.
+There are 4 built-in (embedded) apps, shared by every user, and up to 100 dynamic apps per user created at runtime. Dynamic apps belong to the user who created them (see [Ownership](#ownership)).
 
 ## Spec Format
 
@@ -542,8 +543,8 @@ You can also pass hex colors (e.g., `"#ff6b6b"`), but named colors are preferred
 | Max nesting depth | 10 |
 | Max props size per component | 64 KB |
 | Max total spec size | 512 KB |
-| Max dynamic apps | 100 |
-| Max total dynamic app storage | 50 MB |
+| Max dynamic apps (per owner) | 100 |
+| Max total dynamic app storage (per owner) | 50 MB |
 | App name pattern | `^[a-z0-9][a-z0-9-]{0,62}$` |
 | Reserved names | `component-types` |
 
@@ -598,15 +599,39 @@ spec:
 
 Agents should call `list_component_types` first to discover the catalog, then use `create_ui_app` with a spec. Before `update_ui_app` on an app with a checklist, agents should call `get_ui_app` and keep each item's `checked` value; `update_ui_app` replaces the whole spec, so ticks missing from the new spec are lost.
 
+## Ownership
+
+Each dynamic app belongs to one user, its owner: the user ID of the request
+that created it. For RPCs and `/apps/` pages that is the caller's identity
+(set by the authentication, device-pairing, or user-ID interceptors); for the
+agent tools it is the user who sent the message the agent is answering.
+Requests without an identity act as `default-user` (`types.DefaultUserID`).
+
+- `ListUIApps`, `GetUIApp`, `UpdateUIApp`, `DeleteUIApp`,
+  `SetUIAppChecklistItem`, `/apps/`, and the agent tools see the embedded apps
+  and the caller's own dynamic apps only. Another user's app answers as not
+  found (`NOT_FOUND` / HTTP 404), so its existence is not revealed.
+- Names are unique per owner: two users can each have an app called
+  `meal-plan`. Names of embedded apps are reserved for everyone.
+- Limits (100 apps, 50 MB) apply per owner.
+- The MCP resource view of the registry (`List`, `Read` on `loom-mcp` and
+  embedded hosts) has no user identity and shows `default-user`'s apps.
+
+**Only as strong as the identity.** With no authentication configured, the
+user ID comes from the `X-User-Id` header (`Grpc-Metadata-X-User-Id` on the
+gateway), which any caller can set, so ownership separates users' apps but
+does not protect them from each other. To enforce it, turn on
+`server.auth.enabled` or `server.device_pairing.required`; a paired device
+always acts as the user it was paired for (`looms pair --user`) and cannot
+override it with the header.
+
 ## Persistence
 
-`looms serve` stores each dynamic app as `$LOOM_DATA_DIR/apps/<name>.json` (compiled HTML, the spec it was compiled from, display name, description, `updated_at`; mode 0600) and loads them at startup, so apps survive restarts. Create, update, and delete write the file before the change is visible; if the write fails, the operation fails and the previous version stays. Unreadable files, files whose `name` does not match the file name, and files beyond the registry limits are skipped (logged) and left in place. Embedded apps are not stored.
+`looms serve` stores each dynamic app as a JSON file: `default-user`'s in `$LOOM_DATA_DIR/apps/<name>.json` (where all apps were stored before apps had owners, so existing apps stay `default-user`'s), and every other owner's in `$LOOM_DATA_DIR/apps/users/<key>/<name>.json`, where `<key>` is the first 32 hex characters of the SHA-256 of the owner's user ID. Each file (mode 0600) holds the compiled HTML, the spec it was compiled from, display name, description, `updated_at`, and, outside the top directory, the owner's user ID. The server loads them at startup, so apps survive restarts. Create, update, and delete write the file before the change is visible; if the write fails, the operation fails and the previous version stays. Unreadable files, files whose `name` does not match the file name, files whose owner does not match their directory, and files beyond the registry limits are skipped (logged) and left in place. Embedded apps are not stored.
 
 The spec is stored for apps created or updated from a spec (`CreateUIApp`, `UpdateUIApp`, `create_ui_app`, `update_ui_app`). Files written before specs were stored have none; such apps load and serve as before, but `get_ui_app` and `SetUIAppChecklistItem` fail for them until the next update.
 
 `UIApp.updated_at` (`updatedAt` on the gateway) is the last create or update of a dynamic app; unset for embedded apps.
-
-Apps are shared by all users of a server; there is no per-user ownership.
 
 ## Checklist State
 
@@ -640,7 +665,7 @@ The server loads the stored spec, finds the checklist by `id` at any depth (insi
 | `FAILED_PRECONDITION` | The app has no stored spec, or the server has no spec-keeping app store or compiler |
 | `INTERNAL` | Stored spec unreadable, recompile failed, or the save failed (the previous version stays) |
 
-Ticks are stored in the spec, so they survive restarts and appear to every viewer. Apps are shared by all users of a server.
+Ticks are stored in the spec, so they survive restarts and appear on every device of the app's owner.
 
 ## HTTP Access Control
 

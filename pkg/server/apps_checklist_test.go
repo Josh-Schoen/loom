@@ -74,7 +74,7 @@ func newChecklistServer(t *testing.T, dir string) (*MultiAgentServer, *apps.UIRe
 
 func storedChecklistItems(t *testing.T, registry *apps.UIResourceRegistry, name string) map[string]bool {
 	t.Helper()
-	raw, err := registry.AppSpec(name)
+	raw, err := registry.AppSpec("", name)
 	require.NoError(t, err)
 	spec := &loomv1.UIAppSpec{}
 	require.NoError(t, protojson.Unmarshal(raw, spec))
@@ -115,7 +115,7 @@ func TestSetUIAppChecklistItem_TicksAndPersists(t *testing.T) {
 	assert.Equal(t, want, storedChecklistItems(t, registry, "groceries"))
 
 	// The served HTML reflects the change.
-	html, _, err := registry.GetAppHTML("groceries")
+	html, _, err := registry.GetAppHTML("", "groceries")
 	require.NoError(t, err)
 	assert.Contains(t, string(html), `"checked":true`)
 

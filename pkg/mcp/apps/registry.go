@@ -28,11 +28,19 @@ import (
 )
 
 const (
-	// DefaultMaxDynamic is the maximum number of dynamic (agent-created) apps.
+	// DefaultMaxDynamic is the maximum number of dynamic (agent-created) apps
+	// per owner.
 	DefaultMaxDynamic = 100
 
-	// DefaultMaxTotalBytes is the maximum total HTML bytes for dynamic apps (50 MB).
+	// DefaultMaxTotalBytes is the maximum total HTML bytes of one owner's
+	// dynamic apps (50 MB).
 	DefaultMaxTotalBytes int64 = 50 * 1024 * 1024
+
+	// DefaultOwner owns dynamic apps on servers without per-user identity,
+	// apps created through the owner-less methods, and apps stored before
+	// apps had owners. It equals types.DefaultUserID, the user ID requests
+	// get when no identity is configured.
+	DefaultOwner = "default-user"
 )
 
 // UIResource represents an HTML app that can be rendered by an MCP client.
@@ -44,18 +52,24 @@ type UIResource struct {
 	HTML        []byte                   // Raw HTML content
 	Meta        *protocol.UIResourceMeta // Security and display metadata
 	Dynamic     bool                     // true = agent-created, false = embedded
+	Owner       string                   // User who owns a dynamic app (DefaultOwner when empty); unused for embedded
 	UpdatedAt   time.Time                // Last create/update (dynamic apps only)
 	Spec        []byte                   // protojson UIAppSpec the HTML was compiled from (dynamic apps; may be nil)
 }
 
 // UIResourceRegistry manages UI resources that the MCP server exposes.
+// Embedded apps are shared by everyone. Dynamic (agent-created) apps belong
+// to the user who created them: two owners can each have an app with the
+// same name, and the owner-scoped methods (ListAppInfo, GetAppHTML,
+// CreateApp, ...) only see the given owner's apps plus the embedded ones.
 // Thread-safe for concurrent access.
 type UIResourceRegistry struct {
-	resources     map[string]*UIResource
+	resources     map[string]*UIResource            // embedded apps, by URI
+	dynamic       map[string]map[string]*UIResource // dynamic apps, by owner then name
 	mu            sync.RWMutex
 	onChange      func()           // Called outside lock after mutations
-	maxDynamic    int              // Max dynamic apps (default 100)
-	maxTotalBytes int64            // Max total HTML bytes for dynamic apps (default 50MB)
+	maxDynamic    int              // Max dynamic apps per owner (default 100)
+	maxTotalBytes int64            // Max total HTML bytes of one owner's dynamic apps (default 50MB)
 	store         *fileStore       // Persists dynamic apps when non-nil
 	now           func() time.Time // Clock for UpdatedAt
 }
@@ -64,17 +78,28 @@ type UIResourceRegistry struct {
 func NewUIResourceRegistry() *UIResourceRegistry {
 	return &UIResourceRegistry{
 		resources:     make(map[string]*UIResource),
+		dynamic:       make(map[string]map[string]*UIResource),
 		maxDynamic:    DefaultMaxDynamic,
 		maxTotalBytes: DefaultMaxTotalBytes,
 		now:           time.Now,
 	}
 }
 
-// EnablePersistence stores dynamic apps in dir (one JSON file per app) and
-// loads the apps already there, so agent-created apps survive restarts. Call
-// once, after registering embedded apps and before serving. Files that cannot
-// be read, or that would exceed the registry limits, are skipped and returned
-// by name; they stay on disk.
+// normalizeOwner maps an empty owner to DefaultOwner.
+func normalizeOwner(owner string) string {
+	if owner == "" {
+		return DefaultOwner
+	}
+	return owner
+}
+
+func appURI(name string) string { return "ui://loom/" + name }
+
+// EnablePersistence stores dynamic apps in dir and loads the apps already
+// there, so agent-created apps survive restarts. Call once, after
+// registering embedded apps and before serving. Files that cannot be read,
+// or that would exceed the registry limits, are skipped and returned by
+// path relative to dir; they stay on disk.
 func (r *UIResourceRegistry) EnablePersistence(dir string) (loaded int, skipped []string, err error) {
 	store, err := newFileStore(dir)
 	if err != nil {
@@ -89,18 +114,19 @@ func (r *UIResourceRegistry) EnablePersistence(dir string) (loaded int, skipped 
 	defer r.mu.Unlock()
 	for _, app := range stored {
 		res := &UIResource{
-			URI:         "ui://loom/" + app.Name,
+			URI:         appURI(app.Name),
 			Name:        app.DisplayName,
 			Description: app.Description,
 			MIMEType:    protocol.ResourceMIME,
 			HTML:        []byte(app.HTML),
 			Meta:        &protocol.UIResourceMeta{PrefersBorder: boolPtrTrue()},
 			Dynamic:     true,
+			Owner:       normalizeOwner(app.Owner),
 			UpdatedAt:   app.UpdatedAt,
 			Spec:        specBytes(app.Spec),
 		}
 		if _, err := r.upsertLocked(res); err != nil {
-			skipped = append(skipped, app.Name+".json")
+			skipped = append(skipped, app.file)
 			continue
 		}
 		loaded++
@@ -119,7 +145,7 @@ func (r *UIResourceRegistry) SetOnChange(fn func()) {
 	r.onChange = fn
 }
 
-// Register adds a UI resource to the registry.
+// Register adds an embedded UI resource to the registry.
 // Returns an error if a resource with the same URI is already registered.
 func (r *UIResourceRegistry) Register(res *UIResource) error {
 	if res == nil {
@@ -127,6 +153,9 @@ func (r *UIResourceRegistry) Register(res *UIResource) error {
 	}
 	if res.URI == "" {
 		return fmt.Errorf("resource URI cannot be empty")
+	}
+	if res.Dynamic {
+		return fmt.Errorf("dynamic resources are added with Upsert or CreateApp")
 	}
 
 	r.mu.Lock()
@@ -140,9 +169,10 @@ func (r *UIResourceRegistry) Register(res *UIResource) error {
 	return nil
 }
 
-// Upsert creates or replaces a dynamic UI resource. It rejects overwrites of
-// embedded (non-dynamic) resources. Returns true if a new resource was created,
-// false if an existing dynamic resource was replaced.
+// Upsert creates or replaces a dynamic UI resource of res.Owner (DefaultOwner
+// when empty). It rejects resources whose name is taken by an embedded app.
+// Returns true if a new resource was created, false if an existing dynamic
+// resource was replaced.
 func (r *UIResourceRegistry) Upsert(res *UIResource) (created bool, err error) {
 	if res == nil {
 		return false, fmt.Errorf("resource cannot be nil")
@@ -170,17 +200,20 @@ func (r *UIResourceRegistry) Upsert(res *UIResource) (created bool, err error) {
 	return created, nil
 }
 
-// upsertLocked inserts or replaces a dynamic resource in the map.
+// upsertLocked inserts or replaces a dynamic resource of res.Owner.
 // The caller MUST hold r.mu in write mode.
 func (r *UIResourceRegistry) upsertLocked(res *UIResource) (created bool, err error) {
-	existing, exists := r.resources[res.URI]
-	if exists && !existing.Dynamic {
+	name := extractAppName(res.URI)
+	if _, embedded := r.embeddedLocked(name); embedded {
 		return false, fmt.Errorf("cannot overwrite embedded resource: %s", res.URI)
 	}
+	res.Owner = normalizeOwner(res.Owner)
+	apps := r.dynamic[res.Owner]
+	existing, exists := apps[name]
 
 	// Capacity checks for new resources
 	if !exists {
-		dynCount, dynBytes := r.dynamicStatsLocked()
+		dynCount, dynBytes := r.dynamicStatsLocked(res.Owner)
 		if dynCount >= r.maxDynamic {
 			return false, fmt.Errorf("dynamic app limit reached (%d)", r.maxDynamic)
 		}
@@ -192,14 +225,18 @@ func (r *UIResourceRegistry) upsertLocked(res *UIResource) (created bool, err er
 	if res.UpdatedAt.IsZero() {
 		res.UpdatedAt = r.now()
 	}
-	r.resources[res.URI] = res
+	if apps == nil {
+		apps = make(map[string]*UIResource)
+		r.dynamic[res.Owner] = apps
+	}
+	apps[name] = res
 	if r.store != nil {
 		if err := r.store.save(res); err != nil {
 			// Keep memory and disk in agreement: undo the change.
 			if exists {
-				r.resources[res.URI] = existing
+				apps[name] = existing
 			} else {
-				delete(r.resources, res.URI)
+				delete(apps, name)
 			}
 			return false, err
 		}
@@ -207,58 +244,89 @@ func (r *UIResourceRegistry) upsertLocked(res *UIResource) (created bool, err er
 	return !exists, nil
 }
 
-// Delete removes a dynamic UI resource by URI. Rejects deletion of embedded resources.
+// Delete removes a DefaultOwner dynamic UI resource by URI. Rejects deletion
+// of embedded resources. Use DeleteApp for other owners.
 func (r *UIResourceRegistry) Delete(uri string) error {
-	var notify func()
-
-	r.mu.Lock()
-	existing, exists := r.resources[uri]
-	if !exists {
-		r.mu.Unlock()
-		return fmt.Errorf("resource not found: %s", uri)
-	}
-	if !existing.Dynamic {
-		r.mu.Unlock()
+	r.mu.RLock()
+	_, embedded := r.resources[uri]
+	r.mu.RUnlock()
+	if embedded {
 		return fmt.Errorf("cannot delete embedded resource: %s", uri)
 	}
-
-	delete(r.resources, uri)
-	if r.store != nil {
-		if err := r.store.delete(extractAppName(uri)); err != nil {
-			r.resources[uri] = existing
-			r.mu.Unlock()
-			return err
-		}
-	}
-	notify = r.onChange
-	r.mu.Unlock()
-
-	if notify != nil {
-		notify()
-	}
-	return nil
+	return r.DeleteApp(DefaultOwner, extractAppName(uri))
 }
 
-// dynamicStatsLocked returns the count and total HTML bytes of dynamic resources.
-// Must be called with r.mu held.
-func (r *UIResourceRegistry) dynamicStatsLocked() (count int, totalBytes int64) {
-	for _, res := range r.resources {
-		if res.Dynamic {
-			count++
-			totalBytes += int64(len(res.HTML))
-		}
+// dynamicStatsLocked returns the count and total HTML bytes of owner's
+// dynamic resources. Must be called with r.mu held.
+func (r *UIResourceRegistry) dynamicStatsLocked(owner string) (count int, totalBytes int64) {
+	for _, res := range r.dynamic[owner] {
+		count++
+		totalBytes += int64(len(res.HTML))
 	}
 	return count, totalBytes
 }
 
-// List returns all registered resources as MCP Resource objects.
-// Results are sorted by URI for deterministic ordering.
+// visibleLocked returns the embedded resources and owner's dynamic ones.
+// Must be called with r.mu held.
+func (r *UIResourceRegistry) visibleLocked(owner string) []*UIResource {
+	owned := r.dynamic[normalizeOwner(owner)]
+	out := make([]*UIResource, 0, len(r.resources)+len(owned))
+	for _, res := range r.resources {
+		out = append(out, res)
+	}
+	for _, res := range owned {
+		out = append(out, res)
+	}
+	return out
+}
+
+// embeddedLocked finds an embedded app by short name. Must be called with
+// r.mu held.
+func (r *UIResourceRegistry) embeddedLocked(name string) (*UIResource, bool) {
+	if res, ok := r.resources[appURI(name)]; ok {
+		return res, true
+	}
+	for uri, res := range r.resources {
+		if extractAppName(uri) == name {
+			return res, true
+		}
+	}
+	return nil, false
+}
+
+// lookupLocked finds an app by short name: an embedded app, else owner's
+// dynamic app. Must be called with r.mu held.
+func (r *UIResourceRegistry) lookupLocked(owner, name string) (*UIResource, bool) {
+	if res, ok := r.embeddedLocked(name); ok {
+		return res, true
+	}
+	res, ok := r.dynamic[normalizeOwner(owner)][name]
+	return res, ok
+}
+
+// byURILocked finds an embedded resource, or a DefaultOwner dynamic one, by
+// URI. Must be called with r.mu held.
+func (r *UIResourceRegistry) byURILocked(uri string) (*UIResource, bool) {
+	if res, ok := r.resources[uri]; ok {
+		return res, true
+	}
+	res, ok := r.dynamic[DefaultOwner][extractAppName(uri)]
+	if !ok || res.URI != uri {
+		return nil, false
+	}
+	return res, true
+}
+
+// List returns the embedded resources and DefaultOwner's dynamic ones as MCP
+// Resource objects, sorted by URI. This is the view of an MCP client, which
+// has no per-user identity.
 func (r *UIResourceRegistry) List() []protocol.Resource {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
-	resources := make([]protocol.Resource, 0, len(r.resources))
-	for _, res := range r.resources {
+	visible := r.visibleLocked(DefaultOwner)
+	resources := make([]protocol.Resource, 0, len(visible))
+	for _, res := range visible {
 		resources = append(resources, protocol.Resource{
 			URI:         res.URI,
 			Name:        res.Name,
@@ -272,13 +340,13 @@ func (r *UIResourceRegistry) List() []protocol.Resource {
 	return resources
 }
 
-// Read returns the contents of a resource by URI.
+// Read returns the contents of an embedded or DefaultOwner resource by URI.
 // Returns an error if the resource is not found.
 func (r *UIResourceRegistry) Read(uri string) (*protocol.ReadResourceResult, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
-	res, ok := r.resources[uri]
+	res, ok := r.byURILocked(uri)
 	if !ok {
 		return nil, fmt.Errorf("resource not found: %s", uri)
 	}
@@ -314,19 +382,25 @@ func (r *UIResourceRegistry) Read(uri string) (*protocol.ReadResourceResult, err
 	}, nil
 }
 
-// Count returns the number of registered resources.
+// Count returns the number of registered resources: embedded apps plus every
+// owner's dynamic apps.
 func (r *UIResourceRegistry) Count() int {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	return len(r.resources)
+	n := len(r.resources)
+	for _, owned := range r.dynamic {
+		n += len(owned)
+	}
+	return n
 }
 
-// Get returns a UIResource by its URI, or an error if not found.
+// Get returns an embedded or DefaultOwner UIResource by its URI, or an error
+// if not found.
 func (r *UIResourceRegistry) Get(uri string) (*UIResource, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
-	res, ok := r.resources[uri]
+	res, ok := r.byURILocked(uri)
 	if !ok {
 		return nil, fmt.Errorf("resource not found: %s", uri)
 	}
@@ -334,30 +408,30 @@ func (r *UIResourceRegistry) Get(uri string) (*UIResource, error) {
 	return &copy, nil
 }
 
-// AppNames returns sorted short names extracted from all registered URIs.
-// For example, "ui://loom/data-chart" yields "data-chart".
-func (r *UIResourceRegistry) AppNames() []string {
+// AppNames returns the sorted short names of the apps owner can see (the
+// embedded ones and owner's own). For example, "ui://loom/data-chart" yields
+// "data-chart".
+func (r *UIResourceRegistry) AppNames(owner string) []string {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
-	names := make([]string, 0, len(r.resources))
-	for uri := range r.resources {
-		names = append(names, extractAppName(uri))
+	visible := r.visibleLocked(owner)
+	names := make([]string, 0, len(visible))
+	for _, res := range visible {
+		names = append(names, extractAppName(res.URI))
 	}
 	sort.Strings(names)
 	return names
 }
 
-// AppHTML returns the raw HTML content for an app identified by short name.
-// Returns an error if no app matches the given name.
-func (r *UIResourceRegistry) AppHTML(name string) ([]byte, error) {
+// AppHTML returns the raw HTML of an app owner can see, by short name.
+// Returns an error if there is none.
+func (r *UIResourceRegistry) AppHTML(owner, name string) ([]byte, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
-	for uri, res := range r.resources {
-		if extractAppName(uri) == name {
-			return append([]byte(nil), res.HTML...), nil
-		}
+	if res, ok := r.lookupLocked(owner, name); ok {
+		return append([]byte(nil), res.HTML...), nil
 	}
 	return nil, fmt.Errorf("app not found: %s", name)
 }
@@ -375,26 +449,32 @@ type AppInfo struct {
 	UpdatedAt     time.Time // Zero for embedded apps
 }
 
-// ListAppInfo returns metadata for all registered apps, sorted by name.
-func (r *UIResourceRegistry) ListAppInfo() []AppInfo {
+func appInfo(res *UIResource) AppInfo {
+	info := AppInfo{
+		Name:        extractAppName(res.URI),
+		URI:         res.URI,
+		DisplayName: res.Name,
+		Description: res.Description,
+		MimeType:    res.MIMEType,
+		Dynamic:     res.Dynamic,
+		UpdatedAt:   res.UpdatedAt,
+	}
+	if res.Meta != nil && res.Meta.PrefersBorder != nil {
+		info.PrefersBorder = *res.Meta.PrefersBorder
+	}
+	return info
+}
+
+// ListAppInfo returns metadata for the apps owner can see (embedded apps and
+// owner's dynamic apps), sorted by name.
+func (r *UIResourceRegistry) ListAppInfo(owner string) []AppInfo {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
-	infos := make([]AppInfo, 0, len(r.resources))
-	for _, res := range r.resources {
-		info := AppInfo{
-			Name:        extractAppName(res.URI),
-			URI:         res.URI,
-			DisplayName: res.Name,
-			Description: res.Description,
-			MimeType:    res.MIMEType,
-			Dynamic:     res.Dynamic,
-			UpdatedAt:   res.UpdatedAt,
-		}
-		if res.Meta != nil && res.Meta.PrefersBorder != nil {
-			info.PrefersBorder = *res.Meta.PrefersBorder
-		}
-		infos = append(infos, info)
+	visible := r.visibleLocked(owner)
+	infos := make([]AppInfo, 0, len(visible))
+	for _, res := range visible {
+		infos = append(infos, appInfo(res))
 	}
 	sort.Slice(infos, func(i, j int) bool {
 		return infos[i].Name < infos[j].Name
@@ -402,45 +482,33 @@ func (r *UIResourceRegistry) ListAppInfo() []AppInfo {
 	return infos
 }
 
-// GetAppHTML returns the HTML content and metadata for an app by short name.
-// Returns an error if no app matches the given name.
-func (r *UIResourceRegistry) GetAppHTML(name string) ([]byte, *AppInfo, error) {
+// GetAppHTML returns the HTML content and metadata of an app owner can see,
+// by short name. Returns an error if there is none.
+func (r *UIResourceRegistry) GetAppHTML(owner, name string) ([]byte, *AppInfo, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
-	for _, res := range r.resources {
-		if extractAppName(res.URI) == name {
-			info := &AppInfo{
-				Name:        name,
-				URI:         res.URI,
-				DisplayName: res.Name,
-				Description: res.Description,
-				MimeType:    res.MIMEType,
-				Dynamic:     res.Dynamic,
-				UpdatedAt:   res.UpdatedAt,
-			}
-			if res.Meta != nil && res.Meta.PrefersBorder != nil {
-				info.PrefersBorder = *res.Meta.PrefersBorder
-			}
-			return append([]byte(nil), res.HTML...), info, nil
-		}
+	res, ok := r.lookupLocked(owner, name)
+	if !ok {
+		return nil, nil, fmt.Errorf("app not found: %s", name)
 	}
-	return nil, nil, fmt.Errorf("app not found: %s", name)
+	info := appInfo(res)
+	return append([]byte(nil), res.HTML...), &info, nil
 }
 
-// CreateApp creates a dynamic app from compiled HTML. It builds the UIResource,
-// checks existence atomically, and returns the app info. This implements the
-// AppProvider interface for the gRPC server.
-func (r *UIResourceRegistry) CreateApp(name, displayName, description string, html []byte, overwrite bool) (*AppInfo, bool, error) {
-	return r.CreateAppWithSpec(name, displayName, description, html, nil, overwrite)
+// CreateApp creates a dynamic app of owner from compiled HTML. It builds the
+// UIResource, checks existence atomically, and returns the app info. This
+// implements the AppProvider interface for the gRPC server.
+func (r *UIResourceRegistry) CreateApp(owner, name, displayName, description string, html []byte, overwrite bool) (*AppInfo, bool, error) {
+	return r.CreateAppWithSpec(owner, name, displayName, description, html, nil, overwrite)
 }
 
 // CreateAppWithSpec is CreateApp that also keeps spec (protojson UIAppSpec),
 // so the app can later be changed in place (e.g. a checklist tick).
-func (r *UIResourceRegistry) CreateAppWithSpec(name, displayName, description string, html, spec []byte, overwrite bool) (*AppInfo, bool, error) {
-	uri := "ui://loom/" + name
+func (r *UIResourceRegistry) CreateAppWithSpec(owner, name, displayName, description string, html, spec []byte, overwrite bool) (*AppInfo, bool, error) {
+	owner = normalizeOwner(owner)
 	res := &UIResource{
-		URI:         uri,
+		URI:         appURI(name),
 		Name:        displayName,
 		Description: description,
 		MIMEType:    protocol.ResourceMIME,
@@ -449,6 +517,7 @@ func (r *UIResourceRegistry) CreateAppWithSpec(name, displayName, description st
 			PrefersBorder: boolPtrTrue(),
 		},
 		Dynamic: true,
+		Owner:   owner,
 		Spec:    spec,
 	}
 
@@ -456,8 +525,8 @@ func (r *UIResourceRegistry) CreateAppWithSpec(name, displayName, description st
 
 	// Single write lock: check-and-create atomically to prevent TOCTOU races.
 	r.mu.Lock()
-	existing, exists := r.resources[uri]
-	if exists && !overwrite {
+	existing, exists := r.lookupLocked(owner, name)
+	if exists && (!overwrite || !existing.Dynamic) {
 		r.mu.Unlock()
 		if existing.Dynamic {
 			return nil, false, fmt.Errorf("app already exists: %s (use overwrite=true to replace)", name)
@@ -476,35 +545,26 @@ func (r *UIResourceRegistry) CreateAppWithSpec(name, displayName, description st
 		notify()
 	}
 
-	info := &AppInfo{
-		Name:          name,
-		URI:           uri,
-		DisplayName:   displayName,
-		Description:   description,
-		MimeType:      protocol.ResourceMIME,
-		PrefersBorder: true,
-		Dynamic:       true,
-		UpdatedAt:     res.UpdatedAt,
-	}
-	return info, !created, nil
+	info := appInfo(res)
+	return &info, !created, nil
 }
 
-// UpdateApp updates an existing dynamic app with new HTML. Returns an error
-// if the app doesn't exist or is embedded. The stored spec is dropped, since
-// it no longer matches the HTML.
-func (r *UIResourceRegistry) UpdateApp(name, displayName, description string, html []byte) (*AppInfo, error) {
-	return r.UpdateAppWithSpec(name, displayName, description, html, nil)
+// UpdateApp updates an existing dynamic app of owner with new HTML. Returns
+// an error if owner has no such app or it is embedded. The stored spec is
+// dropped, since it no longer matches the HTML.
+func (r *UIResourceRegistry) UpdateApp(owner, name, displayName, description string, html []byte) (*AppInfo, error) {
+	return r.UpdateAppWithSpec(owner, name, displayName, description, html, nil)
 }
 
 // UpdateAppWithSpec is UpdateApp that also replaces the stored spec.
-func (r *UIResourceRegistry) UpdateAppWithSpec(name, displayName, description string, html, spec []byte) (*AppInfo, error) {
-	uri := "ui://loom/" + name
+func (r *UIResourceRegistry) UpdateAppWithSpec(owner, name, displayName, description string, html, spec []byte) (*AppInfo, error) {
+	owner = normalizeOwner(owner)
 
 	var notify func()
 
 	// Single write lock: check-and-update atomically to prevent TOCTOU races.
 	r.mu.Lock()
-	existing, exists := r.resources[uri]
+	existing, exists := r.lookupLocked(owner, name)
 	if !exists {
 		r.mu.Unlock()
 		return nil, fmt.Errorf("app not found: %s", name)
@@ -523,7 +583,7 @@ func (r *UIResourceRegistry) UpdateAppWithSpec(name, displayName, description st
 	}
 
 	res := &UIResource{
-		URI:         uri,
+		URI:         appURI(name),
 		Name:        displayName,
 		Description: description,
 		MIMEType:    protocol.ResourceMIME,
@@ -532,6 +592,7 @@ func (r *UIResourceRegistry) UpdateAppWithSpec(name, displayName, description st
 			PrefersBorder: boolPtrTrue(),
 		},
 		Dynamic: true,
+		Owner:   owner,
 		Spec:    spec,
 	}
 
@@ -546,26 +607,18 @@ func (r *UIResourceRegistry) UpdateAppWithSpec(name, displayName, description st
 		notify()
 	}
 
-	return &AppInfo{
-		Name:          name,
-		URI:           uri,
-		DisplayName:   displayName,
-		Description:   description,
-		MimeType:      protocol.ResourceMIME,
-		PrefersBorder: true,
-		Dynamic:       true,
-		UpdatedAt:     res.UpdatedAt,
-	}, nil
+	info := appInfo(res)
+	return &info, nil
 }
 
-// AppSpec returns the stored spec (protojson UIAppSpec) of a dynamic app, or
-// an error when the app does not exist or has no stored spec (apps created
-// before specs were kept, or through CreateApp/UpdateApp).
-func (r *UIResourceRegistry) AppSpec(name string) ([]byte, error) {
+// AppSpec returns the stored spec (protojson UIAppSpec) of one of owner's
+// dynamic apps, or an error when owner has no such app or it has no stored
+// spec (apps created before specs were kept, or through CreateApp/UpdateApp).
+func (r *UIResourceRegistry) AppSpec(owner, name string) ([]byte, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	res, ok := r.resources["ui://loom/"+name]
-	if !ok || !res.Dynamic {
+	res, ok := r.dynamic[normalizeOwner(owner)][name]
+	if !ok {
 		return nil, fmt.Errorf("app not found: %s", name)
 	}
 	if len(res.Spec) == 0 {
@@ -574,9 +627,42 @@ func (r *UIResourceRegistry) AppSpec(name string) ([]byte, error) {
 	return append([]byte(nil), res.Spec...), nil
 }
 
-// DeleteApp deletes a dynamic app by short name.
-func (r *UIResourceRegistry) DeleteApp(name string) error {
-	return r.Delete("ui://loom/" + name)
+// DeleteApp deletes one of owner's dynamic apps by short name. Rejects
+// deletion of embedded apps.
+func (r *UIResourceRegistry) DeleteApp(owner, name string) error {
+	owner = normalizeOwner(owner)
+	var notify func()
+
+	r.mu.Lock()
+	if res, embedded := r.embeddedLocked(name); embedded {
+		r.mu.Unlock()
+		return fmt.Errorf("cannot delete embedded resource: %s", res.URI)
+	}
+	owned := r.dynamic[owner]
+	existing, exists := owned[name]
+	if !exists {
+		r.mu.Unlock()
+		return fmt.Errorf("resource not found: %s", appURI(name))
+	}
+
+	delete(owned, name)
+	if r.store != nil {
+		if err := r.store.delete(owner, name); err != nil {
+			owned[name] = existing
+			r.mu.Unlock()
+			return err
+		}
+	}
+	if len(owned) == 0 {
+		delete(r.dynamic, owner)
+	}
+	notify = r.onChange
+	r.mu.Unlock()
+
+	if notify != nil {
+		notify()
+	}
+	return nil
 }
 
 func boolPtrTrue() *bool {

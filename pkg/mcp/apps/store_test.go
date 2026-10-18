@@ -39,13 +39,13 @@ func TestPersistenceSurvivesRestart(t *testing.T) {
 	dir := t.TempDir()
 	r := persistentRegistry(t, dir)
 
-	info, _, err := r.CreateApp("meal-plan", "Meal Plan", "This week", []byte("<html>v1</html>"), false)
+	info, _, err := r.CreateApp("", "meal-plan", "Meal Plan", "This week", []byte("<html>v1</html>"), false)
 	require.NoError(t, err)
 	assert.False(t, info.UpdatedAt.IsZero())
 
-	_, err = r.UpdateApp("meal-plan", "", "", []byte("<html>v2</html>"))
+	_, err = r.UpdateApp("", "meal-plan", "", "", []byte("<html>v2</html>"))
 	require.NoError(t, err)
-	_, _, err = r.CreateApp("budget", "Budget", "", []byte("<html>b</html>"), false)
+	_, _, err = r.CreateApp("", "budget", "Budget", "", []byte("<html>b</html>"), false)
 	require.NoError(t, err)
 
 	fi, err := os.Stat(filepath.Join(dir, "meal-plan.json"))
@@ -59,7 +59,7 @@ func TestPersistenceSurvivesRestart(t *testing.T) {
 	assert.Equal(t, 2, loaded)
 	assert.Empty(t, skipped)
 
-	html, got, err := restarted.GetAppHTML("meal-plan")
+	html, got, err := restarted.GetAppHTML("", "meal-plan")
 	require.NoError(t, err)
 	assert.Equal(t, "<html>v2</html>", string(html))
 	assert.Equal(t, "Meal Plan", got.DisplayName)
@@ -67,7 +67,7 @@ func TestPersistenceSurvivesRestart(t *testing.T) {
 	assert.True(t, got.Dynamic)
 	assert.False(t, got.UpdatedAt.IsZero())
 
-	require.NoError(t, restarted.DeleteApp("budget"))
+	require.NoError(t, restarted.DeleteApp("", "budget"))
 	_, err = os.Stat(filepath.Join(dir, "budget.json"))
 	assert.True(t, os.IsNotExist(err))
 }
@@ -91,21 +91,21 @@ func TestPersistenceSkipsBadFiles(t *testing.T) {
 func TestPersistenceFailureLeavesRegistryUnchanged(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "apps")
 	r := persistentRegistry(t, dir)
-	_, _, err := r.CreateApp("kept", "Kept", "", []byte("<html>v1</html>"), false)
+	_, _, err := r.CreateApp("", "kept", "Kept", "", []byte("<html>v1</html>"), false)
 	require.NoError(t, err)
 
 	// Make the directory unusable so every write fails.
 	require.NoError(t, os.RemoveAll(dir))
 	require.NoError(t, os.WriteFile(dir, []byte("not a dir"), 0o600))
 
-	_, _, err = r.CreateApp("lost", "Lost", "", []byte("<html/>"), false)
+	_, _, err = r.CreateApp("", "lost", "Lost", "", []byte("<html/>"), false)
 	assert.Error(t, err)
-	_, _, err = r.GetAppHTML("lost")
+	_, _, err = r.GetAppHTML("", "lost")
 	assert.Error(t, err, "a create that was not saved must not be visible")
 
-	_, err = r.UpdateApp("kept", "", "", []byte("<html>v2</html>"))
+	_, err = r.UpdateApp("", "kept", "", "", []byte("<html>v2</html>"))
 	assert.Error(t, err)
-	html, _, err := r.GetAppHTML("kept")
+	html, _, err := r.GetAppHTML("", "kept")
 	require.NoError(t, err)
 	assert.Equal(t, "<html>v1</html>", string(html), "a failed update keeps the old version")
 }
@@ -114,7 +114,7 @@ func TestStoreRejectsUnsafeNames(t *testing.T) {
 	s, err := newFileStore(t.TempDir())
 	require.NoError(t, err)
 	for _, name := range []string{"../escape", "UPPER", "", "a/b"} {
-		_, err := s.path(name)
+		_, err := s.path("", name)
 		assert.Error(t, err, name)
 	}
 }
@@ -127,13 +127,13 @@ func TestPersistenceConcurrentWrites(t *testing.T) {
 		go func(i int) {
 			defer wg.Done()
 			name := []string{"a", "b", "c"}[i%3]
-			_, _, _ = r.CreateApp(name, name, "", []byte("<p>x</p>"), true)
-			_ = r.ListAppInfo()
+			_, _, _ = r.CreateApp("", name, name, "", []byte("<p>x</p>"), true)
+			_ = r.ListAppInfo("")
 		}(i)
 	}
 	wg.Wait()
 	for _, name := range []string{"a", "b", "c"} {
-		_, info, err := r.GetAppHTML(name)
+		_, info, err := r.GetAppHTML("", name)
 		require.NoError(t, err)
 		assert.WithinDuration(t, time.Now(), info.UpdatedAt, time.Minute)
 	}

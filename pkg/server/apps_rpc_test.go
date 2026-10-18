@@ -26,11 +26,11 @@ type mockAppProvider struct {
 	html  map[string][]byte
 }
 
-func (m *mockAppProvider) ListAppInfo() []apps.AppInfo {
+func (m *mockAppProvider) ListAppInfo(owner string) []apps.AppInfo {
 	return m.infos
 }
 
-func (m *mockAppProvider) GetAppHTML(name string) ([]byte, *apps.AppInfo, error) {
+func (m *mockAppProvider) GetAppHTML(owner, name string) ([]byte, *apps.AppInfo, error) {
 	html, ok := m.html[name]
 	if !ok {
 		return nil, nil, fmt.Errorf("app not found: %s", name)
@@ -43,7 +43,7 @@ func (m *mockAppProvider) GetAppHTML(name string) ([]byte, *apps.AppInfo, error)
 	return nil, nil, fmt.Errorf("app not found: %s", name)
 }
 
-func (m *mockAppProvider) CreateApp(name, displayName, description string, html []byte, overwrite bool) (*apps.AppInfo, bool, error) {
+func (m *mockAppProvider) CreateApp(owner, name, displayName, description string, html []byte, overwrite bool) (*apps.AppInfo, bool, error) {
 	for _, info := range m.infos {
 		if info.Name == name && !overwrite {
 			return nil, false, fmt.Errorf("app already exists: %s", name)
@@ -62,7 +62,7 @@ func (m *mockAppProvider) CreateApp(name, displayName, description string, html 
 	return &info, false, nil
 }
 
-func (m *mockAppProvider) UpdateApp(name, displayName, description string, html []byte) (*apps.AppInfo, error) {
+func (m *mockAppProvider) UpdateApp(owner, name, displayName, description string, html []byte) (*apps.AppInfo, error) {
 	for i, info := range m.infos {
 		if info.Name == name {
 			if displayName != "" {
@@ -78,7 +78,7 @@ func (m *mockAppProvider) UpdateApp(name, displayName, description string, html 
 	return nil, fmt.Errorf("app not found: %s", name)
 }
 
-func (m *mockAppProvider) DeleteApp(name string) error {
+func (m *mockAppProvider) DeleteApp(owner, name string) error {
 	for i, info := range m.infos {
 		if info.Name == name {
 			m.infos = append(m.infos[:i], m.infos[i+1:]...)
@@ -782,34 +782,34 @@ type threadSafeAppProvider struct {
 	provider *mockAppProvider
 }
 
-func (t *threadSafeAppProvider) ListAppInfo() []apps.AppInfo {
+func (t *threadSafeAppProvider) ListAppInfo(owner string) []apps.AppInfo {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	return t.provider.ListAppInfo()
+	return t.provider.ListAppInfo(owner)
 }
 
-func (t *threadSafeAppProvider) GetAppHTML(name string) ([]byte, *apps.AppInfo, error) {
+func (t *threadSafeAppProvider) GetAppHTML(owner, name string) ([]byte, *apps.AppInfo, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	return t.provider.GetAppHTML(name)
+	return t.provider.GetAppHTML(owner, name)
 }
 
-func (t *threadSafeAppProvider) CreateApp(name, displayName, description string, html []byte, overwrite bool) (*apps.AppInfo, bool, error) {
+func (t *threadSafeAppProvider) CreateApp(owner, name, displayName, description string, html []byte, overwrite bool) (*apps.AppInfo, bool, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	return t.provider.CreateApp(name, displayName, description, html, overwrite)
+	return t.provider.CreateApp(owner, name, displayName, description, html, overwrite)
 }
 
-func (t *threadSafeAppProvider) UpdateApp(name, displayName, description string, html []byte) (*apps.AppInfo, error) {
+func (t *threadSafeAppProvider) UpdateApp(owner, name, displayName, description string, html []byte) (*apps.AppInfo, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	return t.provider.UpdateApp(name, displayName, description, html)
+	return t.provider.UpdateApp(owner, name, displayName, description, html)
 }
 
-func (t *threadSafeAppProvider) DeleteApp(name string) error {
+func (t *threadSafeAppProvider) DeleteApp(owner, name string) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	return t.provider.DeleteApp(name)
+	return t.provider.DeleteApp(owner, name)
 }
 
 func TestAppsRPC_ConcurrentCRUDAccess(t *testing.T) {

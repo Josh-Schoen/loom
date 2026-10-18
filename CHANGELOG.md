@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **UI apps belong to the user who created them** — dynamic apps now have an owner, the caller's user ID (for agent tools, the user who sent the message). `ListUIApps`, `GetUIApp`, `UpdateUIApp`, `DeleteUIApp`, `SetUIAppChecklistItem`, `/apps/`, and the UI app agent tools see the shared embedded apps and the caller's own apps only; another user's app answers as not found. Two users can each have an app with the same name, and the 100-app / 50 MB limits apply per user. Previously every user of a server saw and could change every app. Apps stored before this belong to `default-user` and stay where they are; other users' apps are stored under `$LOOM_DATA_DIR/apps/users/<key>/`. The MCP resource view (`loom-mcp`) has no user identity and shows `default-user`'s apps. Separation is enforced only when identity is (`server.auth.enabled` or `server.device_pairing.required`); otherwise the user ID is a header any caller can set. Go API: `server.AppProvider`, `server.AppSpecProvider`, `server.AppHTMLProvider`, and the matching `apps.UIResourceRegistry` methods take an owner argument. Reference: `docs/reference/mcp-apps.md#ownership`.
+
 ### Fixed
 
 - **UI app runtime message handling** — the runtime treated any incoming message with an `id` as a response, including its own `ui/initialize` request when the page was not framed (a native web view), which set the trusted origin to `"null"` and made later `postMessage` calls throw. It now treats only messages with `result` or `error` as responses, never trusts a `"null"` origin, and skips the `ui/initialize` handshake when not framed.
