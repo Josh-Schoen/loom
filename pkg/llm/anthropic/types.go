@@ -47,6 +47,9 @@ type MessagesRequest struct {
 	Tools       []CacheableTool  `json:"tools,omitempty"`
 	System      []TextBlockParam `json:"system,omitempty"`
 	Stream      bool             `json:"stream,omitempty"`
+	// Fallbacks is "default" on models that support the server-side refusal
+	// fallback (see applyModelRules); empty otherwise.
+	Fallbacks string `json:"fallbacks,omitempty"`
 }
 
 // MessagesResponse represents a response from the Anthropic Messages API.

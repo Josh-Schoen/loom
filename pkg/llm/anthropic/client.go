@@ -560,6 +560,8 @@ func (c *Client) ChatStream(ctx context.Context, messages []llmtypes.Message,
 		req.Tools = apiTools
 	}
 
+	betaHeader := applyModelRules(req, c.endpoint)
+
 	// Marshal request
 	body, err := json.Marshal(req)
 	if err != nil {
@@ -578,8 +580,9 @@ func (c *Client) ChatStream(ctx context.Context, messages []llmtypes.Message,
 		r.Header.Set("Content-Type", "application/json")
 		r.Header.Set("x-api-key", c.apiKey)
 		r.Header.Set("anthropic-version", "2023-06-01")
-		// Enable prompt caching beta — cached tokens don't count against Anthropic's ITPM rate limit
-		r.Header.Set("anthropic-beta", "prompt-caching-2024-07-31")
+		// Prompt caching (cached tokens don't count against Anthropic's ITPM
+		// rate limit) and any model-specific betas.
+		r.Header.Set("anthropic-beta", betaHeader)
 		return r, nil
 	}
 	var httpResp *http.Response
@@ -792,6 +795,8 @@ func (c *Client) ChatStream(ctx context.Context, messages []llmtypes.Message,
 
 // callAPI makes the HTTP request to Anthropic's API.
 func (c *Client) callAPI(ctx context.Context, req *MessagesRequest) (*MessagesResponse, error) {
+	betaHeader := applyModelRules(req, c.endpoint)
+
 	// Marshal request
 	body, err := json.Marshal(req)
 	if err != nil {
@@ -810,8 +815,9 @@ func (c *Client) callAPI(ctx context.Context, req *MessagesRequest) (*MessagesRe
 		r.Header.Set("Content-Type", "application/json")
 		r.Header.Set("x-api-key", c.apiKey)
 		r.Header.Set("anthropic-version", "2023-06-01")
-		// Enable prompt caching beta — cached tokens don't count against Anthropic's ITPM rate limit
-		r.Header.Set("anthropic-beta", "prompt-caching-2024-07-31")
+		// Prompt caching (cached tokens don't count against Anthropic's ITPM
+		// rate limit) and any model-specific betas.
+		r.Header.Set("anthropic-beta", betaHeader)
 		return r, nil
 	}
 	var httpResp *http.Response
