@@ -79,13 +79,14 @@ func supportsDefaultFallback(model, endpoint string) bool {
 }
 
 // applyModelRules adjusts req for its model and returns the anthropic-beta
-// header value to send with it.
-func applyModelRules(req *MessagesRequest, endpoint string) string {
+// header value to send with it. allowFallback false leaves the server-side
+// fallback out (after the API rejected it; see Client.send).
+func applyModelRules(req *MessagesRequest, endpoint string, allowFallback bool) string {
 	if !acceptsSamplingParams(req.Model) {
 		req.Temperature = 0 // omitted (omitempty)
 	}
 	betas := []string{promptCachingBeta}
-	if supportsDefaultFallback(req.Model, endpoint) {
+	if allowFallback && supportsDefaultFallback(req.Model, endpoint) {
 		req.Fallbacks = "default"
 		betas = append(betas, serverSideFallbackBeta)
 	}

@@ -23,12 +23,14 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/teradata-labs/loom/pkg/llm"
 	"github.com/teradata-labs/loom/pkg/llm/catalog"
 	llmtypes "github.com/teradata-labs/loom/pkg/llm/types"
 	"github.com/teradata-labs/loom/pkg/shuttle"
+	"go.uber.org/zap"
 )
 
 const (
@@ -76,6 +78,9 @@ type Client struct {
 	temperature float64
 	rateLimiter *llm.RateLimiter
 	toolNameMap map[string]string // sanitized name → original name
+	// noFallbacks is set when the API rejected the server-side fallback
+	// option; later requests from this client leave it out.
+	noFallbacks atomic.Bool
 }
 
 // Config holds configuration for the Anthropic client.
@@ -560,67 +565,10 @@ func (c *Client) ChatStream(ctx context.Context, messages []llmtypes.Message,
 		req.Tools = apiTools
 	}
 
-	betaHeader := applyModelRules(req, c.endpoint)
-
-	// Marshal request
-	body, err := json.Marshal(req)
+	// 2. Send the request (rate limited, with the model's request rules).
+	httpResp, err := c.send(ctx, req)
 	if err != nil {
-		return nil, fmt.Errorf("failed to marshal request: %w", err)
-	}
-
-	// 2. Send request with rate limiting if enabled.
-	// The lambda creates a fresh HTTP request on each attempt so the request body
-	// can be re-read on a 429 retry. A 429 response is converted to an error so
-	// the rate limiter's exponential-backoff retry logic fires automatically.
-	buildStreamReq := func(ctx context.Context) (*http.Request, error) {
-		r, err := http.NewRequestWithContext(ctx, "POST", c.endpoint, bytes.NewReader(body))
-		if err != nil {
-			return nil, fmt.Errorf("failed to create request: %w", err)
-		}
-		r.Header.Set("Content-Type", "application/json")
-		r.Header.Set("x-api-key", c.apiKey)
-		r.Header.Set("anthropic-version", "2023-06-01")
-		// Prompt caching (cached tokens don't count against Anthropic's ITPM
-		// rate limit) and any model-specific betas.
-		r.Header.Set("anthropic-beta", betaHeader)
-		return r, nil
-	}
-	var httpResp *http.Response
-	if c.rateLimiter != nil {
-		result, err := c.rateLimiter.Do(ctx, func(ctx context.Context) (interface{}, error) {
-			req, err := buildStreamReq(ctx)
-			if err != nil {
-				return nil, err
-			}
-			resp, err := c.httpClient.Do(req)
-			if err != nil {
-				return nil, err
-			}
-			// Convert 429 to a retryable error so the rate limiter backs off and
-			// retries, carrying the server-specified Retry-After so the limiter
-			// waits at least that long.
-			if resp.StatusCode == http.StatusTooManyRequests {
-				respBody, _ := io.ReadAll(resp.Body)
-				_ = resp.Body.Close()
-				return nil, llm.NewThrottleError(
-					fmt.Errorf("API error (status 429): %s", string(respBody)),
-					llm.RetryAfterFromHeaders(resp.Header))
-			}
-			return resp, nil
-		})
-		if err != nil {
-			return nil, fmt.Errorf("HTTP request failed: %w", err)
-		}
-		httpResp = result.(*http.Response)
-	} else {
-		req, err := buildStreamReq(ctx)
-		if err != nil {
-			return nil, err
-		}
-		httpResp, err = c.httpClient.Do(req)
-		if err != nil {
-			return nil, fmt.Errorf("HTTP request failed: %w", err)
-		}
+		return nil, err
 	}
 	defer func() { _ = httpResp.Body.Close() }()
 
@@ -795,67 +743,9 @@ func (c *Client) ChatStream(ctx context.Context, messages []llmtypes.Message,
 
 // callAPI makes the HTTP request to Anthropic's API.
 func (c *Client) callAPI(ctx context.Context, req *MessagesRequest) (*MessagesResponse, error) {
-	betaHeader := applyModelRules(req, c.endpoint)
-
-	// Marshal request
-	body, err := json.Marshal(req)
+	httpResp, err := c.send(ctx, req)
 	if err != nil {
-		return nil, fmt.Errorf("failed to marshal request: %w", err)
-	}
-
-	// Send request with rate limiting if enabled.
-	// The lambda creates a fresh HTTP request on each attempt so the request body
-	// can be re-read on a 429 retry. A 429 response is converted to an error so
-	// the rate limiter's exponential-backoff retry logic fires automatically.
-	buildAPIReq := func(ctx context.Context) (*http.Request, error) {
-		r, err := http.NewRequestWithContext(ctx, "POST", c.endpoint, bytes.NewReader(body))
-		if err != nil {
-			return nil, fmt.Errorf("failed to create request: %w", err)
-		}
-		r.Header.Set("Content-Type", "application/json")
-		r.Header.Set("x-api-key", c.apiKey)
-		r.Header.Set("anthropic-version", "2023-06-01")
-		// Prompt caching (cached tokens don't count against Anthropic's ITPM
-		// rate limit) and any model-specific betas.
-		r.Header.Set("anthropic-beta", betaHeader)
-		return r, nil
-	}
-	var httpResp *http.Response
-	if c.rateLimiter != nil {
-		result, err := c.rateLimiter.Do(ctx, func(ctx context.Context) (interface{}, error) {
-			req, err := buildAPIReq(ctx)
-			if err != nil {
-				return nil, err
-			}
-			resp, err := c.httpClient.Do(req)
-			if err != nil {
-				return nil, err
-			}
-			// Convert 429 to a retryable error so the rate limiter backs off and
-			// retries, carrying the server-specified Retry-After so the limiter
-			// waits at least that long.
-			if resp.StatusCode == http.StatusTooManyRequests {
-				respBody, _ := io.ReadAll(resp.Body)
-				_ = resp.Body.Close()
-				return nil, llm.NewThrottleError(
-					fmt.Errorf("API error (status 429): %s", string(respBody)),
-					llm.RetryAfterFromHeaders(resp.Header))
-			}
-			return resp, nil
-		})
-		if err != nil {
-			return nil, fmt.Errorf("HTTP request failed: %w", err)
-		}
-		httpResp = result.(*http.Response)
-	} else {
-		req, err := buildAPIReq(ctx)
-		if err != nil {
-			return nil, err
-		}
-		httpResp, err = c.httpClient.Do(req)
-		if err != nil {
-			return nil, fmt.Errorf("HTTP request failed: %w", err)
-		}
+		return nil, err
 	}
 	defer func() { _ = httpResp.Body.Close() }()
 
@@ -889,3 +779,109 @@ var _ llmtypes.LLMProvider = (*Client)(nil)
 
 // Ensure Client implements StreamingLLMProvider interface.
 var _ llmtypes.StreamingLLMProvider = (*Client)(nil)
+
+// send applies the model's request rules to req (applyModelRules) and posts
+// it. If the API rejects the server-side fallback option (an unknown field or
+// beta on this endpoint or account), the request is sent again without it,
+// and this client stops sending it: a reply without the fallback beats no
+// reply. Other responses are returned as they are; the caller closes the body.
+func (c *Client) send(ctx context.Context, req *MessagesRequest) (*http.Response, error) {
+	betaHeader := applyModelRules(req, c.endpoint, !c.noFallbacks.Load())
+	resp, err := c.post(ctx, req, betaHeader)
+	if err != nil || resp.StatusCode != http.StatusBadRequest || req.Fallbacks == "" {
+		return resp, err
+	}
+
+	respBody, readErr := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if readErr != nil {
+		return nil, fmt.Errorf("failed to read response: %w", readErr)
+	}
+	if !rejectsFallbacks(respBody) {
+		// Hand the caller the response as it came.
+		resp.Body = io.NopCloser(bytes.NewReader(respBody))
+		return resp, nil
+	}
+
+	if c.noFallbacks.CompareAndSwap(false, true) {
+		zap.L().Warn("Anthropic API rejected the server-side fallback option; sending requests without it",
+			zap.String("model", req.Model),
+			zap.String("response", string(respBody)))
+	}
+	req.Fallbacks = ""
+	betaHeader = applyModelRules(req, c.endpoint, false)
+	return c.post(ctx, req, betaHeader)
+}
+
+// rejectsFallbacks reports whether a 400 response body says the request's
+// fallbacks field or its anthropic-beta header was not accepted.
+func rejectsFallbacks(body []byte) bool {
+	var apiErr struct {
+		Error struct {
+			Type    string `json:"type"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(body, &apiErr) != nil || apiErr.Error.Type != "invalid_request_error" {
+		return false
+	}
+	msg := strings.ToLower(apiErr.Error.Message)
+	return strings.Contains(msg, "fallbacks") || strings.Contains(msg, "anthropic-beta") || strings.Contains(msg, serverSideFallbackBeta)
+}
+
+// post marshals req and sends it with the rate limiter when one is
+// configured. Each attempt builds a fresh HTTP request so the body can be
+// re-read on a 429 retry; a 429 is turned into a retryable error so the rate
+// limiter's backoff (honoring Retry-After) fires.
+func (c *Client) post(ctx context.Context, req *MessagesRequest, betaHeader string) (*http.Response, error) {
+	body, err := json.Marshal(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal request: %w", err)
+	}
+	build := func(ctx context.Context) (*http.Request, error) {
+		r, err := http.NewRequestWithContext(ctx, "POST", c.endpoint, bytes.NewReader(body))
+		if err != nil {
+			return nil, fmt.Errorf("failed to create request: %w", err)
+		}
+		r.Header.Set("Content-Type", "application/json")
+		r.Header.Set("x-api-key", c.apiKey)
+		r.Header.Set("anthropic-version", "2023-06-01")
+		// Prompt caching (cached tokens don't count against Anthropic's ITPM
+		// rate limit) and any model-specific betas.
+		r.Header.Set("anthropic-beta", betaHeader)
+		return r, nil
+	}
+	if c.rateLimiter == nil {
+		r, err := build(ctx)
+		if err != nil {
+			return nil, err
+		}
+		resp, err := c.httpClient.Do(r)
+		if err != nil {
+			return nil, fmt.Errorf("HTTP request failed: %w", err)
+		}
+		return resp, nil
+	}
+	result, err := c.rateLimiter.Do(ctx, func(ctx context.Context) (interface{}, error) {
+		r, err := build(ctx)
+		if err != nil {
+			return nil, err
+		}
+		resp, err := c.httpClient.Do(r)
+		if err != nil {
+			return nil, err
+		}
+		if resp.StatusCode == http.StatusTooManyRequests {
+			respBody, _ := io.ReadAll(resp.Body)
+			_ = resp.Body.Close()
+			return nil, llm.NewThrottleError(
+				fmt.Errorf("API error (status 429): %s", string(respBody)),
+				llm.RetryAfterFromHeaders(resp.Header))
+		}
+		return resp, nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("HTTP request failed: %w", err)
+	}
+	return result.(*http.Response), nil
+}
