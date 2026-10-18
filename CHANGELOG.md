@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **Graph memory is now scoped per user on SQLite.** The SQLite graph memory store did not write or filter `user_id`, so when several people shared one agent, facts extracted from one person's conversations were recalled into another person's conversations, and ID-based operations (`Forget`, `Supersede`, `Consolidate`, `TouchMemories`, `Unrelate`, `GetLineage`, `Neighbors`, edge listing) acted on any user's rows. Every statement now writes and filters the caller's user ID (`types.UserIDFromContext`; an empty ID means `default-user`, so existing single-user data stays reachable). `Relate` and `Remember` reject links to another user's entities.
+- **Graph entity names are unique per user.** `UNIQUE(agent_id, name)` on `graph_entities` becomes `UNIQUE(agent_id, user_id, name)` on both backends, so two people sharing an agent can each have an entity such as "mom". New migrations: SQLite `000009_graph_entities_per_user` (rebuilds `graph_entities`, keeping rows, edges, memory links, indexes and FTS triggers) and PostgreSQL `000024_graph_entities_per_user`. Rolling back fails while two users under one agent share an entity name.
+- **PostgreSQL graph memory store matches the same contract.** It already relied on RLS; it now also carries explicit `user_id` predicates, checks entity ownership before creating edges or memory links (foreign-key checks bypass RLS), and creates referenced entities under a fresh ID when the requested ID belongs to another user.
+- `Forget`, `Supersede`, `GetMemory` and `Consolidate` return the new sentinel `memory.ErrNotFound` (wrapped) for a memory that does not exist or belongs to another user, instead of succeeding without effect.
+- SQLite now stores `graph_memories.expires_at` in the same text format as `datetime('now')`. A TTL set through `Memory.ExpiresAt` that had passed earlier the same day was treated as still active.
+
+### Added
+
+- `GraphMemoryStore.ListMemories(ctx, agentID, limit, offset)` lists the caller's active memories (not forgotten, expired or superseded), newest first, with a total count.
+- `GraphMemoryStore.ForgetAll(ctx, agentID)` forgets all of the caller's memories under an agent and deletes the caller's entities and edges under it. Memory content is soft-deleted (`expires_at`), as with `Forget`.
+
 ## [1.4.0] - 2026-08-12
 
 ### Breaking Changes

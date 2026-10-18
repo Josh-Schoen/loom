@@ -49,7 +49,7 @@ Salience-driven graph-backed episodic memory for persistent, cross-session agent
 2. **Salience-Driven Retrieval**: Not all memories are equal; salience scoring with time decay ensures the most important and recent memories surface first
 3. **Immutable Audit Trail**: Memory content is append-only with lineage tracking (SUPERSEDES, CONSOLIDATES), providing a complete historical record
 4. **Token Budget Control**: Automatic context truncation prevents memory injection from overflowing the LLM context window
-5. **Agent-Scoped Isolation**: Each agent maintains its own knowledge graph; no cross-agent leakage
+5. **Agent- and User-Scoped Isolation**: Each agent maintains its own knowledge graph, and within an agent each user (the caller's user ID) has their own entities, edges, and memories; no cross-agent or cross-user leakage
 6. **Opt-Out by Default**: Graph memory is enabled when a store is available; agents must explicitly disable it
 
 **Non-goals**:
@@ -143,7 +143,8 @@ Salience-driven graph-backed episodic memory for persistent, cross-session agent
 │  │                   ListEdgesFrom, ListEdgesTo                     │   │
 │  │                                                                  │   │
 │  │  Memory Ops ──── Remember, GetMemory, Recall, Forget,          │   │
-│  │                   Supersede, Consolidate, GetLineage            │   │
+│  │                   Supersede, Consolidate, GetLineage,           │   │
+│  │                   ListMemories, ForgetAll                       │   │
 │  │                                                                  │   │
 │  │  Salience ────── TouchMemories, DecayAll                        │   │
 │  │                                                                  │   │
@@ -176,7 +177,7 @@ Salience-driven graph-backed episodic memory for persistent, cross-session agent
 **Responsibility**: Represent mutable current-state knowledge as a directed graph.
 
 **Entities** are nodes with:
-- `name` (UNIQUE per agent_id) -- the human-readable identifier
+- `name` (UNIQUE per agent_id + user_id) -- the human-readable identifier
 - `entity_type` -- person, tool, pattern, concept, project, device, etc.
 - `properties_json` -- arbitrary structured data
 - Mutable: name, type, properties can all be updated
@@ -191,9 +192,50 @@ Salience-driven graph-backed episodic memory for persistent, cross-session agent
 
 **Invariant**:
 ```
-Entity(agent_id, name) is UNIQUE per agent
+Entity(agent_id, user_id, name) is UNIQUE (each user under an agent has their own "mom")
 Edge(source_id, target_id, relation) is UNIQUE (upsert on conflict)
 ```
+
+### User Scoping
+
+Several people can share one agent. Every `GraphMemoryStore` operation is scoped to
+the caller's user ID, taken from the request context (`types.UserIDFromContext`).
+An empty user ID maps to `default-user`, which is also the column default, so
+single-user installs and rows written before per-user scoping keep working.
+
+- **Writes** record the caller's `user_id` on entities, edges, and memories.
+- **Reads** (`Recall`, `VectorRecall`, `ContextFor`, `GetEntity`, `ListEntities`,
+  `SearchEntities`, `ListMemories`, `Neighbors`, `ListEdgesFrom/To`, `GetLineage`,
+  `GetStats`) return only the caller's rows.
+- **ID-based mutations** (`Forget`, `Supersede`, `Consolidate`, `TouchMemories`,
+  `Unrelate`, `DecayAll`) only affect the caller's rows. `Forget`, `Supersede`,
+  `GetMemory`, and `Consolidate` return `memory.ErrNotFound` (wrapped; test with
+  `errors.Is`) for a memory that does not exist or belongs to another user.
+- `Relate` and `Remember` reject links to another user's entity IDs with
+  `memory.ErrNotFound`.
+- `ListMemories(agentID, limit, offset)` lists the caller's active memories (not
+  forgotten/expired, not superseded), newest first, with a total count.
+- `ForgetAll(agentID)` forgets all of the caller's memories under the agent
+  (sets `expires_at`, as `Forget` does; content stays in the table for lineage)
+  and hard-deletes the caller's entities and edges under the agent.
+
+Enforcement differs by backend:
+
+- **SQLite**: the store adds `user_id = ?` predicates to every statement. There
+  is no database-level enforcement.
+- **PostgreSQL**: Row-Level Security policies (migrations 000010, 000017) enforce
+  the same isolation in the database; the store also carries explicit `user_id`
+  predicates so that `Forget`/`Supersede` report not-found instead of silently
+  matching zero rows, and checks entity ownership before linking (foreign-key
+  checks bypass RLS).
+
+Background work that runs without a user identity (for example, the skill-eviction
+salience boost, which uses `context.Background()`) operates on `default-user` rows only.
+
+Migrations: SQLite `000009_graph_entities_per_user` rebuilds `graph_entities` to
+change `UNIQUE(agent_id, name)` to `UNIQUE(agent_id, user_id, name)`; PostgreSQL
+`000024_graph_entities_per_user` swaps the constraint in place. Rolling either back
+fails if two users under one agent have an entity with the same name.
 
 
 ### Episodic Memory (Memories)
@@ -490,7 +532,7 @@ Chat Loop      Agent              GraphMemoryStore    Session
 ├───────────────────┤     ├───────────────────┤     ├─────────────────────┤
 │ id (PK)           │◀────│ source_id (FK)    │     │ id (PK)             │
 │ agent_id          │◀────│ target_id (FK)    │     │ agent_id            │
-│ name (UNIQUE/aid) │     │ agent_id          │     │ content             │
+│ name (UNIQ a,u,n) │     │ agent_id          │     │ content             │
 │ entity_type       │     │ relation          │     │ summary             │
 │ properties_json   │     │ properties_json   │     │ memory_type         │
 │ owner             │     │ UNIQUE(s,t,rel)   │     │ source              │
@@ -643,7 +685,7 @@ SELECT DISTINCT * FROM neighbor_walk
 
 ### Decision 3: Agent-Scoped Isolation vs. Shared Knowledge Graph
 
-**Chosen**: Per-agent knowledge graph (agent_id scoping on all tables)
+**Chosen**: Per-agent knowledge graph (agent_id scoping on all tables), further scoped per user within an agent (user_id; see [User Scoping](#user-scoping))
 
 **Rationale**:
 - Prevents cross-agent memory contamination
@@ -676,9 +718,9 @@ SELECT DISTINCT * FROM neighbor_walk
 
 ### Constraint 2: Agent-Scoped Only
 
-**Description**: Knowledge graphs are isolated per `agent_id`. No cross-agent memory sharing.
+**Description**: Knowledge graphs are isolated per `agent_id`, and per user within an agent. No cross-agent or cross-user memory sharing.
 
-**Impact**: Two agents cannot share knowledge unless explicitly copied. This is by design for isolation.
+**Impact**: Two agents, or two users of one agent, cannot share knowledge unless explicitly copied. This is by design for isolation. On SQLite, isolation depends on the caller's identity reaching the request context (see `docs/reference/security-model.md`); Loom does not authenticate that identity itself.
 
 ### Constraint 3: Keyword Search Only
 

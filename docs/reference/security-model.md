@@ -34,7 +34,7 @@ admin token authentication, and deployment requirements.
 | User identity source | `x-user-id` gRPC metadata header | Trusted as-is from caller |
 | Identity validation | Input sanitization only | Max 256 chars, no control characters |
 | Data isolation (PostgreSQL) | Row-Level Security (RLS) | `set_config('app.current_user_id', $1, true)` per transaction |
-| Data isolation (SQLite) | **None** | Single-tenant mode, all data shared |
+| Data isolation (SQLite) | **Partial, no RLS** | Sessions and graph memory filter by `user_id` in store queries; other data is shared. See [SQLite Limitations](#sqlite-limitations) |
 | Admin authentication | `x-admin-token` gRPC metadata header | Compared against `LOOM_ADMIN_TOKEN` env var |
 | Transport security | TLS (configurable) | See `docs/reference/tls.md` |
 | JWT verification | **Not performed** | Must be done by upstream proxy |
@@ -198,6 +198,9 @@ database level using Row-Level Security.
 | `graph_memories` | Direct | `user_id` column (migration 000010) |
 | `graph_memory_entities` | Inherited | Via `memory_id` -> `graph_memories.user_id` |
 | `graph_memory_lineage` | Inherited | Via `new_memory_id` -> `graph_memories.user_id` |
+
+Graph entity names are unique per `(agent_id, user_id, name)` (migration 000024), so
+two users of one agent can each have an entity with the same name.
 
 ### RLS Guarantees
 
@@ -365,12 +368,16 @@ not suitable for multi-tenant deployments.
 SQLite does **not** support Row-Level Security. When Loom runs with a SQLite backend:
 
 - `require_user_id` is forced to `false` regardless of configuration.
-- All requests use the fixed identity `"default-user"`.
-- The `x-user-id` header is ignored.
-- All data is accessible to all callers.
-- There is no per-user data isolation.
+- A request's identity is the `x-user-id` header (or the JWT subject when
+  authentication is enabled) when one is present, and `"default-user"` otherwise.
+- There is no database-level isolation. The session store and the graph memory
+  store add `user_id` predicates to their queries, so one user's sessions and
+  graph memory (entities, edges, memories) are not returned to another user.
+  Other data (for example artifacts and tool execution records) is shared.
+- Because Loom does not authenticate the identity, this separation is only as
+  strong as the proxy or authenticator that sets it.
 
-SQLite mode is single-tenant only. For multi-tenant deployments, use the PostgreSQL backend.
+For multi-tenant deployments that need database-enforced isolation, use the PostgreSQL backend.
 
 See `docs/reference/sqlite-guidance.md` for details on SQLite limitations.
 

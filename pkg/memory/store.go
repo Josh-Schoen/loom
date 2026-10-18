@@ -14,7 +14,17 @@
 
 package memory
 
-import "context"
+import (
+	"context"
+	"errors"
+)
+
+// ErrNotFound reports that a memory or entity does not exist for the caller.
+// Graph memory is scoped per user (types.UserIDFromContext, with an empty
+// identity meaning types.DefaultUserID), so a row owned by another user is
+// reported as not found rather than as a permission error. Implementations
+// wrap it; test with errors.Is.
+var ErrNotFound = errors.New("graph memory: not found")
 
 // TokenCounter counts tokens. Satisfied by *agent.TokenCounter.
 type TokenCounter interface {
@@ -23,6 +33,13 @@ type TokenCounter interface {
 
 // GraphMemoryStore defines the storage interface for graph-backed episodic memory.
 // Implementations exist for SQLite and PostgreSQL.
+//
+// Every operation is scoped to the caller: the user ID carried by ctx
+// (types.UserIDFromContext; an empty ID means types.DefaultUserID). Rows are
+// written with that user ID, reads only return that user's rows, and ID-based
+// mutations only affect that user's rows. Several people can therefore share
+// one agent without their entities, edges, or memories being visible to each
+// other.
 type GraphMemoryStore interface {
 	// Entity CRUD (mutable)
 	CreateEntity(ctx context.Context, entity *Entity) (*Entity, error)
@@ -41,12 +58,27 @@ type GraphMemoryStore interface {
 
 	// Memory (append-only, immutable content)
 	Remember(ctx context.Context, mem *Memory) (*Memory, error)
+	// GetMemory returns ErrNotFound (wrapped) when the memory does not exist
+	// for the caller under agentID.
 	GetMemory(ctx context.Context, agentID, memoryID string) (*Memory, error)
 	Recall(ctx context.Context, opts RecallOpts) ([]*Memory, error)
-	Forget(ctx context.Context, memoryID string) error                                  // soft-delete: set expires_at
-	Supersede(ctx context.Context, oldMemoryID string, newMem *Memory) (*Memory, error) // creates SUPERSEDES lineage
+	// Forget soft-deletes (sets expires_at). Returns ErrNotFound (wrapped) when
+	// the caller has no memory with this ID.
+	Forget(ctx context.Context, memoryID string) error
+	// Supersede creates newMem with a SUPERSEDES lineage to oldMemoryID.
+	// Returns ErrNotFound (wrapped) when the caller has no memory oldMemoryID.
+	Supersede(ctx context.Context, oldMemoryID string, newMem *Memory) (*Memory, error)
 	Consolidate(ctx context.Context, memoryIDs []string, consolidated *Memory) (*Memory, error)
 	GetLineage(ctx context.Context, memoryID string) ([]*MemoryLineage, error)
+
+	// ListMemories returns the caller's active memories for agentID (not
+	// forgotten/expired, not superseded, not deleted), newest first, and the
+	// total count of such memories. EntityIDs need not be populated.
+	ListMemories(ctx context.Context, agentID string, limit, offset int) ([]*Memory, int, error)
+	// ForgetAll forgets every active memory the caller has for agentID and
+	// deletes the caller's entities and edges for agentID, so nothing about
+	// the caller is recalled afterwards. Returns the number of memories forgotten.
+	ForgetAll(ctx context.Context, agentID string) (int, error)
 
 	// Access tracking (the only allowed mutation on memories)
 	TouchMemories(ctx context.Context, memoryIDs []string) error
