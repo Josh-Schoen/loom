@@ -119,6 +119,11 @@ const (
 	LoomService_UpdateUIApp_FullMethodName                 = "/loom.v1.LoomService/UpdateUIApp"
 	LoomService_DeleteUIApp_FullMethodName                 = "/loom.v1.LoomService/DeleteUIApp"
 	LoomService_SetUIAppChecklistItem_FullMethodName       = "/loom.v1.LoomService/SetUIAppChecklistItem"
+	LoomService_ListUserMemories_FullMethodName            = "/loom.v1.LoomService/ListUserMemories"
+	LoomService_AddUserMemory_FullMethodName               = "/loom.v1.LoomService/AddUserMemory"
+	LoomService_CorrectUserMemory_FullMethodName           = "/loom.v1.LoomService/CorrectUserMemory"
+	LoomService_ForgetUserMemory_FullMethodName            = "/loom.v1.LoomService/ForgetUserMemory"
+	LoomService_ForgetAllUserMemories_FullMethodName       = "/loom.v1.LoomService/ForgetAllUserMemories"
 	LoomService_ListComponentTypes_FullMethodName          = "/loom.v1.LoomService/ListComponentTypes"
 	LoomService_ListAgentPresets_FullMethodName            = "/loom.v1.LoomService/ListAgentPresets"
 	LoomService_ListWorkflowTemplates_FullMethodName       = "/loom.v1.LoomService/ListWorkflowTemplates"
@@ -320,6 +325,19 @@ type LoomServiceClient interface {
 	// stored (apps created or updated through CreateUIApp/UpdateUIApp or the
 	// agent tools); others return FAILED_PRECONDITION.
 	SetUIAppChecklistItem(ctx context.Context, in *SetUIAppChecklistItemRequest, opts ...grpc.CallOption) (*SetUIAppChecklistItemResponse, error)
+	// ListUserMemories lists the caller's active memories for an agent, newest
+	// first.
+	ListUserMemories(ctx context.Context, in *ListUserMemoriesRequest, opts ...grpc.CallOption) (*ListUserMemoriesResponse, error)
+	// AddUserMemory stores a fact the caller wants the agent to remember.
+	AddUserMemory(ctx context.Context, in *AddUserMemoryRequest, opts ...grpc.CallOption) (*UserMemory, error)
+	// CorrectUserMemory replaces one of the caller's memories with corrected
+	// text (the old one is superseded and no longer recalled).
+	CorrectUserMemory(ctx context.Context, in *CorrectUserMemoryRequest, opts ...grpc.CallOption) (*UserMemory, error)
+	// ForgetUserMemory forgets one of the caller's memories.
+	ForgetUserMemory(ctx context.Context, in *ForgetUserMemoryRequest, opts ...grpc.CallOption) (*ForgetUserMemoryResponse, error)
+	// ForgetAllUserMemories forgets everything the agent remembers about the
+	// caller (memories, and the people, places, and things they mentioned).
+	ForgetAllUserMemories(ctx context.Context, in *ForgetAllUserMemoriesRequest, opts ...grpc.CallOption) (*ForgetAllUserMemoriesResponse, error)
 	// ListComponentTypes returns the catalog of available component types
 	// for building dynamic UI apps.
 	ListComponentTypes(ctx context.Context, in *ListComponentTypesRequest, opts ...grpc.CallOption) (*ListComponentTypesResponse, error)
@@ -1254,6 +1272,56 @@ func (c *loomServiceClient) SetUIAppChecklistItem(ctx context.Context, in *SetUI
 	return out, nil
 }
 
+func (c *loomServiceClient) ListUserMemories(ctx context.Context, in *ListUserMemoriesRequest, opts ...grpc.CallOption) (*ListUserMemoriesResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ListUserMemoriesResponse)
+	err := c.cc.Invoke(ctx, LoomService_ListUserMemories_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *loomServiceClient) AddUserMemory(ctx context.Context, in *AddUserMemoryRequest, opts ...grpc.CallOption) (*UserMemory, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(UserMemory)
+	err := c.cc.Invoke(ctx, LoomService_AddUserMemory_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *loomServiceClient) CorrectUserMemory(ctx context.Context, in *CorrectUserMemoryRequest, opts ...grpc.CallOption) (*UserMemory, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(UserMemory)
+	err := c.cc.Invoke(ctx, LoomService_CorrectUserMemory_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *loomServiceClient) ForgetUserMemory(ctx context.Context, in *ForgetUserMemoryRequest, opts ...grpc.CallOption) (*ForgetUserMemoryResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ForgetUserMemoryResponse)
+	err := c.cc.Invoke(ctx, LoomService_ForgetUserMemory_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *loomServiceClient) ForgetAllUserMemories(ctx context.Context, in *ForgetAllUserMemoriesRequest, opts ...grpc.CallOption) (*ForgetAllUserMemoriesResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ForgetAllUserMemoriesResponse)
+	err := c.cc.Invoke(ctx, LoomService_ForgetAllUserMemories_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *loomServiceClient) ListComponentTypes(ctx context.Context, in *ListComponentTypesRequest, opts ...grpc.CallOption) (*ListComponentTypesResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ListComponentTypesResponse)
@@ -1489,6 +1557,19 @@ type LoomServiceServer interface {
 	// stored (apps created or updated through CreateUIApp/UpdateUIApp or the
 	// agent tools); others return FAILED_PRECONDITION.
 	SetUIAppChecklistItem(context.Context, *SetUIAppChecklistItemRequest) (*SetUIAppChecklistItemResponse, error)
+	// ListUserMemories lists the caller's active memories for an agent, newest
+	// first.
+	ListUserMemories(context.Context, *ListUserMemoriesRequest) (*ListUserMemoriesResponse, error)
+	// AddUserMemory stores a fact the caller wants the agent to remember.
+	AddUserMemory(context.Context, *AddUserMemoryRequest) (*UserMemory, error)
+	// CorrectUserMemory replaces one of the caller's memories with corrected
+	// text (the old one is superseded and no longer recalled).
+	CorrectUserMemory(context.Context, *CorrectUserMemoryRequest) (*UserMemory, error)
+	// ForgetUserMemory forgets one of the caller's memories.
+	ForgetUserMemory(context.Context, *ForgetUserMemoryRequest) (*ForgetUserMemoryResponse, error)
+	// ForgetAllUserMemories forgets everything the agent remembers about the
+	// caller (memories, and the people, places, and things they mentioned).
+	ForgetAllUserMemories(context.Context, *ForgetAllUserMemoriesRequest) (*ForgetAllUserMemoriesResponse, error)
 	// ListComponentTypes returns the catalog of available component types
 	// for building dynamic UI apps.
 	ListComponentTypes(context.Context, *ListComponentTypesRequest) (*ListComponentTypesResponse, error)
@@ -1764,6 +1845,21 @@ func (UnimplementedLoomServiceServer) DeleteUIApp(context.Context, *DeleteUIAppR
 }
 func (UnimplementedLoomServiceServer) SetUIAppChecklistItem(context.Context, *SetUIAppChecklistItemRequest) (*SetUIAppChecklistItemResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method SetUIAppChecklistItem not implemented")
+}
+func (UnimplementedLoomServiceServer) ListUserMemories(context.Context, *ListUserMemoriesRequest) (*ListUserMemoriesResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ListUserMemories not implemented")
+}
+func (UnimplementedLoomServiceServer) AddUserMemory(context.Context, *AddUserMemoryRequest) (*UserMemory, error) {
+	return nil, status.Error(codes.Unimplemented, "method AddUserMemory not implemented")
+}
+func (UnimplementedLoomServiceServer) CorrectUserMemory(context.Context, *CorrectUserMemoryRequest) (*UserMemory, error) {
+	return nil, status.Error(codes.Unimplemented, "method CorrectUserMemory not implemented")
+}
+func (UnimplementedLoomServiceServer) ForgetUserMemory(context.Context, *ForgetUserMemoryRequest) (*ForgetUserMemoryResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ForgetUserMemory not implemented")
+}
+func (UnimplementedLoomServiceServer) ForgetAllUserMemories(context.Context, *ForgetAllUserMemoriesRequest) (*ForgetAllUserMemoriesResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ForgetAllUserMemories not implemented")
 }
 func (UnimplementedLoomServiceServer) ListComponentTypes(context.Context, *ListComponentTypesRequest) (*ListComponentTypesResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ListComponentTypes not implemented")
@@ -3279,6 +3375,96 @@ func _LoomService_SetUIAppChecklistItem_Handler(srv interface{}, ctx context.Con
 	return interceptor(ctx, in, info, handler)
 }
 
+func _LoomService_ListUserMemories_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListUserMemoriesRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LoomServiceServer).ListUserMemories(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LoomService_ListUserMemories_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LoomServiceServer).ListUserMemories(ctx, req.(*ListUserMemoriesRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LoomService_AddUserMemory_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(AddUserMemoryRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LoomServiceServer).AddUserMemory(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LoomService_AddUserMemory_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LoomServiceServer).AddUserMemory(ctx, req.(*AddUserMemoryRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LoomService_CorrectUserMemory_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CorrectUserMemoryRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LoomServiceServer).CorrectUserMemory(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LoomService_CorrectUserMemory_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LoomServiceServer).CorrectUserMemory(ctx, req.(*CorrectUserMemoryRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LoomService_ForgetUserMemory_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ForgetUserMemoryRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LoomServiceServer).ForgetUserMemory(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LoomService_ForgetUserMemory_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LoomServiceServer).ForgetUserMemory(ctx, req.(*ForgetUserMemoryRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LoomService_ForgetAllUserMemories_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ForgetAllUserMemoriesRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LoomServiceServer).ForgetAllUserMemories(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LoomService_ForgetAllUserMemories_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LoomServiceServer).ForgetAllUserMemories(ctx, req.(*ForgetAllUserMemoriesRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _LoomService_ListComponentTypes_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(ListComponentTypesRequest)
 	if err := dec(in); err != nil {
@@ -3669,6 +3855,26 @@ var LoomService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "SetUIAppChecklistItem",
 			Handler:    _LoomService_SetUIAppChecklistItem_Handler,
+		},
+		{
+			MethodName: "ListUserMemories",
+			Handler:    _LoomService_ListUserMemories_Handler,
+		},
+		{
+			MethodName: "AddUserMemory",
+			Handler:    _LoomService_AddUserMemory_Handler,
+		},
+		{
+			MethodName: "CorrectUserMemory",
+			Handler:    _LoomService_CorrectUserMemory_Handler,
+		},
+		{
+			MethodName: "ForgetUserMemory",
+			Handler:    _LoomService_ForgetUserMemory_Handler,
+		},
+		{
+			MethodName: "ForgetAllUserMemories",
+			Handler:    _LoomService_ForgetAllUserMemories_Handler,
 		},
 		{
 			MethodName: "ListComponentTypes",

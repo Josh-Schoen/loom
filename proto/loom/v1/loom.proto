@@ -29,6 +29,7 @@ import "loom/v1/shared_memory.proto";
 import "loom/v1/storage.proto";
 import "loom/v1/templates.proto";
 import "loom/v1/tools.proto";
+import "loom/v1/user_memory.proto";
 
 option go_package = "github.com/teradata-labs/loom/gen/go/loom/v1;loomv1";
 
@@ -621,6 +622,46 @@ service LoomService {
       post: "/v1/apps/{name}:set-checklist-item"
       body: "*"
     };
+  }
+
+  // What an agent remembers about the caller (user_memory.proto): the
+  // caller's own graph memories for one agent, which the agent recalls in
+  // later conversations. All five are scoped to the caller's user ID and
+  // return FAILED_PRECONDITION when the agent has graph memory disabled or
+  // the server has no graph memory store.
+
+  // ListUserMemories lists the caller's active memories for an agent, newest
+  // first.
+  rpc ListUserMemories(ListUserMemoriesRequest) returns (ListUserMemoriesResponse) {
+    option (google.api.http) = {get: "/v1/agents/{agent_id}/memories"};
+  }
+
+  // AddUserMemory stores a fact the caller wants the agent to remember.
+  rpc AddUserMemory(AddUserMemoryRequest) returns (UserMemory) {
+    option (google.api.http) = {
+      post: "/v1/agents/{agent_id}/memories"
+      body: "*"
+    };
+  }
+
+  // CorrectUserMemory replaces one of the caller's memories with corrected
+  // text (the old one is superseded and no longer recalled).
+  rpc CorrectUserMemory(CorrectUserMemoryRequest) returns (UserMemory) {
+    option (google.api.http) = {
+      post: "/v1/agents/{agent_id}/memories/{memory_id}:correct"
+      body: "*"
+    };
+  }
+
+  // ForgetUserMemory forgets one of the caller's memories.
+  rpc ForgetUserMemory(ForgetUserMemoryRequest) returns (ForgetUserMemoryResponse) {
+    option (google.api.http) = {delete: "/v1/agents/{agent_id}/memories/{memory_id}"};
+  }
+
+  // ForgetAllUserMemories forgets everything the agent remembers about the
+  // caller (memories, and the people, places, and things they mentioned).
+  rpc ForgetAllUserMemories(ForgetAllUserMemoriesRequest) returns (ForgetAllUserMemoriesResponse) {
+    option (google.api.http) = {delete: "/v1/agents/{agent_id}/memories"};
   }
 
   // ListComponentTypes returns the catalog of available component types

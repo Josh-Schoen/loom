@@ -254,6 +254,208 @@
         ]
       }
     },
+    "/v1/agents/{agentId}/memories": {
+      "get": {
+        "summary": "ListUserMemories lists the caller's active memories for an agent, newest\nfirst.",
+        "operationId": "LoomService_ListUserMemories",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/v1ListUserMemoriesResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "agentId",
+            "description": "Agent ID or name.",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "limit",
+            "description": "Maximum memories to return (default 100, maximum 500).",
+            "in": "query",
+            "required": false,
+            "type": "integer",
+            "format": "int32"
+          },
+          {
+            "name": "offset",
+            "description": "Number of memories to skip.",
+            "in": "query",
+            "required": false,
+            "type": "integer",
+            "format": "int32"
+          }
+        ],
+        "tags": [
+          "LoomService"
+        ]
+      },
+      "delete": {
+        "summary": "ForgetAllUserMemories forgets everything the agent remembers about the\ncaller (memories, and the people, places, and things they mentioned).",
+        "operationId": "LoomService_ForgetAllUserMemories",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/v1ForgetAllUserMemoriesResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "agentId",
+            "description": "Agent ID or name.",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          }
+        ],
+        "tags": [
+          "LoomService"
+        ]
+      },
+      "post": {
+        "summary": "AddUserMemory stores a fact the caller wants the agent to remember.",
+        "operationId": "LoomService_AddUserMemory",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/v1UserMemory"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "agentId",
+            "description": "Agent ID or name.",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/LoomServiceAddUserMemoryBody"
+            }
+          }
+        ],
+        "tags": [
+          "LoomService"
+        ]
+      }
+    },
+    "/v1/agents/{agentId}/memories/{memoryId}": {
+      "delete": {
+        "summary": "ForgetUserMemory forgets one of the caller's memories.",
+        "operationId": "LoomService_ForgetUserMemory",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/v1ForgetUserMemoryResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "agentId",
+            "description": "Agent ID or name.",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "memoryId",
+            "description": "Memory to forget.",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          }
+        ],
+        "tags": [
+          "LoomService"
+        ]
+      }
+    },
+    "/v1/agents/{agentId}/memories/{memoryId}:correct": {
+      "post": {
+        "summary": "CorrectUserMemory replaces one of the caller's memories with corrected\ntext (the old one is superseded and no longer recalled).",
+        "operationId": "LoomService_CorrectUserMemory",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/v1UserMemory"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "agentId",
+            "description": "Agent ID or name.",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "memoryId",
+            "description": "Memory to replace.",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/LoomServiceCorrectUserMemoryBody"
+            }
+          }
+        ],
+        "tags": [
+          "LoomService"
+        ]
+      }
+    },
     "/v1/agents/{agentId}:reload": {
       "post": {
         "summary": "ReloadAgent hot-reloads agent configuration without stopping.",
@@ -3414,6 +3616,15 @@
     }
   },
   "definitions": {
+    "LoomServiceAddUserMemoryBody": {
+      "type": "object",
+      "properties": {
+        "content": {
+          "type": "string",
+          "description": "The fact to remember (1-500 characters)."
+        }
+      }
+    },
     "LoomServiceAnswerClarificationQuestionBody": {
       "type": "object",
       "properties": {
@@ -3431,6 +3642,15 @@
         }
       },
       "description": "AnswerClarificationRequest provides an answer to a clarification question."
+    },
+    "LoomServiceCorrectUserMemoryBody": {
+      "type": "object",
+      "properties": {
+        "content": {
+          "type": "string",
+          "description": "Corrected fact (1-500 characters). The old memory is superseded and no\nlonger recalled."
+        }
+      }
     },
     "LoomServicePauseScheduleBody": {
       "type": "object",
@@ -3719,7 +3939,7 @@
         "NULL_VALUE"
       ],
       "default": "NULL_VALUE",
-      "description": "`NullValue` is a singleton enumeration to represent the null value for the\n`Value` type union.\n\nThe JSON representation for `NullValue` is JSON `null`.\n\n - NULL_VALUE: Null value."
+      "description": "Represents a JSON `null`.\n\n`NullValue` is a sentinel, using an enum with only one value to represent\nthe null value for the `Value` type union.\n\nA field of type `NullValue` with any value other than `0` is considered\ninvalid. Most ProtoJSON serializers will emit a Value with a `null_value` set\nas a JSON `null` regardless of the integer value, and so will round trip to\na `0` value.\n\n - NULL_VALUE: Null value."
     },
     "rpcStatus": {
       "type": "object",
@@ -5380,6 +5600,19 @@
       "default": "EXECUTION_STAGE_UNSPECIFIED",
       "description": "ExecutionStage enum for tracking progress.\n\n - EXECUTION_STAGE_HUMAN_IN_THE_LOOP: Waiting for human response"
     },
+    "v1ForgetAllUserMemoriesResponse": {
+      "type": "object",
+      "properties": {
+        "forgottenCount": {
+          "type": "integer",
+          "format": "int32",
+          "description": "Number of memories forgotten."
+        }
+      }
+    },
+    "v1ForgetUserMemoryResponse": {
+      "type": "object"
+    },
     "v1ForkJoinPattern": {
       "type": "object",
       "properties": {
@@ -6306,6 +6539,24 @@
         }
       },
       "description": "ListUIAppsResponse returns the list of UI apps."
+    },
+    "v1ListUserMemoriesResponse": {
+      "type": "object",
+      "properties": {
+        "memories": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "$ref": "#/definitions/v1UserMemory"
+          },
+          "description": "Newest first."
+        },
+        "totalCount": {
+          "type": "integer",
+          "format": "int32",
+          "description": "Total active memories the caller has for this agent."
+        }
+      }
     },
     "v1ListWorkflowExecutionsResponse": {
       "type": "object",
@@ -10108,6 +10359,41 @@
         }
       },
       "description": "UploadArtifactResponse returns the created artifact metadata."
+    },
+    "v1UserMemory": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Memory ID."
+        },
+        "content": {
+          "type": "string",
+          "description": "The remembered fact, one sentence (e.g. \"Prefers vegetarian dinners\")."
+        },
+        "summary": {
+          "type": "string",
+          "description": "Short form of content (under ~50 characters); may be empty."
+        },
+        "memoryType": {
+          "type": "string",
+          "description": "fact, preference, decision, experience, failure, or observation."
+        },
+        "source": {
+          "type": "string",
+          "description": "Where it came from: \"auto_extracted\" (learned from a conversation),\n\"user\" (added or corrected through this API), or another source label."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "int64",
+          "description": "When it was remembered (Unix seconds)."
+        },
+        "eventDate": {
+          "type": "string",
+          "description": "Date the fact refers to (YYYY-MM-DD), when it has one."
+        }
+      },
+      "description": "UserMemory is one thing an agent remembers about the caller."
     },
     "v1VotingStrategy": {
       "type": "string",

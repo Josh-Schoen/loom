@@ -1,0 +1,86 @@
+// Copyright © 2026 Teradata Corporation - All Rights Reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+
+syntax = "proto3";
+
+package loom.v1;
+
+option go_package = "github.com/teradata-labs/loom/gen/go/loom/v1;loomv1";
+
+// What an agent remembers about the person calling: the caller's own active
+// graph memories for one agent (see GraphMemoryService for the full graph).
+// Every request is scoped to the caller's user ID; another user's memories
+// answer as NOT_FOUND.
+
+// UserMemory is one thing an agent remembers about the caller.
+message UserMemory {
+  // Memory ID.
+  string id = 1;
+  // The remembered fact, one sentence (e.g. "Prefers vegetarian dinners").
+  string content = 2;
+  // Short form of content (under ~50 characters); may be empty.
+  string summary = 3;
+  // fact, preference, decision, experience, failure, or observation.
+  string memory_type = 4;
+  // Where it came from: "auto_extracted" (learned from a conversation),
+  // "user" (added or corrected through this API), or another source label.
+  string source = 5;
+  // When it was remembered (Unix seconds).
+  int64 created_at = 6;
+  // Date the fact refers to (YYYY-MM-DD), when it has one.
+  string event_date = 7;
+}
+
+message ListUserMemoriesRequest {
+  // Agent ID or name.
+  string agent_id = 1;
+  // Maximum memories to return (default 100, maximum 500).
+  int32 limit = 2;
+  // Number of memories to skip.
+  int32 offset = 3;
+}
+
+message ListUserMemoriesResponse {
+  // Newest first.
+  repeated UserMemory memories = 1;
+  // Total active memories the caller has for this agent.
+  int32 total_count = 2;
+}
+
+message AddUserMemoryRequest {
+  // Agent ID or name.
+  string agent_id = 1;
+  // The fact to remember (1-500 characters).
+  string content = 2;
+}
+
+message CorrectUserMemoryRequest {
+  // Agent ID or name.
+  string agent_id = 1;
+  // Memory to replace.
+  string memory_id = 2;
+  // Corrected fact (1-500 characters). The old memory is superseded and no
+  // longer recalled.
+  string content = 3;
+}
+
+message ForgetUserMemoryRequest {
+  // Agent ID or name.
+  string agent_id = 1;
+  // Memory to forget.
+  string memory_id = 2;
+}
+
+message ForgetUserMemoryResponse {}
+
+message ForgetAllUserMemoriesRequest {
+  // Agent ID or name.
+  string agent_id = 1;
+}
+
+message ForgetAllUserMemoriesResponse {
+  // Number of memories forgotten.
+  int32 forgotten_count = 1;
+}

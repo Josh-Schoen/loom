@@ -250,7 +250,7 @@ func (m *mockGraphMemoryStore) Forget(_ context.Context, memoryID string) error 
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if _, ok := m.memories[memoryID]; !ok {
-		return fmt.Errorf("memory not found: %s", memoryID)
+		return fmt.Errorf("forget %s: %w", memoryID, memory.ErrNotFound)
 	}
 	now := time.Now()
 	m.memories[memoryID].ExpiresAt = &now
@@ -614,6 +614,14 @@ func TestGraphMemoryServer_ValidationErrors(t *testing.T) {
 				return err
 			},
 			wantCode: codes.InvalidArgument,
+		},
+		{
+			name: "Forget unknown memory",
+			call: func() error {
+				_, err := srv.Forget(ctx, &loomv1.ForgetRequest{AgentId: "a", MemoryId: "nope"})
+				return err
+			},
+			wantCode: codes.NotFound,
 		},
 		{
 			name: "Forget missing memory_id",

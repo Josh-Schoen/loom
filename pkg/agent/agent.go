@@ -347,7 +347,12 @@ func NewAgent(backend fabric.ExecutionBackend, llmProvider LLMProvider, opts ...
 		store := a.graphMemoryStore
 		agentName := a.config.Name
 		a.skillOrchestrator.SetOnSkillEviction(func(sessionID string, skill *skills.Skill, activeFor time.Duration) {
+			// Graph memory is per user: boost the memories of the person
+			// whose session used the skill.
 			ctx := context.Background()
+			if session, ok := a.GetSession(sessionID); ok && session.UserID != "" {
+				ctx = types.ContextWithUserID(ctx, session.UserID)
+			}
 
 			// Build search query from skill name + first 3 keywords.
 			query := skill.Name

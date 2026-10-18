@@ -39,7 +39,7 @@ looms serve --http-port 0
 
 ### API Endpoints
 
-LoomService gRPC endpoints are available via HTTP/REST through the grpc-gateway. Only LoomService is registered with the HTTP gateway (other gRPC services like ToolRegistryService are gRPC-only). Example endpoints:
+LoomService and DeviceService (`/v1/pairing:redeem`, see [device pairing](device-pairing.md)) are available via HTTP/REST through the grpc-gateway; other gRPC services such as ToolRegistryService and GraphMemoryService are gRPC-only. Example endpoints:
 
 - `POST /v1/weave` - Execute agent query
 - `POST /v1/sessions` - Create session
@@ -47,8 +47,9 @@ LoomService gRPC endpoints are available via HTTP/REST through the grpc-gateway.
 - `GET /v1/sessions/{session_id}` - Get session
 - `DELETE /v1/sessions/{session_id}` - Delete session
 - `POST /v1/weave:stream` - Stream agent execution (SSE)
+- `GET /v1/agents/{agent_id}/memories` - What the agent remembers about the caller ([user memories](user-memories.md))
 
-This is a subset; LoomService exposes 38 HTTP path patterns via gRPC-gateway. See `/swagger-ui` for the full LoomService API. (The generated OpenAPI spec is built from all annotated protos, so `/swagger-ui` also lists endpoints for services such as TaskService and SkillsImportService that are *not* HTTP-registered and are reachable over gRPC only.)
+This is a subset; the HTTP routes are the `google.api.http` annotations on `LoomService` in `proto/loom/v1/loom.proto`. See `/swagger-ui` for the full LoomService API. (The generated OpenAPI spec is built from all annotated protos, so `/swagger-ui` also lists endpoints for services such as TaskService and SkillsImportService that are *not* HTTP-registered and are reachable over gRPC only.)
 
 #### List sessions (`GET /v1/sessions`)
 

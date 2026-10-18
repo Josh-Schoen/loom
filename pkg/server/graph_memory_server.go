@@ -397,6 +397,9 @@ func (s *GraphMemoryServer) Forget(ctx context.Context, req *loomv1.ForgetReques
 	}
 
 	err := s.store.Forget(ctx, req.MemoryId)
+	if errors.Is(err, memory.ErrNotFound) {
+		return nil, status.Error(codes.NotFound, "memory not found")
+	}
 	if err != nil {
 		s.logger.Error("forget failed", zap.Error(err), zap.String("agent_id", req.AgentId))
 		return nil, status.Errorf(codes.Internal, "forget: %v", err)
