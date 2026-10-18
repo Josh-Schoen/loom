@@ -19,6 +19,7 @@ import (
 	"database/sql"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"sort"
@@ -29,7 +30,27 @@ import (
 
 	"github.com/teradata-labs/loom/pkg/memory"
 	"github.com/teradata-labs/loom/pkg/observability"
+	"github.com/teradata-labs/loom/pkg/types"
 )
+
+// graphUserID returns the user that owns graph memory rows written or read on
+// behalf of ctx. A context without an identity maps to types.DefaultUserID,
+// which is also the column default, so single-user installs (and rows written
+// before per-user scoping) keep working unchanged.
+func graphUserID(ctx context.Context) string {
+	if u := types.UserIDFromContext(ctx); u != "" {
+		return u
+	}
+	return types.DefaultUserID
+}
+
+// sqlPlaceholders returns n comma-separated "?" placeholders.
+func sqlPlaceholders(n int) string {
+	if n <= 0 {
+		return ""
+	}
+	return strings.TrimSuffix(strings.Repeat("?,", n), ",")
+}
 
 // GraphMemoryStore implements memory.GraphMemoryStore for SQLite.
 type GraphMemoryStore struct {
@@ -80,10 +101,10 @@ func (s *GraphMemoryStore) CreateEntity(ctx context.Context, entity *memory.Enti
 	entity.UpdatedAt = now
 
 	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO graph_entities (id, agent_id, name, entity_type, properties_json, owner, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, datetime(?), datetime(?))`,
+		`INSERT INTO graph_entities (id, agent_id, name, entity_type, properties_json, owner, user_id, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, datetime(?), datetime(?))`,
 		entity.ID, entity.AgentID, entity.Name, entity.EntityType,
-		entity.PropertiesJSON, entity.Owner,
+		entity.PropertiesJSON, entity.Owner, graphUserID(ctx),
 		now.Format(time.RFC3339), now.Format(time.RFC3339),
 	)
 	if err != nil {
@@ -98,8 +119,8 @@ func (s *GraphMemoryStore) GetEntity(ctx context.Context, agentID, name string) 
 
 	row := s.db.QueryRowContext(ctx,
 		`SELECT id, agent_id, name, entity_type, properties_json, COALESCE(owner,''), created_at, updated_at
-		 FROM graph_entities WHERE agent_id = ? AND name = ?`,
-		agentID, name,
+		 FROM graph_entities WHERE agent_id = ? AND user_id = ? AND name = ?`,
+		agentID, graphUserID(ctx), name,
 	)
 	return scanEntity(row)
 }
@@ -113,9 +134,9 @@ func (s *GraphMemoryStore) UpdateEntity(ctx context.Context, entity *memory.Enti
 
 	result, err := s.db.ExecContext(ctx,
 		`UPDATE graph_entities SET entity_type = ?, properties_json = ?, updated_at = datetime(?)
-		 WHERE agent_id = ? AND name = ?`,
+		 WHERE agent_id = ? AND user_id = ? AND name = ?`,
 		entity.EntityType, entity.PropertiesJSON, now.Format(time.RFC3339),
-		entity.AgentID, entity.Name,
+		entity.AgentID, graphUserID(ctx), entity.Name,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("update entity: %w", err)
@@ -140,17 +161,17 @@ func (s *GraphMemoryStore) ListEntities(ctx context.Context, agentID, entityType
 	var args []interface{}
 
 	if entityType != "" {
-		countQuery = `SELECT COUNT(*) FROM graph_entities WHERE agent_id = ? AND entity_type = ?`
+		countQuery = `SELECT COUNT(*) FROM graph_entities WHERE agent_id = ? AND user_id = ? AND entity_type = ?`
 		query = `SELECT id, agent_id, name, entity_type, properties_json, COALESCE(owner,''), created_at, updated_at
-				 FROM graph_entities WHERE agent_id = ? AND entity_type = ?
+				 FROM graph_entities WHERE agent_id = ? AND user_id = ? AND entity_type = ?
 				 ORDER BY name LIMIT ? OFFSET ?`
-		args = []interface{}{agentID, entityType}
+		args = []interface{}{agentID, graphUserID(ctx), entityType}
 	} else {
-		countQuery = `SELECT COUNT(*) FROM graph_entities WHERE agent_id = ?`
+		countQuery = `SELECT COUNT(*) FROM graph_entities WHERE agent_id = ? AND user_id = ?`
 		query = `SELECT id, agent_id, name, entity_type, properties_json, COALESCE(owner,''), created_at, updated_at
-				 FROM graph_entities WHERE agent_id = ?
+				 FROM graph_entities WHERE agent_id = ? AND user_id = ?
 				 ORDER BY name LIMIT ? OFFSET ?`
-		args = []interface{}{agentID}
+		args = []interface{}{agentID, graphUserID(ctx)}
 	}
 
 	var total int
@@ -197,9 +218,9 @@ func (s *GraphMemoryStore) SearchEntities(ctx context.Context, agentID, query st
 		`SELECT e.id, e.agent_id, e.name, e.entity_type, e.properties_json, COALESCE(e.owner,''), e.created_at, e.updated_at
 		 FROM graph_entities e
 		 JOIN graph_entities_fts f ON f.entity_id = e.id
-		 WHERE f.graph_entities_fts MATCH ? AND e.agent_id = ?
+		 WHERE f.graph_entities_fts MATCH ? AND e.agent_id = ? AND e.user_id = ?
 		 ORDER BY rank LIMIT ?`,
-		ftsQuery, agentID, limit,
+		ftsQuery, agentID, graphUserID(ctx), limit,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("search entities: %w", err)
@@ -222,8 +243,8 @@ func (s *GraphMemoryStore) DeleteEntity(ctx context.Context, agentID, name strin
 	defer s.tracer.EndSpan(span)
 
 	result, err := s.db.ExecContext(ctx,
-		`DELETE FROM graph_entities WHERE agent_id = ? AND name = ?`,
-		agentID, name,
+		`DELETE FROM graph_entities WHERE agent_id = ? AND user_id = ? AND name = ?`,
+		agentID, graphUserID(ctx), name,
 	)
 	if err != nil {
 		return fmt.Errorf("delete entity: %w", err)
@@ -250,18 +271,36 @@ func (s *GraphMemoryStore) Relate(ctx context.Context, edge *memory.Edge) (*memo
 	edge.CreatedAt = now
 	edge.UpdatedAt = now
 
-	// Upsert: ON CONFLICT update properties and timestamp.
-	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO graph_edges (id, agent_id, source_id, target_id, relation, properties_json, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, datetime(?), datetime(?))
+	userID := graphUserID(ctx)
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	// Both endpoints must be the caller's entities: an edge must never join
+	// (or reveal) another user's graph.
+	if err := requireOwnedEntitiesTx(ctx, tx, userID, edge.SourceID, edge.TargetID); err != nil {
+		return nil, fmt.Errorf("relate: %w", err)
+	}
+
+	// Upsert: ON CONFLICT update properties and timestamp. The WHERE keeps the
+	// update on the caller's own edge.
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO graph_edges (id, agent_id, source_id, target_id, relation, properties_json, user_id, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, datetime(?), datetime(?))
 		 ON CONFLICT(source_id, target_id, relation) DO UPDATE SET
 		   properties_json = excluded.properties_json,
-		   updated_at = excluded.updated_at`,
+		   updated_at = excluded.updated_at
+		 WHERE graph_edges.user_id = excluded.user_id`,
 		edge.ID, edge.AgentID, edge.SourceID, edge.TargetID, edge.Relation,
-		edge.PropertiesJSON, now.Format(time.RFC3339), now.Format(time.RFC3339),
-	)
-	if err != nil {
+		edge.PropertiesJSON, userID, now.Format(time.RFC3339), now.Format(time.RFC3339),
+	); err != nil {
 		return nil, fmt.Errorf("relate: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit relate: %w", err)
 	}
 	return edge, nil
 }
@@ -271,8 +310,8 @@ func (s *GraphMemoryStore) Unrelate(ctx context.Context, sourceID, targetID, rel
 	defer s.tracer.EndSpan(span)
 
 	_, err := s.db.ExecContext(ctx,
-		`DELETE FROM graph_edges WHERE source_id = ? AND target_id = ? AND relation = ?`,
-		sourceID, targetID, relation,
+		`DELETE FROM graph_edges WHERE source_id = ? AND target_id = ? AND relation = ? AND user_id = ?`,
+		sourceID, targetID, relation, graphUserID(ctx),
 	)
 	return err
 }
@@ -285,59 +324,58 @@ func (s *GraphMemoryStore) Neighbors(ctx context.Context, entityID string, relat
 		depth = 1
 	}
 
+	// Numbered parameters: ?1 entity ID, ?2 relation filter ('' = any),
+	// ?3 max depth, ?4 caller's user ID. Every recursive step is restricted
+	// to the caller's edges so a traversal can't walk into another user's graph.
 	var query string
-	var args []interface{}
-
 	switch direction {
 	case "inbound":
 		query = `WITH RECURSIVE traverse(eid, target_id, source_id, depth, path) AS (
 			SELECT e.id, e.target_id, e.source_id, 1, e.target_id || ',' || e.source_id
 			FROM graph_edges e
-			WHERE e.target_id = ? AND (? = '' OR e.relation = ?)
+			WHERE e.target_id = ?1 AND (?2 = '' OR e.relation = ?2) AND e.user_id = ?4
 			UNION ALL
 			SELECT e.id, e.target_id, e.source_id, t.depth + 1, t.path || ',' || e.source_id
 			FROM graph_edges e
 			JOIN traverse t ON e.target_id = t.source_id
-			WHERE t.depth < ? AND t.path NOT LIKE '%' || e.source_id || '%'
-			  AND (? = '' OR e.relation = ?)
+			WHERE t.depth < ?3 AND t.path NOT LIKE '%' || e.source_id || '%'
+			  AND (?2 = '' OR e.relation = ?2) AND e.user_id = ?4
 		)
 		SELECT e.id, e.agent_id, e.source_id, e.target_id, e.relation, e.properties_json, e.created_at, e.updated_at
 		FROM traverse t
 		JOIN graph_edges e ON e.id = t.eid`
-		args = []interface{}{entityID, relation, relation, depth, relation, relation}
 	case "both":
 		query = `WITH RECURSIVE traverse(eid, from_id, to_id, depth, path) AS (
 			SELECT e.id, e.source_id, e.target_id, 1, e.source_id || ',' || e.target_id
 			FROM graph_edges e
-			WHERE (e.source_id = ? OR e.target_id = ?) AND (? = '' OR e.relation = ?)
+			WHERE (e.source_id = ?1 OR e.target_id = ?1) AND (?2 = '' OR e.relation = ?2) AND e.user_id = ?4
 			UNION ALL
 			SELECT e.id, e.source_id, e.target_id, t.depth + 1, t.path || ',' || e.target_id
 			FROM graph_edges e
 			JOIN traverse t ON (e.source_id = t.to_id OR e.target_id = t.from_id)
-			WHERE t.depth < ? AND t.path NOT LIKE '%' || e.target_id || '%'
-			  AND (? = '' OR e.relation = ?)
+			WHERE t.depth < ?3 AND t.path NOT LIKE '%' || e.target_id || '%'
+			  AND (?2 = '' OR e.relation = ?2) AND e.user_id = ?4
 		)
 		SELECT e.id, e.agent_id, e.source_id, e.target_id, e.relation, e.properties_json, e.created_at, e.updated_at
 		FROM traverse t
 		JOIN graph_edges e ON e.id = t.eid`
-		args = []interface{}{entityID, entityID, relation, relation, depth, relation, relation}
 	default: // outbound
 		query = `WITH RECURSIVE traverse(eid, source_id, target_id, depth, path) AS (
 			SELECT e.id, e.source_id, e.target_id, 1, e.source_id || ',' || e.target_id
 			FROM graph_edges e
-			WHERE e.source_id = ? AND (? = '' OR e.relation = ?)
+			WHERE e.source_id = ?1 AND (?2 = '' OR e.relation = ?2) AND e.user_id = ?4
 			UNION ALL
 			SELECT e.id, e.source_id, e.target_id, t.depth + 1, t.path || ',' || e.target_id
 			FROM graph_edges e
 			JOIN traverse t ON e.source_id = t.target_id
-			WHERE t.depth < ? AND t.path NOT LIKE '%' || e.target_id || '%'
-			  AND (? = '' OR e.relation = ?)
+			WHERE t.depth < ?3 AND t.path NOT LIKE '%' || e.target_id || '%'
+			  AND (?2 = '' OR e.relation = ?2) AND e.user_id = ?4
 		)
 		SELECT e.id, e.agent_id, e.source_id, e.target_id, e.relation, e.properties_json, e.created_at, e.updated_at
 		FROM traverse t
 		JOIN graph_edges e ON e.id = t.eid`
-		args = []interface{}{entityID, relation, relation, depth, relation, relation}
 	}
+	args := []interface{}{entityID, relation, depth, graphUserID(ctx)}
 
 	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -363,7 +401,7 @@ func (s *GraphMemoryStore) Neighbors(ctx context.Context, entityID string, relat
 func (s *GraphMemoryStore) ListEdgesFrom(ctx context.Context, entityID string) ([]*memory.Edge, error) {
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT id, agent_id, source_id, target_id, relation, properties_json, created_at, updated_at
-		 FROM graph_edges WHERE source_id = ? ORDER BY relation`, entityID)
+		 FROM graph_edges WHERE source_id = ? AND user_id = ? ORDER BY relation`, entityID, graphUserID(ctx))
 	if err != nil {
 		return nil, fmt.Errorf("list edges from: %w", err)
 	}
@@ -374,7 +412,7 @@ func (s *GraphMemoryStore) ListEdgesFrom(ctx context.Context, entityID string) (
 func (s *GraphMemoryStore) ListEdgesTo(ctx context.Context, entityID string) ([]*memory.Edge, error) {
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT id, agent_id, source_id, target_id, relation, properties_json, created_at, updated_at
-		 FROM graph_edges WHERE target_id = ? ORDER BY relation`, entityID)
+		 FROM graph_edges WHERE target_id = ? AND user_id = ? ORDER BY relation`, entityID, graphUserID(ctx))
 	if err != nil {
 		return nil, fmt.Errorf("list edges to: %w", err)
 	}
@@ -410,10 +448,11 @@ func (s *GraphMemoryStore) Remember(ctx context.Context, mem *memory.Memory) (*m
 	}
 	defer tx.Rollback() //nolint:errcheck
 
-	if err := insertMemoryTx(ctx, tx, mem); err != nil {
+	userID := graphUserID(ctx)
+	if err := insertMemoryTx(ctx, tx, userID, mem); err != nil {
 		return nil, err
 	}
-	if err := linkEntitiesTx(ctx, tx, mem); err != nil {
+	if err := linkEntitiesTx(ctx, tx, userID, mem); err != nil {
 		return nil, err
 	}
 
@@ -433,10 +472,13 @@ func (s *GraphMemoryStore) GetMemory(ctx context.Context, agentID, memoryID stri
 		        token_count, summary_token_count, access_count, properties_json,
 		        created_at, accessed_at, expires_at,
 		        COALESCE(event_date,''), COALESCE(event_date_confidence,'')
-		 FROM graph_memories WHERE agent_id = ? AND id = ?`,
-		agentID, memoryID,
+		 FROM graph_memories WHERE agent_id = ? AND user_id = ? AND id = ?`,
+		agentID, graphUserID(ctx), memoryID,
 	)
 	mem, err := scanMemory(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, fmt.Errorf("get memory %s: %w", memoryID, memory.ErrNotFound)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -475,8 +517,8 @@ func (s *GraphMemoryStore) Recall(ctx context.Context, opts memory.RecallOpts) (
 	var conditions []string
 	var args []interface{}
 
-	conditions = append(conditions, "m.agent_id = ?")
-	args = append(args, opts.AgentID)
+	conditions = append(conditions, "m.agent_id = ?", "m.user_id = ?")
+	args = append(args, opts.AgentID, graphUserID(ctx))
 
 	// Exclude expired.
 	conditions = append(conditions, "(m.expires_at IS NULL OR m.expires_at > datetime('now'))")
@@ -626,12 +668,13 @@ func (s *GraphMemoryStore) VectorRecall(ctx context.Context, opts memory.VectorR
 		        m.embedding
 		 FROM graph_memories m
 		 WHERE m.agent_id = ?
+		   AND m.user_id = ?
 		   AND m.embedding_model = ?
 		   AND (m.expires_at IS NULL OR m.expires_at > datetime('now'))
 		   AND m.embedding IS NOT NULL
 		   AND m.id NOT IN (SELECT old_memory_id FROM graph_memory_lineage WHERE relation_type = 'SUPERSEDES')
 		 ORDER BY m.created_at DESC`,
-		opts.AgentID, opts.Model,
+		opts.AgentID, graphUserID(ctx), opts.Model,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("vector recall query: %w", err)
@@ -753,11 +796,28 @@ func (s *GraphMemoryStore) Forget(ctx context.Context, memoryID string) error {
 	ctx, span := s.tracer.StartSpan(ctx, "sqlite.graph_memory.forget")
 	defer s.tracer.EndSpan(span)
 
-	_, err := s.db.ExecContext(ctx,
-		`UPDATE graph_memories SET expires_at = datetime('now') WHERE id = ?`,
-		memoryID,
+	// Already-expired memories keep their original expiry (forgetting twice
+	// is not an error) but still count as matched, so only a memory the
+	// caller does not own, or one that does not exist, yields ErrNotFound.
+	result, err := s.db.ExecContext(ctx,
+		`UPDATE graph_memories
+		 SET expires_at = CASE
+		       WHEN expires_at IS NOT NULL AND expires_at <= datetime('now') THEN expires_at
+		       ELSE datetime('now') END
+		 WHERE id = ? AND user_id = ?`,
+		memoryID, graphUserID(ctx),
 	)
-	return err
+	if err != nil {
+		return fmt.Errorf("forget: %w", err)
+	}
+	n, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("forget: %w", err)
+	}
+	if n == 0 {
+		return fmt.Errorf("forget memory %s: %w", memoryID, memory.ErrNotFound)
+	}
+	return nil
 }
 
 func (s *GraphMemoryStore) Supersede(ctx context.Context, oldMemoryID string, newMem *memory.Memory) (*memory.Memory, error) {
@@ -770,11 +830,16 @@ func (s *GraphMemoryStore) Supersede(ctx context.Context, oldMemoryID string, ne
 	}
 	defer tx.Rollback() //nolint:errcheck
 
-	// Get old memory's salience.
+	userID := graphUserID(ctx)
+
+	// Get old memory's salience (caller's memories only).
 	var oldSalience float64
 	err = tx.QueryRowContext(ctx,
-		`SELECT salience FROM graph_memories WHERE id = ?`, oldMemoryID,
+		`SELECT salience FROM graph_memories WHERE id = ? AND user_id = ?`, oldMemoryID, userID,
 	).Scan(&oldSalience)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, fmt.Errorf("supersede memory %s: %w", oldMemoryID, memory.ErrNotFound)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("get old memory: %w", err)
 	}
@@ -786,10 +851,10 @@ func (s *GraphMemoryStore) Supersede(ctx context.Context, oldMemoryID string, ne
 
 	s.prepareMemory(newMem)
 
-	if err := insertMemoryTx(ctx, tx, newMem); err != nil {
+	if err := insertMemoryTx(ctx, tx, userID, newMem); err != nil {
 		return nil, err
 	}
-	if err := linkEntitiesTx(ctx, tx, newMem); err != nil {
+	if err := linkEntitiesTx(ctx, tx, userID, newMem); err != nil {
 		return nil, err
 	}
 
@@ -824,36 +889,49 @@ func (s *GraphMemoryStore) Consolidate(ctx context.Context, memoryIDs []string, 
 	}
 	defer tx.Rollback() //nolint:errcheck
 
-	// Find max salience from sources.
-	if consolidated.Salience == 0 {
-		placeholders := make([]string, len(memoryIDs))
-		args := make([]interface{}, len(memoryIDs))
-		for i, id := range memoryIDs {
-			placeholders[i] = "?"
-			args[i] = id
-		}
-		var maxSalience float64
-		if err := tx.QueryRowContext(ctx,
-			fmt.Sprintf(`SELECT MAX(salience) FROM graph_memories WHERE id IN (%s)`,
-				strings.Join(placeholders, ",")),
-			args...,
-		).Scan(&maxSalience); err != nil {
-			return nil, fmt.Errorf("max salience: %w", err)
-		}
-		consolidated.Salience = maxSalience
+	userID := graphUserID(ctx)
+
+	// Every source must be one of the caller's memories; otherwise nothing
+	// is written (consolidating another user's memory would leak it).
+	uniqueIDs := dedupeStrings(memoryIDs)
+	if len(uniqueIDs) == 0 {
+		return nil, fmt.Errorf("consolidate: no source memories")
+	}
+	ownedArgs := make([]interface{}, 0, len(uniqueIDs)+1)
+	for _, id := range uniqueIDs {
+		ownedArgs = append(ownedArgs, id)
+	}
+	ownedArgs = append(ownedArgs, userID)
+	var owned int
+	var maxSalience sql.NullFloat64
+	if err := tx.QueryRowContext(ctx,
+		fmt.Sprintf(`SELECT COUNT(*), MAX(salience) FROM graph_memories WHERE id IN (%s) AND user_id = ?`, // #nosec G201 -- placeholders are "?" only
+			sqlPlaceholders(len(uniqueIDs))),
+		ownedArgs...,
+	).Scan(&owned, &maxSalience); err != nil {
+		return nil, fmt.Errorf("check source memories: %w", err)
+	}
+	if owned != len(uniqueIDs) {
+		return nil, fmt.Errorf("consolidate: %d of %d source memories: %w",
+			len(uniqueIDs)-owned, len(uniqueIDs), memory.ErrNotFound)
+	}
+
+	// Inherit max salience from sources.
+	if consolidated.Salience == 0 && maxSalience.Valid {
+		consolidated.Salience = maxSalience.Float64
 	}
 
 	s.prepareMemory(consolidated)
 
-	if err := insertMemoryTx(ctx, tx, consolidated); err != nil {
+	if err := insertMemoryTx(ctx, tx, userID, consolidated); err != nil {
 		return nil, err
 	}
-	if err := linkEntitiesTx(ctx, tx, consolidated); err != nil {
+	if err := linkEntitiesTx(ctx, tx, userID, consolidated); err != nil {
 		return nil, err
 	}
 
 	// Insert lineage for each source and decay source salience.
-	for _, oldID := range memoryIDs {
+	for _, oldID := range uniqueIDs {
 		_, err = tx.ExecContext(ctx,
 			`INSERT INTO graph_memory_lineage (new_memory_id, old_memory_id, relation_type, created_at)
 			 VALUES (?, ?, 'CONSOLIDATES', datetime('now'))`,
@@ -864,8 +942,8 @@ func (s *GraphMemoryStore) Consolidate(ctx context.Context, memoryIDs []string, 
 		}
 
 		_, err = tx.ExecContext(ctx,
-			`UPDATE graph_memories SET salience = salience * ? WHERE id = ?`,
-			s.salConf.ConsolidationDecay, oldID,
+			`UPDATE graph_memories SET salience = salience * ? WHERE id = ? AND user_id = ?`,
+			s.salConf.ConsolidationDecay, oldID, userID,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("decay salience for %s: %w", oldID, err)
@@ -883,12 +961,16 @@ func (s *GraphMemoryStore) GetLineage(ctx context.Context, memoryID string) ([]*
 	ctx, span := s.tracer.StartSpan(ctx, "sqlite.graph_memory.get_lineage")
 	defer s.tracer.EndSpan(span)
 
+	userID := graphUserID(ctx)
+
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT new_memory_id, old_memory_id, relation_type, created_at
 		 FROM graph_memory_lineage
-		 WHERE new_memory_id = ? OR old_memory_id = ?
+		 WHERE (new_memory_id = ? OR old_memory_id = ?)
+		   AND new_memory_id IN (SELECT id FROM graph_memories WHERE user_id = ?)
+		   AND old_memory_id IN (SELECT id FROM graph_memories WHERE user_id = ?)
 		 ORDER BY created_at`,
-		memoryID, memoryID,
+		memoryID, memoryID, userID, userID,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("get lineage: %w", err)
@@ -911,22 +993,150 @@ func (s *GraphMemoryStore) GetLineage(ctx context.Context, memoryID string) ([]*
 	return lineages, rows.Err()
 }
 
+// activeMemoryPredicate selects memories that are neither expired/forgotten
+// nor superseded. SQLite never sets deleted_at on memories, but the column
+// exists, so it is honoured for consistency with the Postgres backend.
+const activeMemoryPredicate = `(m.expires_at IS NULL OR m.expires_at > datetime('now'))
+	   AND m.deleted_at IS NULL
+	   AND m.id NOT IN (SELECT old_memory_id FROM graph_memory_lineage WHERE relation_type = 'SUPERSEDES')`
+
+// ListMemories returns the caller's active memories for agentID, newest first,
+// with the total number of such memories. It does not touch access counters.
+func (s *GraphMemoryStore) ListMemories(ctx context.Context, agentID string, limit, offset int) ([]*memory.Memory, int, error) {
+	ctx, span := s.tracer.StartSpan(ctx, "sqlite.graph_memory.list_memories")
+	defer s.tracer.EndSpan(span)
+
+	if limit <= 0 {
+		limit = 50
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	userID := graphUserID(ctx)
+
+	var total int
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM graph_memories m
+		 WHERE m.agent_id = ? AND m.user_id = ? AND `+activeMemoryPredicate,
+		agentID, userID,
+	).Scan(&total); err != nil {
+		return nil, 0, fmt.Errorf("count memories: %w", err)
+	}
+
+	// created_at has one-second resolution; rowid breaks ties in insertion order.
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT m.id, m.agent_id, m.content, m.summary, m.memory_type,
+		        COALESCE(m.source,''), COALESCE(m.source_id,''), COALESCE(m.owner,''),
+		        COALESCE(m.memory_agent_id,''), m.tags, m.salience,
+		        m.token_count, m.summary_token_count, m.access_count, m.properties_json,
+		        m.created_at, m.accessed_at, m.expires_at,
+		        COALESCE(m.event_date,''), COALESCE(m.event_date_confidence,'')
+		 FROM graph_memories m
+		 WHERE m.agent_id = ? AND m.user_id = ? AND `+activeMemoryPredicate+`
+		 ORDER BY m.created_at DESC, m.rowid DESC
+		 LIMIT ? OFFSET ?`,
+		agentID, userID, limit, offset,
+	)
+	if err != nil {
+		return nil, 0, fmt.Errorf("list memories: %w", err)
+	}
+	defer rows.Close() //nolint:errcheck
+
+	var memories []*memory.Memory
+	for rows.Next() {
+		mem, err := scanMemoryFromRows(rows)
+		if err != nil {
+			return nil, 0, err
+		}
+		memories = append(memories, mem)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, 0, err
+	}
+	return memories, total, nil
+}
+
+// ForgetAll forgets the caller's memories for agentID and deletes the caller's
+// entities and edges for agentID, in one transaction. Memories are forgotten
+// the same way Forget does it (expires_at is set), including superseded ones,
+// so none of them is recalled again. The returned count is the number of
+// memories ListMemories would have reported before the call.
+func (s *GraphMemoryStore) ForgetAll(ctx context.Context, agentID string) (int, error) {
+	ctx, span := s.tracer.StartSpan(ctx, "sqlite.graph_memory.forget_all")
+	defer s.tracer.EndSpan(span)
+
+	userID := graphUserID(ctx)
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	var active int
+	if err := tx.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM graph_memories m
+		 WHERE m.agent_id = ? AND m.user_id = ? AND `+activeMemoryPredicate,
+		agentID, userID,
+	).Scan(&active); err != nil {
+		return 0, fmt.Errorf("count memories: %w", err)
+	}
+
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE graph_memories SET expires_at = datetime('now')
+		 WHERE agent_id = ? AND user_id = ?
+		   AND (expires_at IS NULL OR expires_at > datetime('now'))`,
+		agentID, userID,
+	); err != nil {
+		return 0, fmt.Errorf("forget memories: %w", err)
+	}
+
+	// Junction rows and edges cascade from graph_entities when foreign keys
+	// are on; delete them explicitly so the result does not depend on the
+	// connection's foreign_keys setting.
+	const ownedEntities = `SELECT id FROM graph_entities WHERE agent_id = ? AND user_id = ?`
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM graph_memory_entities WHERE entity_id IN (`+ownedEntities+`)`,
+		agentID, userID,
+	); err != nil {
+		return 0, fmt.Errorf("unlink entities: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM graph_edges
+		 WHERE user_id = ?
+		   AND (agent_id = ? OR source_id IN (`+ownedEntities+`) OR target_id IN (`+ownedEntities+`))`,
+		userID, agentID, agentID, userID, agentID, userID,
+	); err != nil {
+		return 0, fmt.Errorf("delete edges: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM graph_entities WHERE agent_id = ? AND user_id = ?`,
+		agentID, userID,
+	); err != nil {
+		return 0, fmt.Errorf("delete entities: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("commit forget all: %w", err)
+	}
+	return active, nil
+}
+
 func (s *GraphMemoryStore) TouchMemories(ctx context.Context, memoryIDs []string) error {
 	if len(memoryIDs) == 0 {
 		return nil
 	}
 
-	placeholders := make([]string, len(memoryIDs))
-	args := make([]interface{}, len(memoryIDs))
-	for i, id := range memoryIDs {
-		placeholders[i] = "?"
-		args[i] = id
+	args := make([]interface{}, 0, len(memoryIDs)+1)
+	for _, id := range memoryIDs {
+		args = append(args, id)
 	}
+	args = append(args, graphUserID(ctx))
 
 	_, err := s.db.ExecContext(ctx,
-		fmt.Sprintf(
+		fmt.Sprintf( // #nosec G201 -- placeholders are "?" only
 			`UPDATE graph_memories SET accessed_at = datetime('now'), access_count = access_count + 1
-			 WHERE id IN (%s)`, strings.Join(placeholders, ",")),
+			 WHERE id IN (%s) AND user_id = ?`, sqlPlaceholders(len(memoryIDs))),
 		args...,
 	)
 	return err
@@ -938,8 +1148,8 @@ func (s *GraphMemoryStore) DecayAll(ctx context.Context, agentID string, decayFa
 
 	_, err := s.db.ExecContext(ctx,
 		`UPDATE graph_memories SET salience = MAX(0.0, salience * ?)
-		 WHERE agent_id = ? AND salience > 0.01`,
-		decayFactor, agentID,
+		 WHERE agent_id = ? AND user_id = ? AND salience > 0.01`,
+		decayFactor, agentID, graphUserID(ctx),
 	)
 	return err
 }
@@ -1038,15 +1248,14 @@ func (s *GraphMemoryStore) resolveEntityNames(ctx context.Context, edgesOut, edg
 		return nil
 	}
 
-	placeholders := make([]string, 0, len(ids))
-	args := make([]any, 0, len(ids))
+	args := make([]any, 0, len(ids)+1)
 	for id := range ids {
-		placeholders = append(placeholders, "?")
 		args = append(args, id)
 	}
+	args = append(args, graphUserID(ctx))
 
-	query := fmt.Sprintf(`SELECT id, name FROM graph_entities WHERE id IN (%s)`, // #nosec G201 -- placeholders are "?" only; values passed via args
-		strings.Join(placeholders, ","))
+	query := fmt.Sprintf(`SELECT id, name FROM graph_entities WHERE id IN (%s) AND user_id = ?`, // #nosec G201 -- placeholders are "?" only; values passed via args
+		sqlPlaceholders(len(ids)))
 	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil
@@ -1069,40 +1278,41 @@ func (s *GraphMemoryStore) GetStats(ctx context.Context, agentID string) (*memor
 	defer s.tracer.EndSpan(span)
 
 	stats := &memory.GraphStats{MemoriesByType: make(map[string]int)}
+	userID := graphUserID(ctx)
 
 	if err := s.db.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM graph_entities WHERE agent_id = ?`, agentID,
+		`SELECT COUNT(*) FROM graph_entities WHERE agent_id = ? AND user_id = ?`, agentID, userID,
 	).Scan(&stats.EntityCount); err != nil {
 		return nil, fmt.Errorf("count entities: %w", err)
 	}
 
 	if err := s.db.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM graph_edges WHERE agent_id = ?`, agentID,
+		`SELECT COUNT(*) FROM graph_edges WHERE agent_id = ? AND user_id = ?`, agentID, userID,
 	).Scan(&stats.EdgeCount); err != nil {
 		return nil, fmt.Errorf("count edges: %w", err)
 	}
 
 	if err := s.db.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM graph_memories WHERE agent_id = ?`, agentID,
+		`SELECT COUNT(*) FROM graph_memories WHERE agent_id = ? AND user_id = ?`, agentID, userID,
 	).Scan(&stats.MemoryCount); err != nil {
 		return nil, fmt.Errorf("count memories: %w", err)
 	}
 
 	if err := s.db.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM graph_memories WHERE agent_id = ? AND (expires_at IS NULL OR expires_at > datetime('now'))`,
-		agentID,
+		`SELECT COUNT(*) FROM graph_memories WHERE agent_id = ? AND user_id = ? AND (expires_at IS NULL OR expires_at > datetime('now'))`,
+		agentID, userID,
 	).Scan(&stats.ActiveMemoryCount); err != nil {
 		return nil, fmt.Errorf("count active memories: %w", err)
 	}
 
 	if err := s.db.QueryRowContext(ctx,
-		`SELECT COALESCE(SUM(token_count), 0) FROM graph_memories WHERE agent_id = ?`, agentID,
+		`SELECT COALESCE(SUM(token_count), 0) FROM graph_memories WHERE agent_id = ? AND user_id = ?`, agentID, userID,
 	).Scan(&stats.TotalMemoryTokens); err != nil {
 		return nil, fmt.Errorf("sum memory tokens: %w", err)
 	}
 
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT memory_type, COUNT(*) FROM graph_memories WHERE agent_id = ? GROUP BY memory_type`, agentID,
+		`SELECT memory_type, COUNT(*) FROM graph_memories WHERE agent_id = ? AND user_id = ? GROUP BY memory_type`, agentID, userID,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("group memories by type: %w", err)
@@ -1235,13 +1445,18 @@ func (s *GraphMemoryStore) prepareMemory(mem *memory.Memory) {
 	}
 }
 
-// insertMemoryTx inserts a memory row within an existing transaction.
-func insertMemoryTx(ctx context.Context, tx *sql.Tx, mem *memory.Memory) error {
+// insertMemoryTx inserts a memory row owned by userID within an existing transaction.
+func insertMemoryTx(ctx context.Context, tx *sql.Tx, userID string, mem *memory.Memory) error {
 	tagsJSON, err := json.Marshal(mem.Tags)
 	if err != nil {
 		tagsJSON = []byte("[]")
 	}
 
+	// expires_at is stored through datetime() (UTC "YYYY-MM-DD HH:MM:SS"),
+	// the same text format as datetime('now'), which every expiry predicate
+	// compares it against as a string. A raw RFC3339 value ("...T...Z")
+	// sorts after datetime('now') on the same day, so a TTL that had
+	// already passed earlier that day still read as active.
 	var expiresAt interface{}
 	if mem.ExpiresAt != nil {
 		expiresAt = mem.ExpiresAt.Format(time.RFC3339)
@@ -1268,13 +1483,13 @@ func insertMemoryTx(ctx context.Context, tx *sql.Tx, mem *memory.Memory) error {
 		 (id, agent_id, content, summary, memory_type, source, source_id, owner, memory_agent_id,
 		  tags, salience, token_count, summary_token_count, access_count, properties_json,
 		  created_at, accessed_at, expires_at, embedding, embedding_model,
-		  event_date, event_date_confidence)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, datetime(?), NULL, ?, ?, ?, ?, ?)`,
+		  event_date, event_date_confidence, user_id)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, datetime(?), NULL, datetime(?), ?, ?, ?, ?, ?)`,
 		mem.ID, mem.AgentID, mem.Content, mem.Summary, mem.MemoryType,
 		mem.Source, mem.SourceID, mem.Owner, mem.MemoryAgentID,
 		string(tagsJSON), mem.Salience, mem.TokenCount, mem.SummaryTokenCount,
 		mem.PropertiesJSON, mem.CreatedAt.Format(time.RFC3339), expiresAt, embBytes, embModel,
-		eventDate, eventDateConfidence,
+		eventDate, eventDateConfidence, userID,
 	)
 	if err != nil {
 		return fmt.Errorf("insert memory: %w", err)
@@ -1285,34 +1500,86 @@ func insertMemoryTx(ctx context.Context, tx *sql.Tx, mem *memory.Memory) error {
 // linkEntitiesTx links entity IDs to a memory via the junction table within a transaction.
 // If mem.EntityRoles is populated, it takes precedence (includes per-entity roles).
 // Otherwise falls back to mem.EntityIDs with default RoleAbout.
-func linkEntitiesTx(ctx context.Context, tx *sql.Tx, mem *memory.Memory) error {
+// Every linked entity must belong to userID; a memory is never attached to
+// another user's entity.
+func linkEntitiesTx(ctx context.Context, tx *sql.Tx, userID string, mem *memory.Memory) error {
+	type link struct{ id, role string }
+	var links []link
 	if len(mem.EntityRoles) > 0 {
 		for _, er := range mem.EntityRoles {
 			role := er.Role
 			if role == "" {
 				role = memory.RoleAbout
 			}
-			_, err := tx.ExecContext(ctx,
-				`INSERT INTO graph_memory_entities (memory_id, entity_id, role) VALUES (?, ?, ?)`,
-				mem.ID, er.ID, role,
-			)
-			if err != nil {
-				return fmt.Errorf("link entity %s (role %s): %w", er.ID, role, err)
-			}
+			links = append(links, link{er.ID, role})
 		}
+	} else {
+		// Fallback: EntityIDs without explicit roles -> default to RoleAbout.
+		for _, eid := range mem.EntityIDs {
+			links = append(links, link{eid, memory.RoleAbout})
+		}
+	}
+	if len(links) == 0 {
 		return nil
 	}
-	// Fallback: EntityIDs without explicit roles → default to RoleAbout.
-	for _, eid := range mem.EntityIDs {
-		_, err := tx.ExecContext(ctx,
+
+	ids := make([]string, len(links))
+	for i, l := range links {
+		ids[i] = l.id
+	}
+	if err := requireOwnedEntitiesTx(ctx, tx, userID, ids...); err != nil {
+		return fmt.Errorf("link entities: %w", err)
+	}
+
+	for _, l := range links {
+		if _, err := tx.ExecContext(ctx,
 			`INSERT INTO graph_memory_entities (memory_id, entity_id, role) VALUES (?, ?, ?)`,
-			mem.ID, eid, memory.RoleAbout,
-		)
-		if err != nil {
-			return fmt.Errorf("link entity %s: %w", eid, err)
+			mem.ID, l.id, l.role,
+		); err != nil {
+			return fmt.Errorf("link entity %s (role %s): %w", l.id, l.role, err)
 		}
 	}
 	return nil
+}
+
+// requireOwnedEntitiesTx returns memory.ErrNotFound (wrapped) unless every
+// entity ID exists and belongs to userID.
+func requireOwnedEntitiesTx(ctx context.Context, tx *sql.Tx, userID string, entityIDs ...string) error {
+	unique := dedupeStrings(entityIDs)
+	if len(unique) == 0 {
+		return nil
+	}
+	args := make([]interface{}, 0, len(unique)+1)
+	for _, id := range unique {
+		args = append(args, id)
+	}
+	args = append(args, userID)
+	var n int
+	if err := tx.QueryRowContext(ctx,
+		fmt.Sprintf(`SELECT COUNT(*) FROM graph_entities WHERE id IN (%s) AND user_id = ?`, // #nosec G201 -- placeholders are "?" only
+			sqlPlaceholders(len(unique))),
+		args...,
+	).Scan(&n); err != nil {
+		return fmt.Errorf("check entity ownership: %w", err)
+	}
+	if n != len(unique) {
+		return fmt.Errorf("%d of %d entities: %w", len(unique)-n, len(unique), memory.ErrNotFound)
+	}
+	return nil
+}
+
+// dedupeStrings returns the distinct values of in, preserving first-seen order.
+func dedupeStrings(in []string) []string {
+	seen := make(map[string]struct{}, len(in))
+	out := make([]string, 0, len(in))
+	for _, v := range in {
+		if _, ok := seen[v]; ok {
+			continue
+		}
+		seen[v] = struct{}{}
+		out = append(out, v)
+	}
+	return out
 }
 
 // =============================================================================

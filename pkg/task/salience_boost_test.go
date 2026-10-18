@@ -122,6 +122,10 @@ func (m *mockGraphMemoryStore) GetLineage(context.Context, string) ([]*memory.Me
 	return nil, nil
 }
 func (m *mockGraphMemoryStore) DecayAll(context.Context, string, float64) error { return nil }
+func (m *mockGraphMemoryStore) ListMemories(context.Context, string, int, int) ([]*memory.Memory, int, error) {
+	return nil, 0, nil
+}
+func (m *mockGraphMemoryStore) ForgetAll(context.Context, string) (int, error) { return 0, nil }
 func (m *mockGraphMemoryStore) ContextFor(context.Context, memory.ContextForOpts) (*memory.EntityRecall, error) {
 	return nil, nil
 }

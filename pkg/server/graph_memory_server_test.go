@@ -18,6 +18,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"sort"
 	"sync"
 	"testing"
 	"time"
@@ -292,6 +293,56 @@ func (m *mockGraphMemoryStore) TouchMemories(_ context.Context, _ []string) erro
 
 func (m *mockGraphMemoryStore) DecayAll(_ context.Context, _ string, _ float64) error {
 	return nil
+}
+
+func (m *mockGraphMemoryStore) ListMemories(_ context.Context, agentID string, limit, offset int) ([]*memory.Memory, int, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	var active []*memory.Memory
+	for _, mem := range m.memories {
+		if mem.AgentID == agentID && (mem.ExpiresAt == nil || mem.ExpiresAt.After(time.Now())) {
+			active = append(active, mem)
+		}
+	}
+	sort.Slice(active, func(i, j int) bool { return active[i].CreatedAt.After(active[j].CreatedAt) })
+	total := len(active)
+	if offset < 0 {
+		offset = 0
+	}
+	if offset >= total {
+		return nil, total, nil
+	}
+	active = active[offset:]
+	if limit > 0 && len(active) > limit {
+		active = active[:limit]
+	}
+	return active, total, nil
+}
+
+func (m *mockGraphMemoryStore) ForgetAll(_ context.Context, agentID string) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	now := time.Now()
+	n := 0
+	for _, mem := range m.memories {
+		if mem.AgentID == agentID && (mem.ExpiresAt == nil || mem.ExpiresAt.After(now)) {
+			mem.ExpiresAt = &now
+			n++
+		}
+	}
+	for k, e := range m.entities {
+		if e.AgentID == agentID {
+			delete(m.entities, k)
+		}
+	}
+	kept := m.edges[:0]
+	for _, e := range m.edges {
+		if e.AgentID != agentID {
+			kept = append(kept, e)
+		}
+	}
+	m.edges = kept
+	return n, nil
 }
 
 func (m *mockGraphMemoryStore) ContextFor(_ context.Context, opts memory.ContextForOpts) (*memory.EntityRecall, error) {
