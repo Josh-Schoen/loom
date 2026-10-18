@@ -104,8 +104,8 @@ func (r *Rule) respond(data TemplateData, messages []types.Message) *types.LLMRe
 		return textResponse(render(r.reply, data), messages)
 	}
 	input := make(map[string]interface{}, len(r.CallTool.arguments))
-	for key, t := range r.CallTool.arguments {
-		input[key] = render(t, data)
+	for key, node := range r.CallTool.arguments {
+		input[key] = renderArg(node, data)
 	}
 	return &types.LLMResponse{
 		ToolCalls: []types.ToolCall{{
@@ -161,6 +161,28 @@ func messageText(m types.Message) string {
 
 // render executes a template; a failure is rendered into the text so a
 // script mistake is visible in the conversation rather than silently empty.
+// renderArg renders a compiled argument value, recursing into lists and maps.
+func renderArg(node argNode, data TemplateData) any {
+	switch node.kind {
+	case argTemplate:
+		return render(node.tmpl, data)
+	case argList:
+		out := make([]any, 0, len(node.list))
+		for _, child := range node.list {
+			out = append(out, renderArg(child, data))
+		}
+		return out
+	case argMap:
+		out := make(map[string]any, len(node.fields))
+		for key, child := range node.fields {
+			out[key] = renderArg(child, data)
+		}
+		return out
+	default:
+		return node.literal
+	}
+}
+
 func render(t *template.Template, data TemplateData) string {
 	var b strings.Builder
 	if err := t.Execute(&b, data); err != nil {

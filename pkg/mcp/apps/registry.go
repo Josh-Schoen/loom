@@ -22,6 +22,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/teradata-labs/loom/pkg/mcp/protocol"
 )
@@ -43,6 +44,7 @@ type UIResource struct {
 	HTML        []byte                   // Raw HTML content
 	Meta        *protocol.UIResourceMeta // Security and display metadata
 	Dynamic     bool                     // true = agent-created, false = embedded
+	UpdatedAt   time.Time                // Last create/update (dynamic apps only)
 }
 
 // UIResourceRegistry manages UI resources that the MCP server exposes.
@@ -50,9 +52,11 @@ type UIResource struct {
 type UIResourceRegistry struct {
 	resources     map[string]*UIResource
 	mu            sync.RWMutex
-	onChange      func() // Called outside lock after mutations
-	maxDynamic    int    // Max dynamic apps (default 100)
-	maxTotalBytes int64  // Max total HTML bytes for dynamic apps (default 50MB)
+	onChange      func()           // Called outside lock after mutations
+	maxDynamic    int              // Max dynamic apps (default 100)
+	maxTotalBytes int64            // Max total HTML bytes for dynamic apps (default 50MB)
+	store         *fileStore       // Persists dynamic apps when non-nil
+	now           func() time.Time // Clock for UpdatedAt
 }
 
 // NewUIResourceRegistry creates a new empty registry.
@@ -61,7 +65,46 @@ func NewUIResourceRegistry() *UIResourceRegistry {
 		resources:     make(map[string]*UIResource),
 		maxDynamic:    DefaultMaxDynamic,
 		maxTotalBytes: DefaultMaxTotalBytes,
+		now:           time.Now,
 	}
+}
+
+// EnablePersistence stores dynamic apps in dir (one JSON file per app) and
+// loads the apps already there, so agent-created apps survive restarts. Call
+// once, after registering embedded apps and before serving. Files that cannot
+// be read, or that would exceed the registry limits, are skipped and returned
+// by name; they stay on disk.
+func (r *UIResourceRegistry) EnablePersistence(dir string) (loaded int, skipped []string, err error) {
+	store, err := newFileStore(dir)
+	if err != nil {
+		return 0, nil, err
+	}
+	stored, skipped, err := store.loadAll()
+	if err != nil {
+		return 0, nil, err
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, app := range stored {
+		res := &UIResource{
+			URI:         "ui://loom/" + app.Name,
+			Name:        app.DisplayName,
+			Description: app.Description,
+			MIMEType:    protocol.ResourceMIME,
+			HTML:        []byte(app.HTML),
+			Meta:        &protocol.UIResourceMeta{PrefersBorder: boolPtrTrue()},
+			Dynamic:     true,
+			UpdatedAt:   app.UpdatedAt,
+		}
+		if _, err := r.upsertLocked(res); err != nil {
+			skipped = append(skipped, app.Name+".json")
+			continue
+		}
+		loaded++
+	}
+	r.store = store
+	return loaded, skipped, nil
 }
 
 // SetOnChange registers a callback that is invoked after any mutation
@@ -144,7 +187,21 @@ func (r *UIResourceRegistry) upsertLocked(res *UIResource) (created bool, err er
 		}
 	}
 
+	if res.UpdatedAt.IsZero() {
+		res.UpdatedAt = r.now()
+	}
 	r.resources[res.URI] = res
+	if r.store != nil {
+		if err := r.store.save(res); err != nil {
+			// Keep memory and disk in agreement: undo the change.
+			if exists {
+				r.resources[res.URI] = existing
+			} else {
+				delete(r.resources, res.URI)
+			}
+			return false, err
+		}
+	}
 	return !exists, nil
 }
 
@@ -164,6 +221,13 @@ func (r *UIResourceRegistry) Delete(uri string) error {
 	}
 
 	delete(r.resources, uri)
+	if r.store != nil {
+		if err := r.store.delete(extractAppName(uri)); err != nil {
+			r.resources[uri] = existing
+			r.mu.Unlock()
+			return err
+		}
+	}
 	notify = r.onChange
 	r.mu.Unlock()
 
@@ -306,6 +370,7 @@ type AppInfo struct {
 	MimeType      string
 	PrefersBorder bool
 	Dynamic       bool
+	UpdatedAt     time.Time // Zero for embedded apps
 }
 
 // ListAppInfo returns metadata for all registered apps, sorted by name.
@@ -322,6 +387,7 @@ func (r *UIResourceRegistry) ListAppInfo() []AppInfo {
 			Description: res.Description,
 			MimeType:    res.MIMEType,
 			Dynamic:     res.Dynamic,
+			UpdatedAt:   res.UpdatedAt,
 		}
 		if res.Meta != nil && res.Meta.PrefersBorder != nil {
 			info.PrefersBorder = *res.Meta.PrefersBorder
@@ -349,6 +415,7 @@ func (r *UIResourceRegistry) GetAppHTML(name string) ([]byte, *AppInfo, error) {
 				Description: res.Description,
 				MimeType:    res.MIMEType,
 				Dynamic:     res.Dynamic,
+				UpdatedAt:   res.UpdatedAt,
 			}
 			if res.Meta != nil && res.Meta.PrefersBorder != nil {
 				info.PrefersBorder = *res.Meta.PrefersBorder
@@ -408,6 +475,7 @@ func (r *UIResourceRegistry) CreateApp(name, displayName, description string, ht
 		MimeType:      protocol.ResourceMIME,
 		PrefersBorder: true,
 		Dynamic:       true,
+		UpdatedAt:     res.UpdatedAt,
 	}
 	return info, !created, nil
 }
@@ -470,6 +538,7 @@ func (r *UIResourceRegistry) UpdateApp(name, displayName, description string, ht
 		MimeType:      protocol.ResourceMIME,
 		PrefersBorder: true,
 		Dynamic:       true,
+		UpdatedAt:     res.UpdatedAt,
 	}, nil
 }
 

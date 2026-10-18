@@ -15,6 +15,7 @@ import (
 	"go.uber.org/zap"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 // appNameRegex validates app names: lowercase alphanumeric, hyphens, 1-63 chars.
@@ -276,7 +277,7 @@ func (s *MultiAgentServer) ListComponentTypes(ctx context.Context, req *loomv1.L
 
 // appInfoToProto converts an apps.AppInfo to a proto UIApp message.
 func appInfoToProto(info *apps.AppInfo) *loomv1.UIApp {
-	return &loomv1.UIApp{
+	app := &loomv1.UIApp{
 		Name:          info.Name,
 		Uri:           info.URI,
 		DisplayName:   info.DisplayName,
@@ -285,4 +286,8 @@ func appInfoToProto(info *apps.AppInfo) *loomv1.UIApp {
 		PrefersBorder: info.PrefersBorder,
 		Dynamic:       info.Dynamic,
 	}
+	if !info.UpdatedAt.IsZero() {
+		app.UpdatedAt = timestamppb.New(info.UpdatedAt)
+	}
+	return app
 }

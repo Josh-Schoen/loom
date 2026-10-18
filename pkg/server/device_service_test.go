@@ -17,6 +17,8 @@ package server
 import (
 	"context"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"path/filepath"
 	"testing"
@@ -237,4 +239,32 @@ func TestFirstPrivateIPv4(t *testing.T) {
 	addrs := []net.Addr{mk("127.0.0.1/8"), mk("fe80::1/64"), mk("8.8.8.8/32"), mk("10.0.0.7/24"), mk("192.168.1.2/24")}
 	assert.Equal(t, "10.0.0.7", firstPrivateIPv4(addrs))
 	assert.Equal(t, "", firstPrivateIPv4(addrs[:3]))
+}
+
+func TestAppsPagesRequireCredentialsWhenPairingIsRequired(t *testing.T) {
+	s := newTestDeviceServer(t, true)
+	token := pair(t, s).GetDeviceToken()
+
+	h := NewHTTPServer(nil, "127.0.0.1:0", "127.0.0.1:0", nil)
+	h.SetAppHTMLProvider(newTestProvider())
+	h.SetStreamInterceptors(s.StreamServerInterceptor(), UserIDStreamInterceptor(UserIDConfig{}))
+
+	for _, path := range []string{"/apps/", "/apps/data-chart"} {
+		rr := httptest.NewRecorder()
+		h.handleApps(rr, httptest.NewRequest(http.MethodGet, path, nil))
+		assert.Equal(t, http.StatusUnauthorized, rr.Code, "%s without a token", path)
+
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+		rr = httptest.NewRecorder()
+		h.handleApps(rr, req)
+		assert.Equal(t, http.StatusOK, rr.Code, "%s with a device token", path)
+	}
+}
+
+func TestAppsPagesOpenWithoutInterceptors(t *testing.T) {
+	h := &HTTPServer{appHTMLProvider: newTestProvider()}
+	rr := httptest.NewRecorder()
+	h.handleApps(rr, httptest.NewRequest(http.MethodGet, "/apps/data-chart", nil))
+	assert.Equal(t, http.StatusOK, rr.Code)
 }

@@ -15,6 +15,7 @@ import (
 	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
 	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
 	structpb "google.golang.org/protobuf/types/known/structpb"
+	timestamppb "google.golang.org/protobuf/types/known/timestamppb"
 	reflect "reflect"
 	sync "sync"
 	unsafe "unsafe"
@@ -43,7 +44,9 @@ type UIApp struct {
 	// Whether the app prefers a bordered container
 	PrefersBorder bool `protobuf:"varint,6,opt,name=prefers_border,json=prefersBorder,proto3" json:"prefers_border,omitempty"`
 	// Whether the app was dynamically created by an agent (vs embedded)
-	Dynamic       bool `protobuf:"varint,7,opt,name=dynamic,proto3" json:"dynamic,omitempty"`
+	Dynamic bool `protobuf:"varint,7,opt,name=dynamic,proto3" json:"dynamic,omitempty"`
+	// When a dynamic app was last created or updated. Unset for embedded apps.
+	UpdatedAt     *timestamppb.Timestamp `protobuf:"bytes,8,opt,name=updated_at,json=updatedAt,proto3" json:"updated_at,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -125,6 +128,13 @@ func (x *UIApp) GetDynamic() bool {
 		return x.Dynamic
 	}
 	return false
+}
+
+func (x *UIApp) GetUpdatedAt() *timestamppb.Timestamp {
+	if x != nil {
+		return x.UpdatedAt
+	}
+	return nil
 }
 
 // ListUIAppsRequest lists all available UI apps.
@@ -1032,7 +1042,7 @@ var File_loom_v1_apps_proto protoreflect.FileDescriptor
 
 const file_loom_v1_apps_proto_rawDesc = "" +
 	"\n" +
-	"\x12loom/v1/apps.proto\x12\aloom.v1\x1a\x1cgoogle/protobuf/struct.proto\"\xd0\x01\n" +
+	"\x12loom/v1/apps.proto\x12\aloom.v1\x1a\x1cgoogle/protobuf/struct.proto\x1a\x1fgoogle/protobuf/timestamp.proto\"\x8b\x02\n" +
 	"\x05UIApp\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x10\n" +
 	"\x03uri\x18\x02 \x01(\tR\x03uri\x12!\n" +
@@ -1040,7 +1050,9 @@ const file_loom_v1_apps_proto_rawDesc = "" +
 	"\vdescription\x18\x04 \x01(\tR\vdescription\x12\x1b\n" +
 	"\tmime_type\x18\x05 \x01(\tR\bmimeType\x12%\n" +
 	"\x0eprefers_border\x18\x06 \x01(\bR\rprefersBorder\x12\x18\n" +
-	"\adynamic\x18\a \x01(\bR\adynamic\"\x13\n" +
+	"\adynamic\x18\a \x01(\bR\adynamic\x129\n" +
+	"\n" +
+	"updated_at\x18\b \x01(\v2\x1a.google.protobuf.TimestampR\tupdatedAt\"\x13\n" +
 	"\x11ListUIAppsRequest\"Y\n" +
 	"\x12ListUIAppsResponse\x12\"\n" +
 	"\x04apps\x18\x01 \x03(\v2\x0e.loom.v1.UIAppR\x04apps\x12\x1f\n" +
@@ -1128,25 +1140,27 @@ var file_loom_v1_apps_proto_goTypes = []any{
 	(*ListComponentTypesRequest)(nil),  // 13: loom.v1.ListComponentTypesRequest
 	(*ComponentType)(nil),              // 14: loom.v1.ComponentType
 	(*ListComponentTypesResponse)(nil), // 15: loom.v1.ListComponentTypesResponse
-	(*structpb.Struct)(nil),            // 16: google.protobuf.Struct
+	(*timestamppb.Timestamp)(nil),      // 16: google.protobuf.Timestamp
+	(*structpb.Struct)(nil),            // 17: google.protobuf.Struct
 }
 var file_loom_v1_apps_proto_depIdxs = []int32{
-	0,  // 0: loom.v1.ListUIAppsResponse.apps:type_name -> loom.v1.UIApp
-	0,  // 1: loom.v1.GetUIAppResponse.app:type_name -> loom.v1.UIApp
-	6,  // 2: loom.v1.UIAppSpec.components:type_name -> loom.v1.UIComponent
-	16, // 3: loom.v1.UIComponent.props:type_name -> google.protobuf.Struct
-	6,  // 4: loom.v1.UIComponent.children:type_name -> loom.v1.UIComponent
-	5,  // 5: loom.v1.CreateUIAppRequest.spec:type_name -> loom.v1.UIAppSpec
-	0,  // 6: loom.v1.CreateUIAppResponse.app:type_name -> loom.v1.UIApp
-	5,  // 7: loom.v1.UpdateUIAppRequest.spec:type_name -> loom.v1.UIAppSpec
-	0,  // 8: loom.v1.UpdateUIAppResponse.app:type_name -> loom.v1.UIApp
-	16, // 9: loom.v1.ComponentType.props_schema:type_name -> google.protobuf.Struct
-	14, // 10: loom.v1.ListComponentTypesResponse.types:type_name -> loom.v1.ComponentType
-	11, // [11:11] is the sub-list for method output_type
-	11, // [11:11] is the sub-list for method input_type
-	11, // [11:11] is the sub-list for extension type_name
-	11, // [11:11] is the sub-list for extension extendee
-	0,  // [0:11] is the sub-list for field type_name
+	16, // 0: loom.v1.UIApp.updated_at:type_name -> google.protobuf.Timestamp
+	0,  // 1: loom.v1.ListUIAppsResponse.apps:type_name -> loom.v1.UIApp
+	0,  // 2: loom.v1.GetUIAppResponse.app:type_name -> loom.v1.UIApp
+	6,  // 3: loom.v1.UIAppSpec.components:type_name -> loom.v1.UIComponent
+	17, // 4: loom.v1.UIComponent.props:type_name -> google.protobuf.Struct
+	6,  // 5: loom.v1.UIComponent.children:type_name -> loom.v1.UIComponent
+	5,  // 6: loom.v1.CreateUIAppRequest.spec:type_name -> loom.v1.UIAppSpec
+	0,  // 7: loom.v1.CreateUIAppResponse.app:type_name -> loom.v1.UIApp
+	5,  // 8: loom.v1.UpdateUIAppRequest.spec:type_name -> loom.v1.UIAppSpec
+	0,  // 9: loom.v1.UpdateUIAppResponse.app:type_name -> loom.v1.UIApp
+	17, // 10: loom.v1.ComponentType.props_schema:type_name -> google.protobuf.Struct
+	14, // 11: loom.v1.ListComponentTypesResponse.types:type_name -> loom.v1.ComponentType
+	12, // [12:12] is the sub-list for method output_type
+	12, // [12:12] is the sub-list for method input_type
+	12, // [12:12] is the sub-list for extension type_name
+	12, // [12:12] is the sub-list for extension extendee
+	0,  // [0:12] is the sub-list for field type_name
 }
 
 func init() { file_loom_v1_apps_proto_init() }

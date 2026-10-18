@@ -12,10 +12,13 @@ import (
 
 	"github.com/spf13/viper"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 
 	loomv1 "github.com/teradata-labs/loom/gen/go/loom/v1"
 	"github.com/teradata-labs/loom/pkg/agent"
+	"github.com/teradata-labs/loom/pkg/mcp/apps"
+	"github.com/teradata-labs/loom/pkg/server"
 )
 
 // hasTool reports whether ag has the named tool registered.
@@ -168,4 +171,25 @@ func TestRegisterYAMLBuiltinTools_UnknownTool_NotRegistered(t *testing.T) {
 	registerYAMLBuiltinTools(ag, cfg, nil, zap.NewNop(), "  ", "agent_management")
 
 	assert.False(t, hasTool(ag, "not_a_real_tool"))
+}
+
+func TestDeclaresUIAppTools(t *testing.T) {
+	assert.False(t, declaresUIAppTools(nil))
+	assert.False(t, declaresUIAppTools(newCfg("http_request")))
+	assert.True(t, declaresUIAppTools(newCfg("http_request", "create_ui_app")))
+	assert.True(t, declaresUIAppTools(newCfg("update_ui_app")))
+}
+
+func TestRegisterUIAppTools_DeclaredAreAlwaysOffered(t *testing.T) {
+	compiler, err := apps.NewCompiler()
+	require.NoError(t, err)
+	tools := server.UIAppTools(compiler, apps.NewUIResourceRegistry())
+
+	declared := agent.NewAgent(nil, nil)
+	assert.Equal(t, "declared", registerUIAppTools(declared, tools, true))
+	assert.True(t, hasTool(declared, "create_ui_app"), "declared agents get the tools without any keyword")
+
+	lazy := agent.NewAgent(nil, nil)
+	assert.Equal(t, "lazy", registerUIAppTools(lazy, tools, false))
+	assert.False(t, hasTool(lazy, "create_ui_app"), "other agents get them only after a UI-intent message")
 }

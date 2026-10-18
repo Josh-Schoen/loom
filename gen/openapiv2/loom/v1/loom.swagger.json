@@ -9881,6 +9881,11 @@
         "dynamic": {
           "type": "boolean",
           "title": "Whether the app was dynamically created by an agent (vs embedded)"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "When a dynamic app was last created or updated. Unset for embedded apps."
         }
       },
       "description": "UIApp represents an interactive HTML application exposed by the MCP server."

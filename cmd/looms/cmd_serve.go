@@ -211,7 +211,7 @@ func registerYAMLBuiltinTools(
 		"group_by_query":                  "presentation subsystem",
 		"generate_visualization":          "visualization subsystem",
 		"generate_workflow_visualization": "visualization subsystem",
-		"create_ui_app":                   "UI app subsystem (AppCompiler/AppProvider)",
+		"create_ui_app":                   "UI app subsystem (declaring it makes the UI app tools always offered; see registerUIAppTools)",
 		"list_component_types":            "UI app subsystem (AppCompiler/AppProvider)",
 		"update_ui_app":                   "UI app subsystem (AppCompiler/AppProvider)",
 		"delete_ui_app":                   "UI app subsystem (AppCompiler/AppProvider)",
@@ -1718,6 +1718,9 @@ func runServe(cmd *cobra.Command, args []string) {
 
 	// Initialize empty agents map - all agents loaded from $LOOM_DATA_DIR/agents/ via registry below
 	agents := initializeAgentsMap()
+	// Agents whose YAML lists a UI app tool in tools.builtin are always
+	// offered the UI app tools (see registerUIAppTools); keyed like agents.
+	uiAppToolsDeclared := make(map[string]bool)
 	logger.Info("Agents will be loaded from $LOOM_DATA_DIR/agents/ directory via registry system")
 
 	// Also load agents from $LOOM_DATA_DIR/agents/ directory (created by meta-agent)
@@ -2196,6 +2199,7 @@ func runServe(cmd *cobra.Command, args []string) {
 
 				// Store agent with GUID as key for stable references
 				agents[agentGUID] = ag
+				uiAppToolsDeclared[agentGUID] = declaresUIAppTools(cfg)
 			}
 		}
 		// DO NOT close registry - keep it alive for hot-reload
@@ -2629,6 +2633,16 @@ func runServe(cmd *cobra.Command, args []string) {
 	uiRegistry := apps.NewUIResourceRegistry()
 	if err := apps.RegisterEmbeddedApps(uiRegistry); err != nil {
 		logger.Error("Failed to register some embedded UI apps", zap.Error(err))
+	}
+	// Apps agents create are kept in the data directory so they survive restarts.
+	appsDir := filepath.Join(loomconfig.GetLoomDataDir(), "apps")
+	if loaded, skipped, err := uiRegistry.EnablePersistence(appsDir); err != nil {
+		logger.Error("Agent-created UI apps will not survive a restart", zap.String("dir", appsDir), zap.Error(err))
+	} else {
+		logger.Info("Agent-created UI apps loaded", zap.String("dir", appsDir), zap.Int("count", loaded))
+		if len(skipped) > 0 {
+			logger.Warn("Skipped unreadable or over-limit app files", zap.Strings("files", skipped))
+		}
 	}
 	if uiRegistry.Count() > 0 {
 		loomService.SetAppProvider(uiRegistry)
@@ -3112,12 +3126,13 @@ func runServe(cmd *cobra.Command, args []string) {
 	// tools are only promoted into the active tool set when ContainsUIIntent fires.
 	// tools.none=true skips this for the same reason as communication tools.
 	if appCompiler != nil && uiRegistry != nil && !toolsNoneActive() {
-		logger.Info("Registering UI app tools for lazy disclosure with loaded agents...")
+		logger.Info("Registering UI app tools with loaded agents...")
 		for agentID, ag := range agents {
 			uiAppTools := server.UIAppTools(appCompiler, uiRegistry)
-			ag.RegisterLazyTools(uiAppTools, server.ContainsUIIntent)
-			logger.Info("  UI app tools registered for lazy disclosure",
+			mode := registerUIAppTools(ag, uiAppTools, uiAppToolsDeclared[agentID])
+			logger.Info("  UI app tools registered",
 				zap.String("agent", agentID),
+				zap.String("mode", mode),
 				zap.Int("num_tools", len(uiAppTools)))
 		}
 	} else if toolsNoneActive() {
@@ -3445,8 +3460,8 @@ func runServe(cmd *cobra.Command, args []string) {
 			// Register UI app tools for hot-reloaded agents using lazy disclosure
 			if appCompiler != nil && uiRegistry != nil && !toolsNoneActive() {
 				uiAppTools := server.UIAppTools(appCompiler, uiRegistry)
-				newAgent.RegisterLazyTools(uiAppTools, server.ContainsUIIntent)
-				logger.Info("  UI app tools registered for lazy disclosure", zap.Int("num_tools", len(uiAppTools)))
+				mode := registerUIAppTools(newAgent, uiAppTools, declaresUIAppTools(agentConfig))
+				logger.Info("  UI app tools registered", zap.String("mode", mode), zap.Int("num_tools", len(uiAppTools)))
 			}
 
 			// Check if agent already exists in server (by GUID)
@@ -4069,4 +4084,35 @@ func buildDeviceServer(config *Config, defaultUserID string, logger *zap.Logger)
 		zap.Bool("required", dp.Required),
 		zap.Int("paired_devices", len(manager.List())))
 	return ds
+}
+
+// uiAppToolNames are the tools server.UIAppTools provides.
+var uiAppToolNames = map[string]bool{
+	"create_ui_app": true, "update_ui_app": true, "delete_ui_app": true, "list_component_types": true,
+}
+
+// declaresUIAppTools reports whether cfg lists any UI app tool in tools.builtin.
+func declaresUIAppTools(cfg *loomv1.AgentConfig) bool {
+	if cfg == nil || cfg.Tools == nil {
+		return false
+	}
+	for _, name := range cfg.Tools.Builtin {
+		if uiAppToolNames[name] {
+			return true
+		}
+	}
+	return false
+}
+
+// registerUIAppTools offers the UI app tools to ag. An agent that declares
+// them in tools.builtin always has them (an assistant that builds things on
+// request, whatever the wording); other agents get them only when a message
+// matches server.ContainsUIIntent. Returns "declared" or "lazy" for logging.
+func registerUIAppTools(ag *agent.Agent, tools []shuttle.Tool, declared bool) string {
+	if declared {
+		ag.RegisterTools(tools...)
+		return "declared"
+	}
+	ag.RegisterLazyTools(tools, server.ContainsUIIntent)
+	return "lazy"
 }

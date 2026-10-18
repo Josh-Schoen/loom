@@ -516,7 +516,9 @@ func (h *HTTPServer) handleApps(w http.ResponseWriter, r *http.Request) {
 	// "/apps/" -> index, "/apps/data-chart" -> individual app
 	name := strings.TrimPrefix(r.URL.Path, "/apps/")
 	if name == "" {
-		h.handleAppsIndex(w, r)
+		if h.authorizeHTTP(w, r, listUIAppsFullMethod) {
+			h.handleAppsIndex(w, r)
+		}
 		return
 	}
 
@@ -525,8 +527,50 @@ func (h *HTTPServer) handleApps(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Invalid app name", http.StatusBadRequest)
 		return
 	}
-	h.handleAppHTML(w, r, name)
+	if h.authorizeHTTP(w, r, getUIAppFullMethod) {
+		h.handleAppHTML(w, r, name)
+	}
 }
+
+// gRPC method names whose credentials the /apps/ pages require: the same
+// content is available through the gateway as ListUIApps and GetUIApp.
+const (
+	listUIAppsFullMethod = "/loom.v1.LoomService/ListUIApps"
+	getUIAppFullMethod   = "/loom.v1.LoomService/GetUIApp"
+)
+
+// authorizeHTTP runs the server's interceptor chain (authentication, user
+// identity) for a plain HTTP handler, as if the request were fullMethod. On
+// rejection it writes the mapped HTTP error and returns false. With no
+// interceptors configured every request is allowed, as before.
+func (h *HTTPServer) authorizeHTTP(w http.ResponseWriter, r *http.Request, fullMethod string) bool {
+	if h.streamInterceptor == nil {
+		return true
+	}
+	ctx, err := runtime.AnnotateIncomingContext(r.Context(), h.gatewayMux, r, fullMethod)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Invalid request: %v", err), http.StatusBadRequest)
+		return false
+	}
+	err = h.streamInterceptor(nil, &contextOnlyStream{ctx: ctx}, &grpc.StreamServerInfo{FullMethod: fullMethod},
+		func(any, grpc.ServerStream) error { return nil })
+	if err != nil {
+		st, _ := status.FromError(err)
+		http.Error(w, st.Message(), runtime.HTTPStatusFromCode(st.Code()))
+		return false
+	}
+	return true
+}
+
+// contextOnlyStream carries a request context through stream interceptors
+// for handlers that are not streams. Interceptors read only Context; the
+// embedded nil ServerStream is never called.
+type contextOnlyStream struct {
+	grpc.ServerStream
+	ctx context.Context
+}
+
+func (s *contextOnlyStream) Context() context.Context { return s.ctx }
 
 // isValidAppName returns true if the name contains only safe characters
 // (alphanumeric, hyphens, underscores). Rejects path traversal attempts.

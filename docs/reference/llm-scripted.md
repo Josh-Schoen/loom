@@ -49,7 +49,7 @@ rules:                      # tried in order; the first match answers
       tool_offered: device_add_reminder            # tool must be advertised on the call
     call_tool:
       name: device_add_reminder
-      arguments:                                   # values are templates; sent as strings
+      arguments:                                   # any YAML; every string is a template
         title: '{{.Group 1}}'
         due: '{{dateAt 1 9}}'
   - name: reminder-result
@@ -72,7 +72,7 @@ timing:
 | `when.tool_offered` | string | A tool with this name must be advertised on the provider call. |
 | `when.after_tool` | string | The newest message must be this tool's result. |
 | `call_tool.name` | string | Tool to call. |
-| `call_tool.arguments` | map of string templates | Tool arguments; every value is sent as a string. |
+| `call_tool.arguments` | map of any YAML values | Tool arguments. Strings at any depth (including inside lists and maps) are templates and render to strings; numbers, booleans, and null are sent unchanged; lists and maps keep their structure, so tools that take objects (e.g. `create_ui_app`'s `spec`) can be called. |
 | `reply` | string template | Text reply. |
 
 Each rule sets exactly one of `call_tool` and `reply`.

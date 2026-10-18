@@ -189,3 +189,56 @@ func TestLoadFile(t *testing.T) {
 	_, err = LoadFile(filepath.Join(t.TempDir(), "missing.yaml"))
 	assert.Error(t, err)
 }
+
+func TestRespond_StructuredArguments(t *testing.T) {
+	s := mustParse(t, `
+rules:
+  - name: make-page
+    when:
+      user_message: '(?i)plan my (\w+)'
+      tool_offered: create_ui_app
+    call_tool:
+      name: create_ui_app
+      arguments:
+        name: '{{.Group 1}}-plan'
+        overwrite: true
+        spec:
+          version: "1.0"
+          title: 'Plan: {{.Group 1}}'
+          components:
+            - type: stat-cards
+              props:
+                items:
+                  - {label: Days, value: 7}
+            - type: text
+              props: {content: 'For {{.Group 1}}'}
+`)
+	resp := s.Respond([]types.Message{user("Plan my meals")}, offer("create_ui_app"))
+	require.Len(t, resp.ToolCalls, 1)
+	in := resp.ToolCalls[0].Input
+	assert.Equal(t, "meals-plan", in["name"])
+	assert.Equal(t, true, in["overwrite"], "non-string scalars keep their type")
+
+	spec, ok := in["spec"].(map[string]any)
+	require.True(t, ok, "maps stay maps")
+	assert.Equal(t, "Plan: meals", spec["title"], "strings at any depth are templates")
+	components, ok := spec["components"].([]any)
+	require.True(t, ok)
+	require.Len(t, components, 2)
+	items := components[0].(map[string]any)["props"].(map[string]any)["items"].([]any)
+	assert.Equal(t, 7, items[0].(map[string]any)["value"])
+	assert.Equal(t, "For meals", components[1].(map[string]any)["props"].(map[string]any)["content"])
+}
+
+func TestParse_BadTemplateInNestedArgument(t *testing.T) {
+	_, err := Parse([]byte(`
+rules:
+  - call_tool:
+      name: x
+      arguments:
+        spec:
+          items: ['{{.Nope']
+`))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "arguments.spec.items[0]")
+}

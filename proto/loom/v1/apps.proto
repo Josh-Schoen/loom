@@ -8,6 +8,7 @@ syntax = "proto3";
 package loom.v1;
 
 import "google/protobuf/struct.proto";
+import "google/protobuf/timestamp.proto";
 
 option go_package = "github.com/teradata-labs/loom/gen/go/loom/v1;loomv1";
 
@@ -33,6 +34,9 @@ message UIApp {
 
   // Whether the app was dynamically created by an agent (vs embedded)
   bool dynamic = 7;
+
+  // When a dynamic app was last created or updated. Unset for embedded apps.
+  google.protobuf.Timestamp updated_at = 8;
 }
 
 // ListUIAppsRequest lists all available UI apps.

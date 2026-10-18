@@ -83,13 +83,73 @@ type Match struct {
 	AfterTool string `yaml:"after_tool"`
 }
 
-// ToolCallSpec is a scripted tool call. Argument values are templates and
-// are sent as strings.
+// ToolCallSpec is a scripted tool call. Arguments may be any YAML value
+// (strings, numbers, booleans, lists, maps); every string inside, at any
+// depth, is a template. Other scalars are sent unchanged.
 type ToolCallSpec struct {
-	Name      string            `yaml:"name"`
-	Arguments map[string]string `yaml:"arguments"`
+	Name      string         `yaml:"name"`
+	Arguments map[string]any `yaml:"arguments"`
 
-	arguments map[string]*template.Template
+	arguments map[string]argNode
+}
+
+// argNode is a compiled argument value: a template, a list, a map, or a
+// literal scalar.
+type argNode struct {
+	tmpl    *template.Template
+	list    []argNode
+	fields  map[string]argNode
+	literal any
+	kind    argKind
+}
+
+type argKind int
+
+const (
+	argLiteral argKind = iota
+	argTemplate
+	argList
+	argMap
+)
+
+// compileArg parses every string in v as a template.
+func compileArg(name string, v any) (argNode, error) {
+	switch val := v.(type) {
+	case string:
+		t, err := parseTemplate(name, val)
+		if err != nil {
+			return argNode{}, err
+		}
+		return argNode{kind: argTemplate, tmpl: t}, nil
+	case []any:
+		node := argNode{kind: argList, list: make([]argNode, 0, len(val))}
+		for i, item := range val {
+			child, err := compileArg(fmt.Sprintf("%s[%d]", name, i), item)
+			if err != nil {
+				return argNode{}, err
+			}
+			node.list = append(node.list, child)
+		}
+		return node, nil
+	case map[string]any:
+		node := argNode{kind: argMap, fields: make(map[string]argNode, len(val))}
+		for key, item := range val {
+			child, err := compileArg(name+"."+key, item)
+			if err != nil {
+				return argNode{}, err
+			}
+			node.fields[key] = child
+		}
+		return node, nil
+	case map[any]any:
+		converted := make(map[string]any, len(val))
+		for key, item := range val {
+			converted[fmt.Sprint(key)] = item
+		}
+		return compileArg(name, converted)
+	default:
+		return argNode{kind: argLiteral, literal: val}, nil
+	}
 }
 
 // Timing shapes the simulated token stream.
@@ -172,9 +232,9 @@ func (s *Script) compile() error {
 		if r.CallTool.Name == "" {
 			return fmt.Errorf("scripted: %s: call_tool.name is required", label)
 		}
-		r.CallTool.arguments = make(map[string]*template.Template, len(r.CallTool.Arguments))
+		r.CallTool.arguments = make(map[string]argNode, len(r.CallTool.Arguments))
 		for key, value := range r.CallTool.Arguments {
-			if r.CallTool.arguments[key], err = parseTemplate(label+".arguments."+key, value); err != nil {
+			if r.CallTool.arguments[key], err = compileArg(label+".arguments."+key, value); err != nil {
 				return err
 			}
 		}

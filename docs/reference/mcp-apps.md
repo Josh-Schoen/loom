@@ -539,7 +539,17 @@ Exposed by `loom-mcp` bridge to MCP clients (Claude Code, Cursor, etc.):
 
 ### Agent Tools
 
-Registered to all server-side Loom agents via lazy disclosure (tools appear in the active tool set only when the user message contains UI-related keywords like "dashboard", "chart", "visualization", etc.):
+Registered to all server-side Loom agents in one of two ways:
+
+- **Lazy disclosure** (default): the tools appear in the active tool set only when the user message contains UI-related keywords like "dashboard", "chart", "visualization", etc.
+- **Always offered**: an agent whose YAML lists any of these tools under `tools.builtin` (or the flat `tools:` list) has all four from the first turn, whatever the wording. Use this for assistants that build pages on request ("plan my meals for the week"). The startup log shows `mode: declared` or `mode: lazy` per agent.
+
+```yaml
+spec:
+  tools:
+    - create_ui_app
+    - update_ui_app
+```
 
 | Tool | Description |
 |------|-------------|
@@ -549,6 +559,18 @@ Registered to all server-side Loom agents via lazy disclosure (tools appear in t
 | `list_component_types` | Discover available component types and prop schemas |
 
 Agents should call `list_component_types` first to discover the catalog, then use `create_ui_app` with a spec.
+
+## Persistence
+
+`looms serve` stores each dynamic app as `$LOOM_DATA_DIR/apps/<name>.json` (compiled HTML, display name, description, `updated_at`; mode 0600) and loads them at startup, so apps survive restarts. Create, update, and delete write the file before the change is visible; if the write fails, the operation fails and the previous version stays. Unreadable files, files whose `name` does not match the file name, and files beyond the registry limits are skipped (logged) and left in place. Embedded apps are not stored.
+
+`UIApp.updated_at` (`updatedAt` on the gateway) is the last create or update of a dynamic app; unset for embedded apps.
+
+Apps are shared by all users of a server; there is no per-user ownership.
+
+## HTTP Access Control
+
+`/apps/` and `/apps/<name>` run the same authentication and user-identity interceptors as the gateway's `ListUIApps` and `GetUIApp`. With no authentication configured they stay open as before. With `server.auth.enabled` or `server.device_pairing.required`, a request needs `Authorization: Bearer <token>` (`401` otherwise), so a plain browser cannot open them; clients fetch `GET /v1/apps/{name}` (HTML in `content`, base64) with their credentials instead.
 
 ## Security Constraints
 
