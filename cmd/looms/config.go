@@ -1285,6 +1285,7 @@ func setDefaults() {
 	// Default both false to preserve existing behavior.
 	viper.SetDefault("tools.minimal", false)
 	viper.SetDefault("tools.none", false)
+	viper.SetDefault("agents.install_bundled", true)
 	// Check LOOM_YOLO environment variable
 	if os.Getenv("LOOM_YOLO") == "true" || os.Getenv("LOOM_YOLO") == "1" {
 		viper.Set("tools.permissions.yolo", true)

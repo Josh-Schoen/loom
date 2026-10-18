@@ -103,7 +103,8 @@ func init() {
 // toolsMinimalActive reports whether the five always-on auto-injected tools
 // (shell_execute, workspace, tool_search, graph_memory, task_board) should
 // be suppressed. tools.none is a stricter superset that also suppresses
-// communication and UI app tools — it implies tools.minimal semantics here.
+// communication tools, and UI app tools for agents that do not declare them
+// — it implies tools.minimal semantics here.
 func toolsMinimalActive() bool {
 	return viper.GetBool("tools.minimal") || viper.GetBool("tools.none")
 }
@@ -1414,90 +1415,15 @@ func runServe(cmd *cobra.Command, args []string) {
 		logger.Warn("Examples source not found, skipping copy")
 	}
 
-	// Copy default weaver agent to loom data directory (if not exists)
-	agentsDir := filepath.Join(loomDataDir, "agents")
-	weaverDestPath := filepath.Join(agentsDir, "weaver.yaml")
-	if _, err := os.Stat(weaverDestPath); os.IsNotExist(err) {
-		// Ensure agents directory exists
-		if err := os.MkdirAll(agentsDir, 0750); err != nil {
-			logger.Warn("Failed to create agents directory", zap.Error(err))
-		}
-
-		// Get weaver from embedded files
-		weaverData := embedded.GetWeaver()
-		logger.Info("Using embedded weaver.yaml")
-
-		// Write to destination
-		if err := os.WriteFile(weaverDestPath, weaverData, 0600); err != nil {
-			logger.Warn("Failed to copy weaver.yaml to agents directory", zap.Error(err))
-		} else {
-			logger.Info("Weaver agent installed",
-				zap.String("source", "embedded"),
-				zap.String("dest", weaverDestPath),
-				zap.Int("size", len(weaverData)))
-		}
+	// The bundled weaver and guide agents (and weaver's skills) build and
+	// explain agents, with shell access. A server for people who only talk to
+	// their own assistant turns them off with agents.install_bundled: false.
+	if viper.GetBool("agents.install_bundled") {
+		installBundledAgents(loomDataDir, logger)
 	} else {
-		logger.Debug("Weaver agent already exists", zap.String("path", weaverDestPath))
+		logger.Info("Bundled agents (weaver, guide) not installed: agents.install_bundled is false")
 	}
-
-	// Copy default guide agent to loom data directory (if not exists)
-	guideDestPath := filepath.Join(agentsDir, "guide.yaml")
-	if _, err := os.Stat(guideDestPath); os.IsNotExist(err) {
-		// Ensure agents directory exists
-		if err := os.MkdirAll(agentsDir, 0750); err != nil {
-			logger.Warn("Failed to create agents directory", zap.Error(err))
-		}
-
-		// Get guide from embedded files
-		guideData := embedded.GetGuide()
-		logger.Info("Using embedded guide.yaml")
-
-		// Write to destination
-		if err := os.WriteFile(guideDestPath, guideData, 0600); err != nil {
-			logger.Warn("Failed to copy guide.yaml to agents directory", zap.Error(err))
-		} else {
-			logger.Info("Guide agent installed",
-				zap.String("source", "embedded"),
-				zap.String("dest", guideDestPath),
-				zap.Int("size", len(guideData)))
-		}
-	} else {
-		logger.Debug("Guide agent already exists", zap.String("path", guideDestPath))
-	}
-
-	// Deploy bundled weaver skills (if not exists). One block per skill so
-	// users can delete an individual file to opt out without losing the
-	// others.
 	skillsDir := filepath.Join(loomDataDir, "skills")
-	weaverBundledSkills := []struct {
-		name string
-		data []byte
-	}{
-		{name: "weaver-creation.yaml", data: embedded.GetWeaverCreationSkill()},
-		{name: "weaver-presets.yaml", data: embedded.GetWeaverPresetsSkill()},
-		{name: "weaver-templates.yaml", data: embedded.GetWeaverTemplatesSkill()},
-		{name: "weaver-from-scratch.yaml", data: embedded.GetWeaverFromScratchSkill()},
-	}
-	for _, s := range weaverBundledSkills {
-		path := filepath.Join(skillsDir, s.name)
-		if _, err := os.Stat(path); os.IsNotExist(err) {
-			if err := os.MkdirAll(skillsDir, 0750); err != nil {
-				logger.Warn("Failed to create skills directory", zap.Error(err))
-			}
-			if err := os.WriteFile(path, s.data, 0600); err != nil {
-				logger.Warn("Failed to deploy weaver skill",
-					zap.String("name", s.name), zap.Error(err))
-			} else {
-				logger.Info("Weaver skill installed",
-					zap.String("name", s.name),
-					zap.String("dest", path),
-					zap.Int("size", len(s.data)))
-			}
-		} else {
-			logger.Debug("Weaver skill already exists",
-				zap.String("name", s.name), zap.String("path", path))
-		}
-	}
 
 	// Create agent guide in loom data directory (visible to agents)
 	agentGuidePath := filepath.Join(loomDataDir, "START_HERE.md")
@@ -3124,10 +3050,15 @@ func runServe(cmd *cobra.Command, args []string) {
 
 	// Register UI app tools with all loaded agents using lazy disclosure:
 	// tools are only promoted into the active tool set when ContainsUIIntent fires.
-	// tools.none=true skips this for the same reason as communication tools.
-	if appCompiler != nil && uiRegistry != nil && !toolsNoneActive() {
+	// Agents that declare a UI app tool get them from the first turn. Under
+	// tools.none=true only those agents get them: the agent's tool list is
+	// what its YAML declared.
+	if appCompiler != nil && uiRegistry != nil {
 		logger.Info("Registering UI app tools with loaded agents...")
 		for agentID, ag := range agents {
+			if toolsNoneActive() && !uiAppToolsDeclared[agentID] {
+				continue
+			}
 			uiAppTools := server.UIAppTools(appCompiler, uiRegistry)
 			mode := registerUIAppTools(ag, uiAppTools, uiAppToolsDeclared[agentID])
 			logger.Info("  UI app tools registered",
@@ -3135,8 +3066,6 @@ func runServe(cmd *cobra.Command, args []string) {
 				zap.String("mode", mode),
 				zap.Int("num_tools", len(uiAppTools)))
 		}
-	} else if toolsNoneActive() {
-		logger.Info("UI app tools suppressed by tools.none")
 	}
 
 	// Enable reflection if configured
@@ -3458,9 +3387,9 @@ func runServe(cmd *cobra.Command, args []string) {
 			}
 
 			// Register UI app tools for hot-reloaded agents using lazy disclosure
-			if appCompiler != nil && uiRegistry != nil && !toolsNoneActive() {
+			if declared := declaresUIAppTools(agentConfig); appCompiler != nil && uiRegistry != nil && (declared || !toolsNoneActive()) {
 				uiAppTools := server.UIAppTools(appCompiler, uiRegistry)
-				mode := registerUIAppTools(newAgent, uiAppTools, declaresUIAppTools(agentConfig))
+				mode := registerUIAppTools(newAgent, uiAppTools, declared)
 				logger.Info("  UI app tools registered", zap.String("mode", mode), zap.Int("num_tools", len(uiAppTools)))
 			}
 
@@ -4117,4 +4046,94 @@ func registerUIAppTools(ag *agent.Agent, tools []shuttle.Tool, declared bool) st
 	}
 	ag.RegisterLazyTools(tools, server.ContainsUIIntent)
 	return "lazy"
+}
+
+// installBundledAgents copies the embedded weaver and guide agents and the
+// weaver skills into the data directory, each only if it is not there yet,
+// so people can edit or delete them.
+func installBundledAgents(loomDataDir string, logger *zap.Logger) {
+	// Copy default weaver agent to loom data directory (if not exists)
+	agentsDir := filepath.Join(loomDataDir, "agents")
+	weaverDestPath := filepath.Join(agentsDir, "weaver.yaml")
+	if _, err := os.Stat(weaverDestPath); os.IsNotExist(err) {
+		// Ensure agents directory exists
+		if err := os.MkdirAll(agentsDir, 0750); err != nil {
+			logger.Warn("Failed to create agents directory", zap.Error(err))
+		}
+
+		// Get weaver from embedded files
+		weaverData := embedded.GetWeaver()
+		logger.Info("Using embedded weaver.yaml")
+
+		// Write to destination
+		if err := os.WriteFile(weaverDestPath, weaverData, 0600); err != nil {
+			logger.Warn("Failed to copy weaver.yaml to agents directory", zap.Error(err))
+		} else {
+			logger.Info("Weaver agent installed",
+				zap.String("source", "embedded"),
+				zap.String("dest", weaverDestPath),
+				zap.Int("size", len(weaverData)))
+		}
+	} else {
+		logger.Debug("Weaver agent already exists", zap.String("path", weaverDestPath))
+	}
+
+	// Copy default guide agent to loom data directory (if not exists)
+	guideDestPath := filepath.Join(agentsDir, "guide.yaml")
+	if _, err := os.Stat(guideDestPath); os.IsNotExist(err) {
+		// Ensure agents directory exists
+		if err := os.MkdirAll(agentsDir, 0750); err != nil {
+			logger.Warn("Failed to create agents directory", zap.Error(err))
+		}
+
+		// Get guide from embedded files
+		guideData := embedded.GetGuide()
+		logger.Info("Using embedded guide.yaml")
+
+		// Write to destination
+		if err := os.WriteFile(guideDestPath, guideData, 0600); err != nil {
+			logger.Warn("Failed to copy guide.yaml to agents directory", zap.Error(err))
+		} else {
+			logger.Info("Guide agent installed",
+				zap.String("source", "embedded"),
+				zap.String("dest", guideDestPath),
+				zap.Int("size", len(guideData)))
+		}
+	} else {
+		logger.Debug("Guide agent already exists", zap.String("path", guideDestPath))
+	}
+
+	// Deploy bundled weaver skills (if not exists). One block per skill so
+	// users can delete an individual file to opt out without losing the
+	// others.
+	skillsDir := filepath.Join(loomDataDir, "skills")
+	weaverBundledSkills := []struct {
+		name string
+		data []byte
+	}{
+		{name: "weaver-creation.yaml", data: embedded.GetWeaverCreationSkill()},
+		{name: "weaver-presets.yaml", data: embedded.GetWeaverPresetsSkill()},
+		{name: "weaver-templates.yaml", data: embedded.GetWeaverTemplatesSkill()},
+		{name: "weaver-from-scratch.yaml", data: embedded.GetWeaverFromScratchSkill()},
+	}
+	for _, s := range weaverBundledSkills {
+		path := filepath.Join(skillsDir, s.name)
+		if _, err := os.Stat(path); os.IsNotExist(err) {
+			if err := os.MkdirAll(skillsDir, 0750); err != nil {
+				logger.Warn("Failed to create skills directory", zap.Error(err))
+			}
+			if err := os.WriteFile(path, s.data, 0600); err != nil {
+				logger.Warn("Failed to deploy weaver skill",
+					zap.String("name", s.name), zap.Error(err))
+			} else {
+				logger.Info("Weaver skill installed",
+					zap.String("name", s.name),
+					zap.String("dest", path),
+					zap.Int("size", len(s.data)))
+			}
+		} else {
+			logger.Debug("Weaver skill already exists",
+				zap.String("name", s.name), zap.String("path", path))
+		}
+	}
 }

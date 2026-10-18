@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`tools.none` keeps declared UI app tools** — under `tools.none: true`, an agent that lists a UI app tool in its YAML now gets the UI app tools (always offered); previously `tools.none` removed them from every agent, contradicting "the agent's tool list is what its YAML declares". Agents that do not declare them still get none.
+- **`agents.install_bundled`** (default `true`) — `false` stops `looms serve` from installing the bundled `weaver` and `guide` agents and weaver skills, for servers whose users should only reach their own assistant (no shell access, no agent creation). With `tools.none: true`, a personal-assistant server exposes only the tools its agents declare.
+
 - **UI apps belong to the user who created them** — dynamic apps now have an owner, the caller's user ID (for agent tools, the user who sent the message). `ListUIApps`, `GetUIApp`, `UpdateUIApp`, `DeleteUIApp`, `SetUIAppChecklistItem`, `/apps/`, and the UI app agent tools see the shared embedded apps and the caller's own apps only; another user's app answers as not found. Two users can each have an app with the same name, and the 100-app / 50 MB limits apply per user. Previously every user of a server saw and could change every app. Apps stored before this belong to `default-user` and stay where they are; other users' apps are stored under `$LOOM_DATA_DIR/apps/users/<key>/`. The MCP resource view (`loom-mcp`) has no user identity and shows `default-user`'s apps. Separation is enforced only when identity is (`server.auth.enabled` or `server.device_pairing.required`); otherwise the user ID is a header any caller can set. Go API: `server.AppProvider`, `server.AppSpecProvider`, `server.AppHTMLProvider`, and the matching `apps.UIResourceRegistry` methods take an owner argument. Reference: `docs/reference/mcp-apps.md#ownership`.
 
 ### Fixed

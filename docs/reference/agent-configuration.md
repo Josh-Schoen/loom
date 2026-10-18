@@ -343,7 +343,9 @@ spec:
 | **Progressively disclosed** (registered dynamically after triggering conditions) | `get_error_details` (after first error), `conversation_memory` (after first L2 swap), `session_memory` (after 3+ sessions), `query_tool_result` (after first large result or first tool result returned by reference) |
 | **Workflow-injected** (auto-added for workflow agents) | `send_message`, `publish`, `shared_memory_read`, `shared_memory_write`, `top_n_query`, `group_by_query` |
 
-The server's tool policy withholds some of these from the model while their subsystems keep running: `tools.minimal` suppresses `graph_memory` and `task_board`; `tools.none` additionally suppresses `conversation_memory`, `session_memory`, `get_error_details`, `query_tool_result`, the workflow-injected tools, and `manage_ephemeral_agents`. `manage_skills` and `load_pattern` are not suppressed by either policy.
+The server's tool policy withholds some of these from the model while their subsystems keep running: `tools.minimal` suppresses `graph_memory` and `task_board`; `tools.none` additionally suppresses `conversation_memory`, `session_memory`, `get_error_details`, `query_tool_result`, the workflow-injected tools, and `manage_ephemeral_agents`. `manage_skills` and `load_pattern` are not suppressed by either policy. Under `tools.none`, `shell_execute` and `workspace` are not auto-registered, communication tools are not registered, and UI app tools are registered only for agents that declare one in their YAML tools (then always offered); the agent's tool list is what its YAML declares.
+
+`agents.install_bundled` (server config, default `true`): when `false`, `looms serve` does not copy the bundled `weaver` and `guide` agents and the weaver skills into `$LOOM_DATA_DIR`. Copies already there are not removed. Use it with `tools.none: true` for a server whose users only talk to their own assistant (for example a personal assistant reached from paired phones), so no agent on it can run shell commands or create agents.
 
 #### manage_skills
 
