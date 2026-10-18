@@ -58,7 +58,7 @@ Command reference for `loom` (client) and `looms` (server).
 | `looms config delete-key` | Delete secret from keyring | `<key-name>` |
 | `looms config list-keys` | List available secret keys | |
 | `looms pair` | Show a QR code that pairs a device | `--ttl`, `--user`, `--link-only`, `--server` |
-| `looms devices list` | List paired devices | `--server` |
+| `looms devices list` | List paired devices | `--server`, `--json` |
 | `looms devices revoke` | Revoke a paired device | `<device-id>`, `--server` |
 | `looms hitl list` | List pending HITL requests | `--session`, `--agent`, `--db` |
 | `looms hitl show` | Show HITL request details | `<request-id>`, `--db` |
@@ -411,6 +411,13 @@ looms devices list
 
 looms devices revoke dev_c4f44b6ed2ae5c23
 # Revoked dev_c4f44b6ed2ae5c23 (Test iPhone). It can no longer connect.
+```
+
+`--json` prints the list as `loom.v1.ListDevicesResponse` in protojson (every field present):
+
+```bash
+looms devices list --json
+# {"devices":[{"id":"dev_c4f44b6ed2ae5c23","name":"Test iPhone","platform":"ios","userId":"default-user","createdAt":"2026-10-18T02:48:10Z","lastSeenAt":"2026-10-18T02:48:10Z","revokedAt":null}]}
 ```
 
 ### looms pattern

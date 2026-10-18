@@ -31,6 +31,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/encoding/protojson"
 	"rsc.io/qr"
 
 	loomv1 "github.com/teradata-labs/loom/gen/go/loom/v1"
@@ -48,6 +49,7 @@ var (
 	pairUser     string
 	pairTTL      time.Duration
 	pairLinkOnly bool
+	devicesJSON  bool
 )
 
 var pairCmd = &cobra.Command{
@@ -93,6 +95,7 @@ func init() {
 	pairCmd.Flags().StringVar(&pairUser, "user", "", "User the device acts as (default: the server's default user)")
 	pairCmd.Flags().DurationVar(&pairTTL, "ttl", 0, "How long the code works (default and maximum: server.device_pairing.code_ttl_seconds)")
 	pairCmd.Flags().BoolVar(&pairLinkOnly, "link-only", false, "Print only the pairing link (for scripts)")
+	devicesListCmd.Flags().BoolVar(&devicesJSON, "json", false, "Print the devices as JSON (loom.v1.ListDevicesResponse), for scripts and apps")
 }
 
 // deviceClient connects to the DeviceService with the admin token attached.
@@ -180,8 +183,22 @@ func runDevicesList(cmd *cobra.Command, _ []string) error {
 	if err != nil {
 		return explainDeviceError(err)
 	}
+	if devicesJSON {
+		return printDevicesJSON(cmd.OutOrStdout(), resp)
+	}
 	printDevices(cmd.OutOrStdout(), resp.GetDevices())
 	return nil
+}
+
+// printDevicesJSON writes resp as protojson (lowerCamelCase fields, as on the
+// HTTP gateway), so other programs can read the list without parsing the table.
+func printDevicesJSON(w io.Writer, resp *loomv1.ListDevicesResponse) error {
+	data, err := protojson.MarshalOptions{EmitUnpopulated: true}.Marshal(resp)
+	if err != nil {
+		return err
+	}
+	_, err = fmt.Fprintln(w, string(data))
+	return err
 }
 
 func printDevices(w io.Writer, list []*loomv1.Device) {

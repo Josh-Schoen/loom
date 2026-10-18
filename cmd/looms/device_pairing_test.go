@@ -16,8 +16,10 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -115,4 +117,31 @@ func TestPrintDevices(t *testing.T) {
 	assert.Contains(t, out, "dev_1")
 	assert.Contains(t, out, "active")
 	assert.Contains(t, out, "revoked")
+}
+
+func TestPrintDevicesJSON(t *testing.T) {
+	var buf bytes.Buffer
+	created := timestamppb.New(time.Date(2026, 10, 18, 14, 0, 0, 0, time.UTC))
+	require.NoError(t, printDevicesJSON(&buf, &loomv1.ListDevicesResponse{Devices: []*loomv1.Device{
+		{Id: "dev_1", Name: "Alice's iPhone", Platform: "ios", UserId: "alice", CreatedAt: created, LastSeenAt: created},
+	}}))
+	var out struct {
+		Devices []struct {
+			ID         string `json:"id"`
+			Name       string `json:"name"`
+			UserID     string `json:"userId"`
+			CreatedAt  string `json:"createdAt"`
+			LastSeenAt string `json:"lastSeenAt"`
+		} `json:"devices"`
+	}
+	require.NoError(t, json.Unmarshal(buf.Bytes(), &out))
+	require.Len(t, out.Devices, 1)
+	assert.Equal(t, "dev_1", out.Devices[0].ID)
+	assert.Equal(t, "Alice's iPhone", out.Devices[0].Name)
+	assert.Equal(t, "alice", out.Devices[0].UserID)
+	assert.Equal(t, "2026-10-18T14:00:00Z", out.Devices[0].CreatedAt)
+
+	buf.Reset()
+	require.NoError(t, printDevicesJSON(&buf, &loomv1.ListDevicesResponse{}))
+	assert.JSONEq(t, `{"devices":[]}`, buf.String())
 }

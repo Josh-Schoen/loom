@@ -67,6 +67,7 @@ port in plaintext.
 | `looms pair --ttl 5m` | Shorter lifetime (capped at `code_ttl_seconds`). |
 | `looms pair --user alice` | Device acts as `alice` (default: the server's default user). Pages the assistant makes for `alice` are hers alone; see `mcp-apps.md#ownership`. |
 | `looms devices list` | Paired devices with status (`active` / `revoked`). |
+| `looms devices list --json` | The same as JSON: `loom.v1.ListDevicesResponse` in protojson (lowerCamelCase, every field present; `revokedAt` is `null` for active devices), for scripts and setup apps. |
 | `looms devices revoke <device-id>` | Disable a device token permanently. |
 
 Common flag: `--server` (default `localhost:60051`).
