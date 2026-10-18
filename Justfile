@@ -82,6 +82,14 @@ test-e2e-storage-up:
 test-e2e-storage-down:
     docker compose -f test/e2e/docker-compose.yml down -v
 
+# Run the PostgreSQL store's integration tests (pkg/storage/postgres) against
+# the e2e PostgreSQL container (started first). The connection must be a
+# superuser: the RLS tests create their own restricted roles and switch to them.
+test-postgres:
+    just test-e2e-storage-up
+    TEST_POSTGRES_URL="postgres://loom_test:loom_test_pass@localhost:5433/loom_test?sslmode=disable" \
+        GOWORK=off go test -tags "fts5 integration" -race -count=1 -p 1 ./pkg/storage/postgres/...
+
 # Run e2e storage tests against the running server (sqlite or postgres)
 test-e2e-storage backend="sqlite":
     LOOM_E2E_BACKEND={{backend}} \
