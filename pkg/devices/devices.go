@@ -124,6 +124,13 @@ func (m *Manager) CreateCode(userID string, ttl time.Duration) (string, time.Tim
 	if userID == "" {
 		return "", time.Time{}, errors.New("user id is required")
 	}
+	// As for user IDs in request headers: no control characters (reserved,
+	// e.g. for the shared UI apps' owner).
+	for i := 0; i < len(userID); i++ {
+		if userID[i] < 0x20 {
+			return "", time.Time{}, errors.New("user id must not contain control characters")
+		}
+	}
 	if ttl <= 0 {
 		return "", time.Time{}, errors.New("ttl must be positive")
 	}

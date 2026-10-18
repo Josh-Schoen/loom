@@ -106,6 +106,8 @@ func TestCreateCodeValidation(t *testing.T) {
 	assert.Error(t, err)
 	_, _, err = m.CreateCode("u", 0)
 	assert.Error(t, err)
+	_, _, err = m.CreateCode("\x01shared", time.Minute)
+	assert.Error(t, err, "control characters are reserved")
 }
 
 func TestRevokeDisablesToken(t *testing.T) {

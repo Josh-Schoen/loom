@@ -794,6 +794,46 @@
         ]
       }
     },
+    "/v1/apps/{name}:set-sharing": {
+      "post": {
+        "summary": "SetUIAppSharing shares one of the caller's dynamic apps with everyone on\nthe server (UIApp.shared), or stops sharing one the caller shared.\nFAILED_PRECONDITION when another user's own app has the same name, or\nwhen someone else shared it; NOT_FOUND when the caller sees no such app.",
+        "operationId": "LoomService_SetUIAppSharing",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/v1SetUIAppSharingResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "name",
+            "description": "App name",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/LoomServiceSetUIAppSharingBody"
+            }
+          }
+        ],
+        "tags": [
+          "LoomService"
+        ]
+      }
+    },
     "/v1/artifacts": {
       "get": {
         "summary": "ListArtifacts lists artifacts with optional filtering.",
@@ -3734,6 +3774,16 @@
       },
       "description": "SetUIAppChecklistItemRequest ticks or unticks one checklist item."
     },
+    "LoomServiceSetUIAppSharingBody": {
+      "type": "object",
+      "properties": {
+        "shared": {
+          "type": "boolean",
+          "title": "true to share, false to make it the caller's own again"
+        }
+      },
+      "description": "SetUIAppSharingRequest shares one of the caller's apps with everyone on\nthe server, or stops sharing one the caller shared."
+    },
     "LoomServiceStartAgentBody": {
       "type": "object",
       "description": "StartAgentRequest starts an agent."
@@ -5076,6 +5126,10 @@
         "overwrite": {
           "type": "boolean",
           "title": "Overwrite an existing dynamic app with the same name"
+        },
+        "shared": {
+          "type": "boolean",
+          "description": "Create it as a shared app (see UIApp.shared). A shared app's name cannot\nbe used by any user's own app: FAILED_PRECONDITION when it is."
         }
       },
       "description": "CreateUIAppRequest creates a new dynamic MCP UI app from a declarative spec."
@@ -8726,6 +8780,15 @@
       },
       "description": "SetUIAppChecklistItemResponse returns the updated app."
     },
+    "v1SetUIAppSharingResponse": {
+      "type": "object",
+      "properties": {
+        "app": {
+          "$ref": "#/definitions/v1UIApp"
+        }
+      },
+      "description": "SetUIAppSharingResponse returns the app after the change."
+    },
     "v1SharedMemoryNamespace": {
       "type": "string",
       "enum": [
@@ -10204,6 +10267,14 @@
           "type": "string",
           "format": "date-time",
           "description": "When a dynamic app was last created or updated. Unset for embedded apps."
+        },
+        "shared": {
+          "type": "boolean",
+          "description": "A shared app: everyone on the server sees it and can change it (a\nhousehold's grocery list). Other dynamic apps belong to one user."
+        },
+        "sharedBy": {
+          "type": "string",
+          "description": "For shared apps: the user ID of the person who shared it. Only they can\ndelete it or stop sharing it."
         }
       },
       "description": "UIApp represents an interactive HTML application exposed by the MCP server."

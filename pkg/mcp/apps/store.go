@@ -51,7 +51,8 @@ type storedApp struct {
 	HTML        string          `json:"html"`
 	UpdatedAt   time.Time       `json:"updated_at"`
 	Spec        json.RawMessage `json:"spec,omitempty"`
-	Owner       string          `json:"owner,omitempty"` // empty means DefaultOwner
+	Owner       string          `json:"owner,omitempty"`     // empty means DefaultOwner
+	SharedBy    string          `json:"shared_by,omitempty"` // shared apps: the user who shared it
 
 	file string // path relative to the store directory, set by loadAll
 }
@@ -100,6 +101,7 @@ func (s *fileStore) save(res *UIResource) error {
 		HTML:        string(res.HTML),
 		UpdatedAt:   res.UpdatedAt,
 		Spec:        json.RawMessage(res.Spec),
+		SharedBy:    res.SharedBy,
 	}
 	if owner != DefaultOwner {
 		stored.Owner = owner

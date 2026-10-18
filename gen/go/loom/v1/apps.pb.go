@@ -46,7 +46,13 @@ type UIApp struct {
 	// Whether the app was dynamically created by an agent (vs embedded)
 	Dynamic bool `protobuf:"varint,7,opt,name=dynamic,proto3" json:"dynamic,omitempty"`
 	// When a dynamic app was last created or updated. Unset for embedded apps.
-	UpdatedAt     *timestamppb.Timestamp `protobuf:"bytes,8,opt,name=updated_at,json=updatedAt,proto3" json:"updated_at,omitempty"`
+	UpdatedAt *timestamppb.Timestamp `protobuf:"bytes,8,opt,name=updated_at,json=updatedAt,proto3" json:"updated_at,omitempty"`
+	// A shared app: everyone on the server sees it and can change it (a
+	// household's grocery list). Other dynamic apps belong to one user.
+	Shared bool `protobuf:"varint,9,opt,name=shared,proto3" json:"shared,omitempty"`
+	// For shared apps: the user ID of the person who shared it. Only they can
+	// delete it or stop sharing it.
+	SharedBy      string `protobuf:"bytes,10,opt,name=shared_by,json=sharedBy,proto3" json:"shared_by,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -135,6 +141,20 @@ func (x *UIApp) GetUpdatedAt() *timestamppb.Timestamp {
 		return x.UpdatedAt
 	}
 	return nil
+}
+
+func (x *UIApp) GetShared() bool {
+	if x != nil {
+		return x.Shared
+	}
+	return false
+}
+
+func (x *UIApp) GetSharedBy() string {
+	if x != nil {
+		return x.SharedBy
+	}
+	return ""
 }
 
 // ListUIAppsRequest lists all available UI apps.
@@ -519,7 +539,10 @@ type CreateUIAppRequest struct {
 	// Declarative app specification
 	Spec *UIAppSpec `protobuf:"bytes,4,opt,name=spec,proto3" json:"spec,omitempty"`
 	// Overwrite an existing dynamic app with the same name
-	Overwrite     bool `protobuf:"varint,5,opt,name=overwrite,proto3" json:"overwrite,omitempty"`
+	Overwrite bool `protobuf:"varint,5,opt,name=overwrite,proto3" json:"overwrite,omitempty"`
+	// Create it as a shared app (see UIApp.shared). A shared app's name cannot
+	// be used by any user's own app: FAILED_PRECONDITION when it is.
+	Shared        bool `protobuf:"varint,6,opt,name=shared,proto3" json:"shared,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -585,6 +608,13 @@ func (x *CreateUIAppRequest) GetSpec() *UIAppSpec {
 func (x *CreateUIAppRequest) GetOverwrite() bool {
 	if x != nil {
 		return x.Overwrite
+	}
+	return false
+}
+
+func (x *CreateUIAppRequest) GetShared() bool {
+	if x != nil {
+		return x.Shared
 	}
 	return false
 }
@@ -991,6 +1021,107 @@ func (x *SetUIAppChecklistItemResponse) GetApp() *UIApp {
 	return nil
 }
 
+// SetUIAppSharingRequest shares one of the caller's apps with everyone on
+// the server, or stops sharing one the caller shared.
+type SetUIAppSharingRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// App name
+	Name string `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
+	// true to share, false to make it the caller's own again
+	Shared        bool `protobuf:"varint,2,opt,name=shared,proto3" json:"shared,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SetUIAppSharingRequest) Reset() {
+	*x = SetUIAppSharingRequest{}
+	mi := &file_loom_v1_apps_proto_msgTypes[15]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SetUIAppSharingRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SetUIAppSharingRequest) ProtoMessage() {}
+
+func (x *SetUIAppSharingRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_loom_v1_apps_proto_msgTypes[15]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SetUIAppSharingRequest.ProtoReflect.Descriptor instead.
+func (*SetUIAppSharingRequest) Descriptor() ([]byte, []int) {
+	return file_loom_v1_apps_proto_rawDescGZIP(), []int{15}
+}
+
+func (x *SetUIAppSharingRequest) GetName() string {
+	if x != nil {
+		return x.Name
+	}
+	return ""
+}
+
+func (x *SetUIAppSharingRequest) GetShared() bool {
+	if x != nil {
+		return x.Shared
+	}
+	return false
+}
+
+// SetUIAppSharingResponse returns the app after the change.
+type SetUIAppSharingResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	App           *UIApp                 `protobuf:"bytes,1,opt,name=app,proto3" json:"app,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SetUIAppSharingResponse) Reset() {
+	*x = SetUIAppSharingResponse{}
+	mi := &file_loom_v1_apps_proto_msgTypes[16]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SetUIAppSharingResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SetUIAppSharingResponse) ProtoMessage() {}
+
+func (x *SetUIAppSharingResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_loom_v1_apps_proto_msgTypes[16]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SetUIAppSharingResponse.ProtoReflect.Descriptor instead.
+func (*SetUIAppSharingResponse) Descriptor() ([]byte, []int) {
+	return file_loom_v1_apps_proto_rawDescGZIP(), []int{16}
+}
+
+func (x *SetUIAppSharingResponse) GetApp() *UIApp {
+	if x != nil {
+		return x.App
+	}
+	return nil
+}
+
 // ListComponentTypesRequest requests the catalog of available component types.
 type ListComponentTypesRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
@@ -1000,7 +1131,7 @@ type ListComponentTypesRequest struct {
 
 func (x *ListComponentTypesRequest) Reset() {
 	*x = ListComponentTypesRequest{}
-	mi := &file_loom_v1_apps_proto_msgTypes[15]
+	mi := &file_loom_v1_apps_proto_msgTypes[17]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1012,7 +1143,7 @@ func (x *ListComponentTypesRequest) String() string {
 func (*ListComponentTypesRequest) ProtoMessage() {}
 
 func (x *ListComponentTypesRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_loom_v1_apps_proto_msgTypes[15]
+	mi := &file_loom_v1_apps_proto_msgTypes[17]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1025,7 +1156,7 @@ func (x *ListComponentTypesRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListComponentTypesRequest.ProtoReflect.Descriptor instead.
 func (*ListComponentTypesRequest) Descriptor() ([]byte, []int) {
-	return file_loom_v1_apps_proto_rawDescGZIP(), []int{15}
+	return file_loom_v1_apps_proto_rawDescGZIP(), []int{17}
 }
 
 // ComponentType describes a single component type in the catalog.
@@ -1047,7 +1178,7 @@ type ComponentType struct {
 
 func (x *ComponentType) Reset() {
 	*x = ComponentType{}
-	mi := &file_loom_v1_apps_proto_msgTypes[16]
+	mi := &file_loom_v1_apps_proto_msgTypes[18]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1059,7 +1190,7 @@ func (x *ComponentType) String() string {
 func (*ComponentType) ProtoMessage() {}
 
 func (x *ComponentType) ProtoReflect() protoreflect.Message {
-	mi := &file_loom_v1_apps_proto_msgTypes[16]
+	mi := &file_loom_v1_apps_proto_msgTypes[18]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1072,7 +1203,7 @@ func (x *ComponentType) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ComponentType.ProtoReflect.Descriptor instead.
 func (*ComponentType) Descriptor() ([]byte, []int) {
-	return file_loom_v1_apps_proto_rawDescGZIP(), []int{16}
+	return file_loom_v1_apps_proto_rawDescGZIP(), []int{18}
 }
 
 func (x *ComponentType) GetType() string {
@@ -1121,7 +1252,7 @@ type ListComponentTypesResponse struct {
 
 func (x *ListComponentTypesResponse) Reset() {
 	*x = ListComponentTypesResponse{}
-	mi := &file_loom_v1_apps_proto_msgTypes[17]
+	mi := &file_loom_v1_apps_proto_msgTypes[19]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1133,7 +1264,7 @@ func (x *ListComponentTypesResponse) String() string {
 func (*ListComponentTypesResponse) ProtoMessage() {}
 
 func (x *ListComponentTypesResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_loom_v1_apps_proto_msgTypes[17]
+	mi := &file_loom_v1_apps_proto_msgTypes[19]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1146,7 +1277,7 @@ func (x *ListComponentTypesResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListComponentTypesResponse.ProtoReflect.Descriptor instead.
 func (*ListComponentTypesResponse) Descriptor() ([]byte, []int) {
-	return file_loom_v1_apps_proto_rawDescGZIP(), []int{17}
+	return file_loom_v1_apps_proto_rawDescGZIP(), []int{19}
 }
 
 func (x *ListComponentTypesResponse) GetTypes() []*ComponentType {
@@ -1160,7 +1291,7 @@ var File_loom_v1_apps_proto protoreflect.FileDescriptor
 
 const file_loom_v1_apps_proto_rawDesc = "" +
 	"\n" +
-	"\x12loom/v1/apps.proto\x12\aloom.v1\x1a\x1cgoogle/protobuf/struct.proto\x1a\x1fgoogle/protobuf/timestamp.proto\"\x8b\x02\n" +
+	"\x12loom/v1/apps.proto\x12\aloom.v1\x1a\x1cgoogle/protobuf/struct.proto\x1a\x1fgoogle/protobuf/timestamp.proto\"\xc0\x02\n" +
 	"\x05UIApp\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x10\n" +
 	"\x03uri\x18\x02 \x01(\tR\x03uri\x12!\n" +
@@ -1170,7 +1301,10 @@ const file_loom_v1_apps_proto_rawDesc = "" +
 	"\x0eprefers_border\x18\x06 \x01(\bR\rprefersBorder\x12\x18\n" +
 	"\adynamic\x18\a \x01(\bR\adynamic\x129\n" +
 	"\n" +
-	"updated_at\x18\b \x01(\v2\x1a.google.protobuf.TimestampR\tupdatedAt\"\x13\n" +
+	"updated_at\x18\b \x01(\v2\x1a.google.protobuf.TimestampR\tupdatedAt\x12\x16\n" +
+	"\x06shared\x18\t \x01(\bR\x06shared\x12\x1b\n" +
+	"\tshared_by\x18\n" +
+	" \x01(\tR\bsharedBy\"\x13\n" +
 	"\x11ListUIAppsRequest\"Y\n" +
 	"\x12ListUIAppsResponse\x12\"\n" +
 	"\x04apps\x18\x01 \x03(\v2\x0e.loom.v1.UIAppR\x04apps\x12\x1f\n" +
@@ -1195,13 +1329,14 @@ const file_loom_v1_apps_proto_rawDesc = "" +
 	"\x04type\x18\x01 \x01(\tR\x04type\x12-\n" +
 	"\x05props\x18\x02 \x01(\v2\x17.google.protobuf.StructR\x05props\x120\n" +
 	"\bchildren\x18\x03 \x03(\v2\x14.loom.v1.UIComponentR\bchildren\x12\x0e\n" +
-	"\x02id\x18\x04 \x01(\tR\x02id\"\xb3\x01\n" +
+	"\x02id\x18\x04 \x01(\tR\x02id\"\xcb\x01\n" +
 	"\x12CreateUIAppRequest\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12!\n" +
 	"\fdisplay_name\x18\x02 \x01(\tR\vdisplayName\x12 \n" +
 	"\vdescription\x18\x03 \x01(\tR\vdescription\x12&\n" +
 	"\x04spec\x18\x04 \x01(\v2\x12.loom.v1.UIAppSpecR\x04spec\x12\x1c\n" +
-	"\toverwrite\x18\x05 \x01(\bR\toverwrite\"s\n" +
+	"\toverwrite\x18\x05 \x01(\bR\toverwrite\x12\x16\n" +
+	"\x06shared\x18\x06 \x01(\bR\x06shared\"s\n" +
 	"\x13CreateUIAppResponse\x12 \n" +
 	"\x03app\x18\x01 \x01(\v2\x0e.loom.v1.UIAppR\x03app\x12\x18\n" +
 	"\acontent\x18\x02 \x01(\fR\acontent\x12 \n" +
@@ -1224,6 +1359,11 @@ const file_loom_v1_apps_proto_rawDesc = "" +
 	"\aitem_id\x18\x03 \x01(\tR\x06itemId\x12\x18\n" +
 	"\achecked\x18\x04 \x01(\bR\achecked\"A\n" +
 	"\x1dSetUIAppChecklistItemResponse\x12 \n" +
+	"\x03app\x18\x01 \x01(\v2\x0e.loom.v1.UIAppR\x03app\"D\n" +
+	"\x16SetUIAppSharingRequest\x12\x12\n" +
+	"\x04name\x18\x01 \x01(\tR\x04name\x12\x16\n" +
+	"\x06shared\x18\x02 \x01(\bR\x06shared\";\n" +
+	"\x17SetUIAppSharingResponse\x12 \n" +
 	"\x03app\x18\x01 \x01(\v2\x0e.loom.v1.UIAppR\x03app\"\x1b\n" +
 	"\x19ListComponentTypesRequest\"\xc0\x01\n" +
 	"\rComponentType\x12\x12\n" +
@@ -1247,7 +1387,7 @@ func file_loom_v1_apps_proto_rawDescGZIP() []byte {
 	return file_loom_v1_apps_proto_rawDescData
 }
 
-var file_loom_v1_apps_proto_msgTypes = make([]protoimpl.MessageInfo, 18)
+var file_loom_v1_apps_proto_msgTypes = make([]protoimpl.MessageInfo, 20)
 var file_loom_v1_apps_proto_goTypes = []any{
 	(*UIApp)(nil),                         // 0: loom.v1.UIApp
 	(*ListUIAppsRequest)(nil),             // 1: loom.v1.ListUIAppsRequest
@@ -1264,31 +1404,34 @@ var file_loom_v1_apps_proto_goTypes = []any{
 	(*DeleteUIAppResponse)(nil),           // 12: loom.v1.DeleteUIAppResponse
 	(*SetUIAppChecklistItemRequest)(nil),  // 13: loom.v1.SetUIAppChecklistItemRequest
 	(*SetUIAppChecklistItemResponse)(nil), // 14: loom.v1.SetUIAppChecklistItemResponse
-	(*ListComponentTypesRequest)(nil),     // 15: loom.v1.ListComponentTypesRequest
-	(*ComponentType)(nil),                 // 16: loom.v1.ComponentType
-	(*ListComponentTypesResponse)(nil),    // 17: loom.v1.ListComponentTypesResponse
-	(*timestamppb.Timestamp)(nil),         // 18: google.protobuf.Timestamp
-	(*structpb.Struct)(nil),               // 19: google.protobuf.Struct
+	(*SetUIAppSharingRequest)(nil),        // 15: loom.v1.SetUIAppSharingRequest
+	(*SetUIAppSharingResponse)(nil),       // 16: loom.v1.SetUIAppSharingResponse
+	(*ListComponentTypesRequest)(nil),     // 17: loom.v1.ListComponentTypesRequest
+	(*ComponentType)(nil),                 // 18: loom.v1.ComponentType
+	(*ListComponentTypesResponse)(nil),    // 19: loom.v1.ListComponentTypesResponse
+	(*timestamppb.Timestamp)(nil),         // 20: google.protobuf.Timestamp
+	(*structpb.Struct)(nil),               // 21: google.protobuf.Struct
 }
 var file_loom_v1_apps_proto_depIdxs = []int32{
-	18, // 0: loom.v1.UIApp.updated_at:type_name -> google.protobuf.Timestamp
+	20, // 0: loom.v1.UIApp.updated_at:type_name -> google.protobuf.Timestamp
 	0,  // 1: loom.v1.ListUIAppsResponse.apps:type_name -> loom.v1.UIApp
 	0,  // 2: loom.v1.GetUIAppResponse.app:type_name -> loom.v1.UIApp
 	6,  // 3: loom.v1.UIAppSpec.components:type_name -> loom.v1.UIComponent
-	19, // 4: loom.v1.UIComponent.props:type_name -> google.protobuf.Struct
+	21, // 4: loom.v1.UIComponent.props:type_name -> google.protobuf.Struct
 	6,  // 5: loom.v1.UIComponent.children:type_name -> loom.v1.UIComponent
 	5,  // 6: loom.v1.CreateUIAppRequest.spec:type_name -> loom.v1.UIAppSpec
 	0,  // 7: loom.v1.CreateUIAppResponse.app:type_name -> loom.v1.UIApp
 	5,  // 8: loom.v1.UpdateUIAppRequest.spec:type_name -> loom.v1.UIAppSpec
 	0,  // 9: loom.v1.UpdateUIAppResponse.app:type_name -> loom.v1.UIApp
 	0,  // 10: loom.v1.SetUIAppChecklistItemResponse.app:type_name -> loom.v1.UIApp
-	19, // 11: loom.v1.ComponentType.props_schema:type_name -> google.protobuf.Struct
-	16, // 12: loom.v1.ListComponentTypesResponse.types:type_name -> loom.v1.ComponentType
-	13, // [13:13] is the sub-list for method output_type
-	13, // [13:13] is the sub-list for method input_type
-	13, // [13:13] is the sub-list for extension type_name
-	13, // [13:13] is the sub-list for extension extendee
-	0,  // [0:13] is the sub-list for field type_name
+	0,  // 11: loom.v1.SetUIAppSharingResponse.app:type_name -> loom.v1.UIApp
+	21, // 12: loom.v1.ComponentType.props_schema:type_name -> google.protobuf.Struct
+	18, // 13: loom.v1.ListComponentTypesResponse.types:type_name -> loom.v1.ComponentType
+	14, // [14:14] is the sub-list for method output_type
+	14, // [14:14] is the sub-list for method input_type
+	14, // [14:14] is the sub-list for extension type_name
+	14, // [14:14] is the sub-list for extension extendee
+	0,  // [0:14] is the sub-list for field type_name
 }
 
 func init() { file_loom_v1_apps_proto_init() }
@@ -1302,7 +1445,7 @@ func file_loom_v1_apps_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_loom_v1_apps_proto_rawDesc), len(file_loom_v1_apps_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   18,
+			NumMessages:   20,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

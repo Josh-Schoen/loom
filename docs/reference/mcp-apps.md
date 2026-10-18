@@ -552,7 +552,7 @@ You can also pass hex colors (e.g., `"#ff6b6b"`), but named colors are preferred
 
 ### gRPC RPCs
 
-7 RPCs in `LoomService` (defined in `proto/loom/v1/loom.proto`):
+8 RPCs in `LoomService` (defined in `proto/loom/v1/loom.proto`):
 
 | RPC | HTTP | Description |
 |-----|------|-------------|
@@ -563,6 +563,7 @@ You can also pass hex colors (e.g., `"#ff6b6b"`), but named colors are preferred
 | `DeleteUIApp` | `DELETE /v1/apps/{name}` | Delete a dynamic app |
 | `ListComponentTypes` | `GET /v1/apps/component-types` | Discover available component types |
 | `SetUIAppChecklistItem` | `POST /v1/apps/{name}:set-checklist-item` | Tick or untick one checklist item and save the app (see [Checklist State](#checklist-state)) |
+| `SetUIAppSharing` | `POST /v1/apps/{name}:set-sharing` | Share one of the caller's apps with everyone, or stop sharing one the caller shared (`{"shared": true}` or `false`; see [Shared apps](#shared-apps)) |
 
 ### MCP Tools
 
@@ -580,7 +581,7 @@ Exposed by `loom-mcp` bridge to MCP clients (Claude Code, Cursor, etc.):
 Registered to all server-side Loom agents in one of two ways:
 
 - **Lazy disclosure** (default): the tools appear in the active tool set only when the user message contains UI-related keywords like "dashboard", "chart", "visualization", etc.
-- **Always offered**: an agent whose YAML lists any of these tools under `tools.builtin` (or the flat `tools:` list) has all five from the first turn, whatever the wording. Use this for assistants that build pages on request ("plan my meals for the week"). The startup log shows `mode: declared` or `mode: lazy` per agent.
+- **Always offered**: an agent whose YAML lists any of these tools under `tools.builtin` (or the flat `tools:` list) has all six from the first turn, whatever the wording. Use this for assistants that build pages on request ("plan my meals for the week"). The startup log shows `mode: declared` or `mode: lazy` per agent.
 
 ```yaml
 spec:
@@ -596,6 +597,9 @@ spec:
 | `delete_ui_app` | Delete a dynamic app |
 | `list_component_types` | Discover available component types and prop schemas |
 | `get_ui_app` | Return an app's current spec (`{name, spec}`), including checklist ticks. Fails with `NOT_FOUND` for unknown apps or apps without a stored spec |
+| `share_ui_app` | `{name, shared}`: share one of the person's apps with everyone (`shared`, default true) or stop sharing one they shared (`false`). Errors `NAME_IN_USE`, `NOT_SHARER` (see [Shared apps](#shared-apps)) |
+
+`create_ui_app` also takes `shared` (boolean, default false) to create the app as a shared app.
 
 Agents should call `list_component_types` first to discover the catalog, then use `create_ui_app` with a spec. Before `update_ui_app` on an app with a checklist, agents should call `get_ui_app` and keep each item's `checked` value; `update_ui_app` replaces the whole spec, so ticks missing from the new spec are lost.
 
@@ -608,14 +612,38 @@ agent tools it is the user who sent the message the agent is answering.
 Requests without an identity act as `default-user` (`types.DefaultUserID`).
 
 - `ListUIApps`, `GetUIApp`, `UpdateUIApp`, `DeleteUIApp`,
-  `SetUIAppChecklistItem`, `/apps/`, and the agent tools see the embedded apps
-  and the caller's own dynamic apps only. Another user's app answers as not
-  found (`NOT_FOUND` / HTTP 404), so its existence is not revealed.
+  `SetUIAppChecklistItem`, `/apps/`, and the agent tools see the embedded apps,
+  the caller's own dynamic apps, and the [shared apps](#shared-apps). Another
+  user's own app answers as not found (`NOT_FOUND` / HTTP 404), so its
+  existence is not revealed (except through the shared-app name rules below).
 - Names are unique per owner: two users can each have an app called
   `meal-plan`. Names of embedded apps are reserved for everyone.
 - Limits (100 apps, 50 MB) apply per owner.
 - The MCP resource view of the registry (`List`, `Read` on `loom-mcp` and
   embedded hosts) has no user identity and shows `default-user`'s apps.
+
+### Shared apps
+
+A dynamic app can be **shared**: everyone on the server sees it and can
+change it (`UpdateUIApp`, `SetUIAppChecklistItem`, the agent tools), for
+example a household's grocery list on a personal assistant server. Create
+one with `CreateUIApp` `shared: true` (or `create_ui_app` `shared: true`), or
+share an existing app with `SetUIAppSharing` / `share_ui_app`.
+
+- `UIApp.shared` is true and `UIApp.shared_by` is the user ID of the person
+  who shared it. Only that user can delete it (`DeleteUIApp`) or stop sharing
+  it (`SetUIAppSharing` `shared: false`, which makes it their own app again);
+  others get `FAILED_PRECONDITION`.
+- A name means one app for every user: a shared app's name cannot be used by
+  any user's own app. Creating an own app with a shared app's name, creating
+  a shared app with a name someone uses for their own app, and sharing an app
+  whose name another user also uses return `FAILED_PRECONDITION` (agent
+  tools: `NAME_IN_USE`). The error for the last two reveals that some user
+  has an app with that name.
+- Updates keep an app shared and keep `shared_by`. Shared apps count against
+  their own limits (100 apps, 50 MB), separate from each user's.
+- Shared apps are stored under the reserved owner `"\x01shared"` (user IDs
+  cannot contain control characters; `looms pair --user` rejects them too).
 
 **Only as strong as the identity.** With no authentication configured, the
 user ID comes from the `X-User-Id` header (`Grpc-Metadata-X-User-Id` on the

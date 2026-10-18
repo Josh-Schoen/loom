@@ -18,6 +18,7 @@
 package apps
 
 import (
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -41,6 +42,22 @@ const (
 	// apps had owners. It equals types.DefaultUserID, the user ID requests
 	// get when no identity is configured.
 	DefaultOwner = "default-user"
+
+	// SharedOwner owns the shared dynamic apps: apps everyone on the server
+	// sees and can change (a household's grocery list). It starts with a
+	// control character, which user IDs cannot contain, so no user owns it.
+	// Shared apps record who shared them (UIResource.SharedBy).
+	SharedOwner = "\x01shared"
+)
+
+// Errors for shared apps, for callers that map them to status codes.
+var (
+	// ErrNameInUse: a shared app and an owner's own app cannot have the same
+	// name, so a name always means one app for every user.
+	ErrNameInUse = errors.New("app name in use")
+	// ErrNotSharer: only the user who shared an app can delete it or stop
+	// sharing it.
+	ErrNotSharer = errors.New("only the user who shared the app can do that")
 )
 
 // UIResource represents an HTML app that can be rendered by an MCP client.
@@ -52,7 +69,8 @@ type UIResource struct {
 	HTML        []byte                   // Raw HTML content
 	Meta        *protocol.UIResourceMeta // Security and display metadata
 	Dynamic     bool                     // true = agent-created, false = embedded
-	Owner       string                   // User who owns a dynamic app (DefaultOwner when empty); unused for embedded
+	Owner       string                   // User who owns a dynamic app (DefaultOwner when empty; SharedOwner for shared apps); unused for embedded
+	SharedBy    string                   // For shared apps: the user who shared it
 	UpdatedAt   time.Time                // Last create/update (dynamic apps only)
 	Spec        []byte                   // protojson UIAppSpec the HTML was compiled from (dynamic apps; may be nil)
 }
@@ -61,7 +79,9 @@ type UIResource struct {
 // Embedded apps are shared by everyone. Dynamic (agent-created) apps belong
 // to the user who created them: two owners can each have an app with the
 // same name, and the owner-scoped methods (ListAppInfo, GetAppHTML,
-// CreateApp, ...) only see the given owner's apps plus the embedded ones.
+// CreateApp, ...) only see the given owner's apps, the shared apps
+// (SharedOwner), and the embedded ones. A shared app's name is not used by
+// any owner's own app, so a name always resolves to one app.
 // Thread-safe for concurrent access.
 type UIResourceRegistry struct {
 	resources     map[string]*UIResource            // embedded apps, by URI
@@ -122,6 +142,7 @@ func (r *UIResourceRegistry) EnablePersistence(dir string) (loaded int, skipped 
 			Meta:        &protocol.UIResourceMeta{PrefersBorder: boolPtrTrue()},
 			Dynamic:     true,
 			Owner:       normalizeOwner(app.Owner),
+			SharedBy:    app.SharedBy,
 			UpdatedAt:   app.UpdatedAt,
 			Spec:        specBytes(app.Spec),
 		}
@@ -266,15 +287,23 @@ func (r *UIResourceRegistry) dynamicStatsLocked(owner string) (count int, totalB
 	return count, totalBytes
 }
 
-// visibleLocked returns the embedded resources and owner's dynamic ones.
-// Must be called with r.mu held.
+// visibleLocked returns the embedded resources, owner's dynamic ones, and
+// the shared ones. Must be called with r.mu held.
 func (r *UIResourceRegistry) visibleLocked(owner string) []*UIResource {
-	owned := r.dynamic[normalizeOwner(owner)]
-	out := make([]*UIResource, 0, len(r.resources)+len(owned))
+	owner = normalizeOwner(owner)
+	owned := r.dynamic[owner]
+	shared := r.dynamic[SharedOwner]
+	if owner == SharedOwner {
+		shared = nil
+	}
+	out := make([]*UIResource, 0, len(r.resources)+len(owned)+len(shared))
 	for _, res := range r.resources {
 		out = append(out, res)
 	}
 	for _, res := range owned {
+		out = append(out, res)
+	}
+	for _, res := range shared {
 		out = append(out, res)
 	}
 	return out
@@ -295,13 +324,36 @@ func (r *UIResourceRegistry) embeddedLocked(name string) (*UIResource, bool) {
 }
 
 // lookupLocked finds an app by short name: an embedded app, else owner's
-// dynamic app. Must be called with r.mu held.
+// dynamic app, else a shared one. Must be called with r.mu held.
 func (r *UIResourceRegistry) lookupLocked(owner, name string) (*UIResource, bool) {
 	if res, ok := r.embeddedLocked(name); ok {
 		return res, true
 	}
-	res, ok := r.dynamic[normalizeOwner(owner)][name]
+	return r.dynamicLookupLocked(owner, name)
+}
+
+// dynamicLookupLocked finds owner's dynamic app by short name, else a shared
+// one. The result's Owner says which. Must be called with r.mu held.
+func (r *UIResourceRegistry) dynamicLookupLocked(owner, name string) (*UIResource, bool) {
+	if res, ok := r.dynamic[normalizeOwner(owner)][name]; ok {
+		return res, true
+	}
+	res, ok := r.dynamic[SharedOwner][name]
 	return res, ok
+}
+
+// ownNameTakenLocked reports whether any owner other than except has its own
+// (not shared) dynamic app called name. Must be called with r.mu held.
+func (r *UIResourceRegistry) ownNameTakenLocked(name, except string) bool {
+	for owner, apps := range r.dynamic {
+		if owner == SharedOwner || owner == except {
+			continue
+		}
+		if _, ok := apps[name]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 // byURILocked finds an embedded resource, or a DefaultOwner dynamic one, by
@@ -447,6 +499,8 @@ type AppInfo struct {
 	PrefersBorder bool
 	Dynamic       bool
 	UpdatedAt     time.Time // Zero for embedded apps
+	Shared        bool      // A shared app: everyone on the server sees and can change it
+	SharedBy      string    // For shared apps: the user who shared it
 }
 
 func appInfo(res *UIResource) AppInfo {
@@ -458,6 +512,8 @@ func appInfo(res *UIResource) AppInfo {
 		MimeType:    res.MIMEType,
 		Dynamic:     res.Dynamic,
 		UpdatedAt:   res.UpdatedAt,
+		Shared:      res.Dynamic && res.Owner == SharedOwner,
+		SharedBy:    res.SharedBy,
 	}
 	if res.Meta != nil && res.Meta.PrefersBorder != nil {
 		info.PrefersBorder = *res.Meta.PrefersBorder
@@ -526,6 +582,10 @@ func (r *UIResourceRegistry) CreateAppWithSpec(owner, name, displayName, descrip
 	// Single write lock: check-and-create atomically to prevent TOCTOU races.
 	r.mu.Lock()
 	existing, exists := r.lookupLocked(owner, name)
+	if exists && existing.Dynamic && existing.Owner == SharedOwner && owner != SharedOwner {
+		r.mu.Unlock()
+		return nil, false, fmt.Errorf("%w: a shared app is called %s (change it, or pick another name)", ErrNameInUse, name)
+	}
 	if exists && (!overwrite || !existing.Dynamic) {
 		r.mu.Unlock()
 		if existing.Dynamic {
@@ -582,6 +642,7 @@ func (r *UIResourceRegistry) UpdateAppWithSpec(owner, name, displayName, descrip
 		description = existing.Description
 	}
 
+	// A shared app stays shared: it is changed where it lives.
 	res := &UIResource{
 		URI:         appURI(name),
 		Name:        displayName,
@@ -591,9 +652,10 @@ func (r *UIResourceRegistry) UpdateAppWithSpec(owner, name, displayName, descrip
 		Meta: &protocol.UIResourceMeta{
 			PrefersBorder: boolPtrTrue(),
 		},
-		Dynamic: true,
-		Owner:   owner,
-		Spec:    spec,
+		Dynamic:  true,
+		Owner:    existing.Owner,
+		SharedBy: existing.SharedBy,
+		Spec:     spec,
 	}
 
 	_, err := r.upsertLocked(res)
@@ -612,12 +674,13 @@ func (r *UIResourceRegistry) UpdateAppWithSpec(owner, name, displayName, descrip
 }
 
 // AppSpec returns the stored spec (protojson UIAppSpec) of one of owner's
-// dynamic apps, or an error when owner has no such app or it has no stored
-// spec (apps created before specs were kept, or through CreateApp/UpdateApp).
+// dynamic apps or a shared one, or an error when there is no such app or it
+// has no stored spec (apps created before specs were kept, or through
+// CreateApp/UpdateApp).
 func (r *UIResourceRegistry) AppSpec(owner, name string) ([]byte, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	res, ok := r.dynamic[normalizeOwner(owner)][name]
+	res, ok := r.dynamicLookupLocked(owner, name)
 	if !ok {
 		return nil, fmt.Errorf("app not found: %s", name)
 	}
@@ -638,12 +701,17 @@ func (r *UIResourceRegistry) DeleteApp(owner, name string) error {
 		r.mu.Unlock()
 		return fmt.Errorf("cannot delete embedded resource: %s", res.URI)
 	}
-	owned := r.dynamic[owner]
-	existing, exists := owned[name]
+	existing, exists := r.dynamicLookupLocked(owner, name)
 	if !exists {
 		r.mu.Unlock()
 		return fmt.Errorf("resource not found: %s", appURI(name))
 	}
+	if existing.Owner == SharedOwner && owner != SharedOwner && existing.SharedBy != owner {
+		r.mu.Unlock()
+		return fmt.Errorf("%w: %s", ErrNotSharer, name)
+	}
+	owner = existing.Owner
+	owned := r.dynamic[owner]
 
 	delete(owned, name)
 	if r.store != nil {
@@ -661,6 +729,151 @@ func (r *UIResourceRegistry) DeleteApp(owner, name string) error {
 
 	if notify != nil {
 		notify()
+	}
+	return nil
+}
+
+// CreateSharedAppWithSpec creates (or, with overwrite, replaces) a shared
+// app: everyone on the server sees and can change it. sharer is recorded as
+// the user who shared it (kept when an existing shared app is replaced).
+// Returns ErrNameInUse when the name is taken by any owner's own app.
+func (r *UIResourceRegistry) CreateSharedAppWithSpec(sharer, name, displayName, description string, html, spec []byte, overwrite bool) (*AppInfo, bool, error) {
+	sharer = normalizeOwner(sharer)
+	if sharer == SharedOwner {
+		return nil, false, fmt.Errorf("invalid sharer")
+	}
+	res := &UIResource{
+		URI:         appURI(name),
+		Name:        displayName,
+		Description: description,
+		MIMEType:    protocol.ResourceMIME,
+		HTML:        html,
+		Meta: &protocol.UIResourceMeta{
+			PrefersBorder: boolPtrTrue(),
+		},
+		Dynamic:  true,
+		Owner:    SharedOwner,
+		SharedBy: sharer,
+		Spec:     spec,
+	}
+
+	var notify func()
+
+	r.mu.Lock()
+	if _, embedded := r.embeddedLocked(name); embedded {
+		r.mu.Unlock()
+		return nil, false, fmt.Errorf("cannot overwrite embedded app: %s", name)
+	}
+	if _, own := r.dynamic[sharer][name]; own {
+		r.mu.Unlock()
+		return nil, false, fmt.Errorf("%w: you have an app called %s (share it instead, or pick another name)", ErrNameInUse, name)
+	}
+	if r.ownNameTakenLocked(name, sharer) {
+		r.mu.Unlock()
+		return nil, false, fmt.Errorf("%w: another user has an app called %s (pick another name)", ErrNameInUse, name)
+	}
+	if existing, exists := r.dynamic[SharedOwner][name]; exists {
+		if !overwrite {
+			r.mu.Unlock()
+			return nil, false, fmt.Errorf("app already exists: %s (use overwrite=true to replace)", name)
+		}
+		res.SharedBy = existing.SharedBy
+	}
+	created, err := r.upsertLocked(res)
+	notify = r.onChange
+	r.mu.Unlock()
+
+	if err != nil {
+		return nil, false, err
+	}
+	if notify != nil {
+		notify()
+	}
+	info := appInfo(res)
+	return &info, !created, nil
+}
+
+// SetAppSharing shares one of owner's apps (moves it to the shared apps, with
+// owner as the sharer) or stops sharing one owner shared (moves it back to
+// owner's own apps). Sharing returns ErrNameInUse when another owner has an
+// app with the same name; stopping returns ErrNotSharer when someone else
+// shared it. Sharing an already shared app (or unsharing an own one) only
+// returns its info.
+func (r *UIResourceRegistry) SetAppSharing(owner, name string, shared bool) (*AppInfo, error) {
+	owner = normalizeOwner(owner)
+	if owner == SharedOwner {
+		return nil, fmt.Errorf("invalid owner")
+	}
+
+	var notify func()
+
+	r.mu.Lock()
+	if _, embedded := r.embeddedLocked(name); embedded {
+		r.mu.Unlock()
+		return nil, fmt.Errorf("cannot share embedded app: %s", name)
+	}
+	existing, exists := r.dynamicLookupLocked(owner, name)
+	if !exists {
+		r.mu.Unlock()
+		return nil, fmt.Errorf("app not found: %s", name)
+	}
+	isShared := existing.Owner == SharedOwner
+	if isShared == shared {
+		info := appInfo(existing)
+		r.mu.Unlock()
+		return &info, nil
+	}
+	if shared && r.ownNameTakenLocked(name, owner) {
+		r.mu.Unlock()
+		return nil, fmt.Errorf("%w: another user has an app called %s (rename it first)", ErrNameInUse, name)
+	}
+	if !shared && existing.SharedBy != owner {
+		r.mu.Unlock()
+		return nil, fmt.Errorf("%w: %s", ErrNotSharer, name)
+	}
+
+	moved := *existing
+	if shared {
+		moved.Owner, moved.SharedBy = SharedOwner, owner
+	} else {
+		moved.Owner, moved.SharedBy = owner, ""
+	}
+	if err := r.moveLocked(existing, &moved); err != nil {
+		r.mu.Unlock()
+		return nil, err
+	}
+	notify = r.onChange
+	r.mu.Unlock()
+
+	if notify != nil {
+		notify()
+	}
+	info := appInfo(&moved)
+	return &info, nil
+}
+
+// moveLocked replaces from with to, which has the same name and another
+// owner, in memory and in the store (to is written before from is removed,
+// so a failure leaves the app where it was). The caller MUST hold r.mu in
+// write mode.
+func (r *UIResourceRegistry) moveLocked(from, to *UIResource) error {
+	name := extractAppName(from.URI)
+	if _, err := r.upsertLocked(to); err != nil {
+		return err
+	}
+	owned := r.dynamic[from.Owner]
+	delete(owned, name)
+	if r.store != nil {
+		if err := r.store.delete(from.Owner, name); err != nil {
+			// Put it back where it was.
+			owned[name] = from
+			delete(r.dynamic[to.Owner], name)
+			_ = r.store.delete(to.Owner, name)
+			return err
+		}
+	}
+	if len(owned) == 0 {
+		delete(r.dynamic, from.Owner)
 	}
 	return nil
 }

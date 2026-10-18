@@ -16,6 +16,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`get_ui_app` in agent YAML no longer logged as an unknown builtin tool** — declaring it under `tools` logged "Unknown builtin tool" although the UI app subsystem provides it.
+
 - **`WeaveRequest.context` now reaches the model** — the field was documented as "context variables for prompt interpolation" but nothing read it. Its entries are now shown to the model as a system note on every LLM call of that request (`Context sent with this message ...`), never stored in the session or history, so a client can send facts like its `local_time` and `time_zone` (at most 16 entries; keys 64, values 256 characters). Reference: `docs/reference/streaming.md`.
 
 - **Graph memory per-user follow-ups** — `GraphMemoryService.Forget` returned `INTERNAL` for a memory that does not exist or belongs to another user; it now returns `NOT_FOUND`. The skill-eviction salience boost ran without a user identity, so with per-user graph memory it reached only `default-user`'s memories; it now runs as the user whose session used the skill.
@@ -40,6 +42,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Shared UI apps** — a dynamic app can be shared with everyone on the server, who all see and change it (a household's grocery list): `CreateUIApp`/`create_ui_app` take `shared`, new `SetUIAppSharing` RPC (`POST /v1/apps/{name}:set-sharing`) and `share_ui_app` agent tool share or unshare an existing app. `UIApp.shared` and `UIApp.shared_by` report it; only the person who shared an app can delete or unshare it; a shared app's name cannot be used by anyone's own app. `looms pair --user` now rejects user IDs with control characters, as the user-ID header already did. Reference: `docs/reference/mcp-apps.md#shared-apps`.
 - **What an agent remembers about the caller** (`ListUserMemories`, `AddUserMemory`, `CorrectUserMemory`, `ForgetUserMemory`, `ForgetAllUserMemories` on `LoomService`; `GET/POST/DELETE /v1/agents/{agent_id}/memories[/{memory_id}]`, `POST …/{memory_id}:correct`) — lets a client show a person their own graph memories for an agent and add, correct (supersede), or forget them, or forget everything. Scoped to the caller's user ID; `FAILED_PRECONDITION` when graph memory is off for the agent. Reference: `docs/reference/user-memories.md`.
 - `GraphMemoryStore.ListMemories(ctx, agentID, limit, offset)` lists the caller's active memories (not forgotten, expired or superseded), newest first, with a total count.
 - `GraphMemoryStore.ForgetAll(ctx, agentID)` forgets all of the caller's memories under an agent and deletes the caller's entities and edges under it. Memory content is soft-deleted (`expires_at`), as with `Forget`.

@@ -664,6 +664,17 @@ service LoomService {
     option (google.api.http) = {delete: "/v1/agents/{agent_id}/memories"};
   }
 
+  // SetUIAppSharing shares one of the caller's dynamic apps with everyone on
+  // the server (UIApp.shared), or stops sharing one the caller shared.
+  // FAILED_PRECONDITION when another user's own app has the same name, or
+  // when someone else shared it; NOT_FOUND when the caller sees no such app.
+  rpc SetUIAppSharing(SetUIAppSharingRequest) returns (SetUIAppSharingResponse) {
+    option (google.api.http) = {
+      post: "/v1/apps/{name}:set-sharing"
+      body: "*"
+    };
+  }
+
   // ListComponentTypes returns the catalog of available component types
   // for building dynamic UI apps.
   rpc ListComponentTypes(ListComponentTypesRequest) returns (ListComponentTypesResponse) {

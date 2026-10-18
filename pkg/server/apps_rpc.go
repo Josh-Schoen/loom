@@ -7,6 +7,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"regexp"
 	"strings"
@@ -57,6 +58,17 @@ type AppSpecProvider interface {
 	AppSpec(owner, name string) ([]byte, error)
 }
 
+// AppSharingProvider is implemented by providers that keep shared apps:
+// apps everyone on the server sees and can change (a household's grocery
+// list). apps.UIResourceRegistry implements it.
+type AppSharingProvider interface {
+	CreateSharedAppWithSpec(sharer, name, displayName, description string, html, spec []byte, overwrite bool) (*apps.AppInfo, bool, error)
+	SetAppSharing(owner, name string, shared bool) (*apps.AppInfo, error)
+}
+
+// errSharingUnsupported is returned when the app provider keeps no shared apps.
+var errSharingUnsupported = errors.New("this server does not support shared apps")
+
 // appOwner is the owner of the apps a request may see and change: the
 // caller's user ID, set by the identity interceptors (and carried into agent
 // turns, so tools see the user who sent the message). Without one it is
@@ -69,8 +81,19 @@ func appOwner(ctx context.Context) string {
 }
 
 // createAppFromSpec stores a compiled app, with its spec when the provider
-// keeps specs.
-func createAppFromSpec(provider AppProvider, owner, name, displayName, description string, html []byte, spec *loomv1.UIAppSpec, overwrite bool) (*apps.AppInfo, bool, error) {
+// keeps specs; shared creates it as a shared app with owner as the sharer.
+func createAppFromSpec(provider AppProvider, owner, name, displayName, description string, html []byte, spec *loomv1.UIAppSpec, overwrite, shared bool) (*apps.AppInfo, bool, error) {
+	if shared {
+		sp, ok := provider.(AppSharingProvider)
+		if !ok {
+			return nil, false, errSharingUnsupported
+		}
+		specJSON, err := protojson.Marshal(spec)
+		if err != nil {
+			return nil, false, fmt.Errorf("marshal spec: %w", err)
+		}
+		return sp.CreateSharedAppWithSpec(owner, name, displayName, description, html, specJSON, overwrite)
+	}
 	if sp, ok := provider.(AppSpecProvider); ok {
 		specJSON, err := protojson.Marshal(spec)
 		if err != nil {
@@ -212,10 +235,12 @@ func (s *MultiAgentServer) CreateUIApp(ctx context.Context, req *loomv1.CreateUI
 	}
 
 	// Create app in registry
-	info, overwritten, err := createAppFromSpec(provider, appOwner(ctx), req.Name, displayName, req.Description, html, req.Spec, req.Overwrite)
+	info, overwritten, err := createAppFromSpec(provider, appOwner(ctx), req.Name, displayName, req.Description, html, req.Spec, req.Overwrite, req.Shared)
 	if err != nil {
 		errMsg := err.Error()
 		switch {
+		case errors.Is(err, apps.ErrNameInUse), errors.Is(err, errSharingUnsupported):
+			return nil, status.Errorf(codes.FailedPrecondition, "%v", err)
 		case strings.Contains(errMsg, "already exists"):
 			return nil, status.Errorf(codes.AlreadyExists, "%v", err)
 		case strings.Contains(errMsg, "cannot overwrite embedded"):
@@ -380,6 +405,9 @@ func (s *MultiAgentServer) DeleteUIApp(ctx context.Context, req *loomv1.DeleteUI
 	}
 
 	if err := provider.DeleteApp(appOwner(ctx), req.Name); err != nil {
+		if errors.Is(err, apps.ErrNotSharer) {
+			return nil, status.Errorf(codes.FailedPrecondition, "%v", err)
+		}
 		return nil, status.Errorf(codes.NotFound, "%v", err)
 	}
 
@@ -407,6 +435,31 @@ func (s *MultiAgentServer) ListComponentTypes(ctx context.Context, req *loomv1.L
 	}, nil
 }
 
+// SetUIAppSharing shares one of the caller's dynamic apps with everyone on
+// the server, or stops sharing one the caller shared.
+func (s *MultiAgentServer) SetUIAppSharing(ctx context.Context, req *loomv1.SetUIAppSharingRequest) (*loomv1.SetUIAppSharingResponse, error) {
+	if req.Name == "" {
+		return nil, status.Error(codes.InvalidArgument, "app name is required")
+	}
+	s.mu.RLock()
+	provider := s.appProvider
+	s.mu.RUnlock()
+	sp, ok := provider.(AppSharingProvider)
+	if provider == nil || !ok {
+		return nil, status.Error(codes.FailedPrecondition, errSharingUnsupported.Error())
+	}
+	info, err := sp.SetAppSharing(appOwner(ctx), req.Name, req.Shared)
+	switch {
+	case errors.Is(err, apps.ErrNameInUse), errors.Is(err, apps.ErrNotSharer):
+		return nil, status.Errorf(codes.FailedPrecondition, "%v", err)
+	case err != nil && strings.Contains(err.Error(), "not found"):
+		return nil, status.Errorf(codes.NotFound, "%v", err)
+	case err != nil:
+		return nil, status.Errorf(codes.FailedPrecondition, "%v", err)
+	}
+	return &loomv1.SetUIAppSharingResponse{App: appInfoToProto(info)}, nil
+}
+
 // appInfoToProto converts an apps.AppInfo to a proto UIApp message.
 func appInfoToProto(info *apps.AppInfo) *loomv1.UIApp {
 	app := &loomv1.UIApp{
@@ -417,6 +470,8 @@ func appInfoToProto(info *apps.AppInfo) *loomv1.UIApp {
 		MimeType:      info.MimeType,
 		PrefersBorder: info.PrefersBorder,
 		Dynamic:       info.Dynamic,
+		Shared:        info.Shared,
+		SharedBy:      info.SharedBy,
 	}
 	if !info.UpdatedAt.IsZero() {
 		app.UpdatedAt = timestamppb.New(info.UpdatedAt)

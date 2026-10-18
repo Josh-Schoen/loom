@@ -124,6 +124,7 @@ const (
 	LoomService_CorrectUserMemory_FullMethodName           = "/loom.v1.LoomService/CorrectUserMemory"
 	LoomService_ForgetUserMemory_FullMethodName            = "/loom.v1.LoomService/ForgetUserMemory"
 	LoomService_ForgetAllUserMemories_FullMethodName       = "/loom.v1.LoomService/ForgetAllUserMemories"
+	LoomService_SetUIAppSharing_FullMethodName             = "/loom.v1.LoomService/SetUIAppSharing"
 	LoomService_ListComponentTypes_FullMethodName          = "/loom.v1.LoomService/ListComponentTypes"
 	LoomService_ListAgentPresets_FullMethodName            = "/loom.v1.LoomService/ListAgentPresets"
 	LoomService_ListWorkflowTemplates_FullMethodName       = "/loom.v1.LoomService/ListWorkflowTemplates"
@@ -338,6 +339,11 @@ type LoomServiceClient interface {
 	// ForgetAllUserMemories forgets everything the agent remembers about the
 	// caller (memories, and the people, places, and things they mentioned).
 	ForgetAllUserMemories(ctx context.Context, in *ForgetAllUserMemoriesRequest, opts ...grpc.CallOption) (*ForgetAllUserMemoriesResponse, error)
+	// SetUIAppSharing shares one of the caller's dynamic apps with everyone on
+	// the server (UIApp.shared), or stops sharing one the caller shared.
+	// FAILED_PRECONDITION when another user's own app has the same name, or
+	// when someone else shared it; NOT_FOUND when the caller sees no such app.
+	SetUIAppSharing(ctx context.Context, in *SetUIAppSharingRequest, opts ...grpc.CallOption) (*SetUIAppSharingResponse, error)
 	// ListComponentTypes returns the catalog of available component types
 	// for building dynamic UI apps.
 	ListComponentTypes(ctx context.Context, in *ListComponentTypesRequest, opts ...grpc.CallOption) (*ListComponentTypesResponse, error)
@@ -1322,6 +1328,16 @@ func (c *loomServiceClient) ForgetAllUserMemories(ctx context.Context, in *Forge
 	return out, nil
 }
 
+func (c *loomServiceClient) SetUIAppSharing(ctx context.Context, in *SetUIAppSharingRequest, opts ...grpc.CallOption) (*SetUIAppSharingResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(SetUIAppSharingResponse)
+	err := c.cc.Invoke(ctx, LoomService_SetUIAppSharing_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *loomServiceClient) ListComponentTypes(ctx context.Context, in *ListComponentTypesRequest, opts ...grpc.CallOption) (*ListComponentTypesResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ListComponentTypesResponse)
@@ -1570,6 +1586,11 @@ type LoomServiceServer interface {
 	// ForgetAllUserMemories forgets everything the agent remembers about the
 	// caller (memories, and the people, places, and things they mentioned).
 	ForgetAllUserMemories(context.Context, *ForgetAllUserMemoriesRequest) (*ForgetAllUserMemoriesResponse, error)
+	// SetUIAppSharing shares one of the caller's dynamic apps with everyone on
+	// the server (UIApp.shared), or stops sharing one the caller shared.
+	// FAILED_PRECONDITION when another user's own app has the same name, or
+	// when someone else shared it; NOT_FOUND when the caller sees no such app.
+	SetUIAppSharing(context.Context, *SetUIAppSharingRequest) (*SetUIAppSharingResponse, error)
 	// ListComponentTypes returns the catalog of available component types
 	// for building dynamic UI apps.
 	ListComponentTypes(context.Context, *ListComponentTypesRequest) (*ListComponentTypesResponse, error)
@@ -1860,6 +1881,9 @@ func (UnimplementedLoomServiceServer) ForgetUserMemory(context.Context, *ForgetU
 }
 func (UnimplementedLoomServiceServer) ForgetAllUserMemories(context.Context, *ForgetAllUserMemoriesRequest) (*ForgetAllUserMemoriesResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ForgetAllUserMemories not implemented")
+}
+func (UnimplementedLoomServiceServer) SetUIAppSharing(context.Context, *SetUIAppSharingRequest) (*SetUIAppSharingResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method SetUIAppSharing not implemented")
 }
 func (UnimplementedLoomServiceServer) ListComponentTypes(context.Context, *ListComponentTypesRequest) (*ListComponentTypesResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ListComponentTypes not implemented")
@@ -3465,6 +3489,24 @@ func _LoomService_ForgetAllUserMemories_Handler(srv interface{}, ctx context.Con
 	return interceptor(ctx, in, info, handler)
 }
 
+func _LoomService_SetUIAppSharing_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SetUIAppSharingRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LoomServiceServer).SetUIAppSharing(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LoomService_SetUIAppSharing_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LoomServiceServer).SetUIAppSharing(ctx, req.(*SetUIAppSharingRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _LoomService_ListComponentTypes_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(ListComponentTypesRequest)
 	if err := dec(in); err != nil {
@@ -3875,6 +3917,10 @@ var LoomService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ForgetAllUserMemories",
 			Handler:    _LoomService_ForgetAllUserMemories_Handler,
+		},
+		{
+			MethodName: "SetUIAppSharing",
+			Handler:    _LoomService_SetUIAppSharing_Handler,
 		},
 		{
 			MethodName: "ListComponentTypes",

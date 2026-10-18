@@ -37,6 +37,14 @@ message UIApp {
 
   // When a dynamic app was last created or updated. Unset for embedded apps.
   google.protobuf.Timestamp updated_at = 8;
+
+  // A shared app: everyone on the server sees it and can change it (a
+  // household's grocery list). Other dynamic apps belong to one user.
+  bool shared = 9;
+
+  // For shared apps: the user ID of the person who shared it. Only they can
+  // delete it or stop sharing it.
+  string shared_by = 10;
 }
 
 // ListUIAppsRequest lists all available UI apps.
@@ -129,6 +137,10 @@ message CreateUIAppRequest {
 
   // Overwrite an existing dynamic app with the same name
   bool overwrite = 5;
+
+  // Create it as a shared app (see UIApp.shared). A shared app's name cannot
+  // be used by any user's own app: FAILED_PRECONDITION when it is.
+  bool shared = 6;
 }
 
 // CreateUIAppResponse returns the created app and its compiled HTML.
@@ -196,6 +208,21 @@ message SetUIAppChecklistItemRequest {
 
 // SetUIAppChecklistItemResponse returns the updated app.
 message SetUIAppChecklistItemResponse {
+  UIApp app = 1;
+}
+
+// SetUIAppSharingRequest shares one of the caller's apps with everyone on
+// the server, or stops sharing one the caller shared.
+message SetUIAppSharingRequest {
+  // App name
+  string name = 1;
+
+  // true to share, false to make it the caller's own again
+  bool shared = 2;
+}
+
+// SetUIAppSharingResponse returns the app after the change.
+message SetUIAppSharingResponse {
   UIApp app = 1;
 }
 
