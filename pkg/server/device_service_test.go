@@ -88,7 +88,7 @@ func TestCreatePairingCodeBuildsLink(t *testing.T) {
 
 	link, err := url.Parse(resp.GetPairingLink())
 	require.NoError(t, err)
-	assert.Equal(t, "loom", link.Scheme)
+	assert.Equal(t, "loompair", link.Scheme)
 	assert.Equal(t, "pair", link.Host)
 	assert.Equal(t, resp.GetServerUrl(), link.Query().Get("server"))
 	assert.Equal(t, resp.GetCode(), link.Query().Get("code"))

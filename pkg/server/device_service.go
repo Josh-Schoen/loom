@@ -52,7 +52,7 @@ type DevicePairingConfig struct {
 	PublicURL string
 	// HTTPPort is the gateway port used when PublicURL is empty.
 	HTTPPort int
-	// LinkScheme is the URL scheme of pairing links (default "loom").
+	// LinkScheme is the URL scheme of pairing links (default "loompair").
 	LinkScheme string
 	// CodeTTL is the default and maximum pairing code lifetime.
 	CodeTTL time.Duration
@@ -85,7 +85,7 @@ func NewDeviceServer(manager *devices.Manager, cfg DevicePairingConfig) (*Device
 		return nil, errors.New("code TTL must be positive")
 	}
 	if cfg.LinkScheme == "" {
-		cfg.LinkScheme = "loom"
+		cfg.LinkScheme = "loompair"
 	}
 	if cfg.DefaultUserID == "" {
 		cfg.DefaultUserID = "default-user"

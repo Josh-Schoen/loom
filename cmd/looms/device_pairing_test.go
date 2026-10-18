@@ -29,7 +29,7 @@ import (
 func pairingCfg() *Config {
 	c := &Config{}
 	c.Server.HTTPPort = 5006
-	c.Server.DevicePairing = DevicePairingConfig{Enabled: true, LinkScheme: "loom", CodeTTLSeconds: 600}
+	c.Server.DevicePairing = DevicePairingConfig{Enabled: true, LinkScheme: "loompair", CodeTTLSeconds: 600}
 	return c
 }
 
@@ -70,7 +70,7 @@ func TestValidateDevicePairing(t *testing.T) {
 
 func TestWriteQRUsesExplicitColors(t *testing.T) {
 	var buf bytes.Buffer
-	require.NoError(t, writeQR(&buf, "loom://pair?code=ABC&server=http%3A%2F%2F10.0.0.2%3A5006"))
+	require.NoError(t, writeQR(&buf, "loompair://pair?code=ABC&server=http%3A%2F%2F10.0.0.2%3A5006"))
 	lines := strings.Split(strings.TrimRight(buf.String(), "\n"), "\n")
 	require.NotEmpty(t, lines)
 	for _, line := range lines {
@@ -87,7 +87,7 @@ func TestWriteQRUsesExplicitColors(t *testing.T) {
 
 func TestPrintPairingLinkOnly(t *testing.T) {
 	resp := &loomv1.CreatePairingCodeResponse{
-		PairingLink: "loom://pair?code=X&server=http%3A%2F%2F10.0.0.2%3A5006",
+		PairingLink: "loompair://pair?code=X&server=http%3A%2F%2F10.0.0.2%3A5006",
 		ServerUrl:   "http://10.0.0.2:5006",
 		ExpiresAt:   timestamppb.Now(),
 	}

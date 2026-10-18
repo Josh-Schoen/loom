@@ -290,7 +290,7 @@ type DevicePairingConfig struct {
 	// on the same network.
 	PublicURL string `mapstructure:"public_url"`
 
-	// LinkScheme is the URL scheme of pairing links (default: "loom")
+	// LinkScheme is the URL scheme of pairing links (default: "loompair")
 	LinkScheme string `mapstructure:"link_scheme"`
 
 	// CodeTTLSeconds is how long a pairing code works (default: 600, max: 3600)
@@ -1167,7 +1167,7 @@ func setDefaults() {
 	viper.SetDefault("server.device_pairing.enabled", false)
 	viper.SetDefault("server.device_pairing.required", false)
 	viper.SetDefault("server.device_pairing.public_url", "")
-	viper.SetDefault("server.device_pairing.link_scheme", "loom")
+	viper.SetDefault("server.device_pairing.link_scheme", "loompair")
 	viper.SetDefault("server.device_pairing.code_ttl_seconds", 600)
 
 	// CORS defaults (permissive for development, MUST be configured for production)

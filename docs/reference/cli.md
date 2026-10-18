@@ -388,14 +388,14 @@ looms pair
 # Scan this with the phone's camera to connect it:
 # <QR code>
 # Or open this link on the phone:
-#   loom://pair?code=DSE5KEC3ZQZD2SEQSAKQ5QF5GCL4BRVY&server=http%3A%2F%2F192.168.1.20%3A5006
+#   loompair://pair?code=DSE5KEC3ZQZD2SEQSAKQ5QF5GCL4BRVY&server=http%3A%2F%2F192.168.1.20%3A5006
 # The phone will connect to http://192.168.1.20:5006.
 # ...
 ```
 
 ```bash
 looms pair --ttl 5m --link-only
-# loom://pair?code=...&server=...
+# loompair://pair?code=...&server=...
 ```
 
 **Errors:** pairing disabled on the server (`UNIMPLEMENTED`), server not running (`UNAVAILABLE`), admin token missing or rejected.
