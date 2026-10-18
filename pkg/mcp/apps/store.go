@@ -37,11 +37,12 @@ type fileStore struct {
 
 // storedApp is the on-disk form of a dynamic app.
 type storedApp struct {
-	Name        string    `json:"name"`
-	DisplayName string    `json:"display_name"`
-	Description string    `json:"description"`
-	HTML        string    `json:"html"`
-	UpdatedAt   time.Time `json:"updated_at"`
+	Name        string          `json:"name"`
+	DisplayName string          `json:"display_name"`
+	Description string          `json:"description"`
+	HTML        string          `json:"html"`
+	UpdatedAt   time.Time       `json:"updated_at"`
+	Spec        json.RawMessage `json:"spec,omitempty"`
 }
 
 func newFileStore(dir string) (*fileStore, error) {
@@ -71,6 +72,7 @@ func (s *fileStore) save(res *UIResource) error {
 		Description: res.Description,
 		HTML:        string(res.HTML),
 		UpdatedAt:   res.UpdatedAt,
+		Spec:        json.RawMessage(res.Spec),
 	})
 	if err != nil {
 		return err
@@ -133,4 +135,12 @@ func (s *fileStore) loadAll() (loaded []storedApp, skipped []string, err error) 
 		loaded = append(loaded, app)
 	}
 	return loaded, skipped, nil
+}
+
+// specBytes returns a stored spec, or nil when none was stored.
+func specBytes(raw json.RawMessage) []byte {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil
+	}
+	return append([]byte(nil), raw...)
 }

@@ -841,6 +841,7 @@
     chart: renderChart,
     table: renderTable,
     "key-value": renderKeyValue,
+    checklist: renderChecklist,
     text: renderText,
     "code-block": renderCodeBlock,
     "progress-bar": renderProgressBar,
@@ -879,6 +880,7 @@
     "progress-bar": "third",
 
     "key-value": "half",
+    checklist: "half",
     heatmap: "half",
     "message-list": "half",
   });
@@ -1681,6 +1683,153 @@
   }
 
   // --- text ---
+  // Checklist: rows people tick. A tick updates the page at once and is sent
+  // to the host as a ui/notifications/checklist-changed notification
+  // ({component_id, item_id, checked}); the host saves it (loom:
+  // SetUIAppChecklistItem). The item id is item.id, or its label.
+  function renderChecklist(props) {
+    const wrapper = createElement("div", {
+      style: {
+        background: THEME.surface,
+        border: "1px solid " + THEME.border,
+        borderRadius: "8px",
+        padding: "16px 20px",
+      },
+    });
+
+    const items = Array.isArray(props.items)
+      ? props.items.filter((item) => item && typeof item === "object")
+      : [];
+
+    const header = createElement("div", {
+      style: {
+        display: "flex",
+        justifyContent: "space-between",
+        alignItems: "baseline",
+        marginBottom: "8px",
+      },
+    });
+    header.appendChild(
+      createElement(
+        "div",
+        {
+          style: {
+            fontSize: "14px",
+            fontWeight: "600",
+            color: THEME.textPrimary,
+          },
+        },
+        props.title || "",
+      ),
+    );
+    const count = createElement("div", {
+      style: { fontSize: "12px", color: THEME.textSecondary },
+    });
+    header.appendChild(count);
+    wrapper.appendChild(header);
+
+    function updateCount() {
+      const done = items.filter((item) => item.checked === true).length;
+      count.textContent = done + " of " + items.length + " done";
+    }
+
+    const list = createElement("div", {
+      style: { display: "flex", flexDirection: "column" },
+    });
+
+    items.forEach((item, index) => {
+      const itemId = String(item.id || item.label || "");
+      const row = createElement("div", {
+        role: "checkbox",
+        tabindex: "0",
+        "data-item-id": itemId,
+        style: {
+          display: "flex",
+          alignItems: "center",
+          gap: "12px",
+          padding: "10px 0",
+          borderTop: index === 0 ? "none" : "1px solid " + THEME.border,
+          cursor: "pointer",
+          userSelect: "none",
+        },
+      });
+      const mark = createElement("div", {
+        style: {
+          flex: "0 0 22px",
+          width: "22px",
+          height: "22px",
+          borderRadius: "11px",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          fontSize: "14px",
+          fontWeight: "700",
+          color: "#ffffff",
+        },
+      });
+      const label = createElement(
+        "div",
+        { style: { flex: "1 1 auto", fontSize: "14px" } },
+        item.label || itemId,
+      );
+      row.appendChild(mark);
+      row.appendChild(label);
+      if (item.detail) {
+        row.appendChild(
+          createElement(
+            "div",
+            {
+              style: {
+                flex: "0 0 auto",
+                fontSize: "13px",
+                color: THEME.textSecondary,
+              },
+            },
+            item.detail,
+          ),
+        );
+      }
+
+      function paint() {
+        const checked = item.checked === true;
+        setSafeAttribute(row, "aria-checked", checked ? "true" : "false");
+        mark.textContent = checked ? "\u2713" : "";
+        mark.style.background = checked ? THEME.success : "transparent";
+        mark.style.border = checked
+          ? "2px solid " + THEME.success
+          : "2px solid " + THEME.textMuted;
+        label.style.color = checked ? THEME.textMuted : THEME.textPrimary;
+        label.style.textDecoration = checked ? "line-through" : "none";
+      }
+
+      function toggle() {
+        item.checked = item.checked !== true;
+        paint();
+        updateCount();
+        const owner = row.closest("[data-component-id]");
+        sendMCPNotification("ui/notifications/checklist-changed", {
+          component_id: owner ? owner.getAttribute("data-component-id") : "",
+          item_id: itemId,
+          checked: item.checked,
+        });
+      }
+
+      row.addEventListener("click", toggle);
+      row.addEventListener("keydown", (event) => {
+        if (event.key === " " || event.key === "Enter") {
+          event.preventDefault();
+          toggle();
+        }
+      });
+      paint();
+      list.appendChild(row);
+    });
+
+    updateCount();
+    wrapper.appendChild(list);
+    return wrapper;
+  }
+
   function renderText(props) {
     const styleMap = {
       note: {
@@ -2889,6 +3038,14 @@
     });
   }
 
+  // JSON-RPC notification (no id, no reply) to the host.
+  function sendMCPNotification(method, params) {
+    window.parent.postMessage(
+      { jsonrpc: "2.0", method, params: params || {} },
+      trustedOrigin || "*",
+    );
+  }
+
   function handlePostMessage(event) {
     // TOFU: once trusted, reject other origins
     if (trustedOrigin && event.origin !== trustedOrigin) return;
@@ -2909,8 +3066,16 @@
     // JSON-RPC 2.0 responses
     if (data.jsonrpc !== "2.0") return;
 
-    if (typeof data.id === "number" && mcpPending.has(data.id)) {
-      if (!trustedOrigin && event.origin) trustedOrigin = event.origin;
+    // A response carries result or error. Requests this page sent itself also
+    // arrive here when the page is not in a frame (window.parent === window,
+    // e.g. a native app's web view); they are not responses.
+    const isResponse =
+      Object.hasOwn(data, "result") || Object.hasOwn(data, "error");
+    if (isResponse && typeof data.id === "number" && mcpPending.has(data.id)) {
+      // An opaque origin ("null") cannot be a postMessage target; keep "*".
+      if (!trustedOrigin && event.origin && event.origin !== "null") {
+        trustedOrigin = event.origin;
+      }
       const handler = mcpPending.get(data.id);
       mcpPending.delete(data.id);
       if (data.error) {
@@ -3095,13 +3260,17 @@
   }
 
   async function initialize() {
-    try {
-      await sendMCPRequest("ui/initialize", {
-        appUri: APP_SPEC.uri || "",
-        capabilities: { resize: true },
-      });
-    } catch (_) {
-      // Host may not support ui/initialize -- non-fatal
+    // Only a framed page has a host to greet; a top-level page (a browser
+    // tab, a native app's web view) renders at once.
+    if (window.parent !== window) {
+      try {
+        await sendMCPRequest("ui/initialize", {
+          appUri: APP_SPEC.uri || "",
+          capabilities: { resize: true },
+        });
+      } catch (_) {
+        // Host may not support ui/initialize -- non-fatal
+      }
     }
     fullRender();
   }

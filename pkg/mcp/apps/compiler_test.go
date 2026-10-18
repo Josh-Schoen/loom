@@ -551,7 +551,7 @@ func TestCompiler_ListComponentTypes(t *testing.T) {
 	require.NoError(t, err)
 
 	types := c.ListComponentTypes()
-	require.Len(t, types, 14)
+	require.Len(t, types, 15)
 
 	// Verify all types have required fields populated
 	typeNames := make(map[string]bool)
@@ -692,7 +692,7 @@ func TestCompiler_Validate_AllComponentTypes(t *testing.T) {
 	c, err := NewCompiler()
 	require.NoError(t, err)
 
-	// Validate that all 14 component types are accepted with minimal valid props
+	// Validate that all 15 component types are accepted with minimal valid props
 	types := c.Catalog().ValidTypes()
 	for _, typ := range types {
 		t.Run(typ, func(t *testing.T) {
@@ -781,6 +781,10 @@ func TestCompiler_Validate_AllComponentTypes(t *testing.T) {
 				}
 				assert.NoError(t, c.Validate(spec))
 				return
+			case "checklist":
+				props, _ = structpb.NewStruct(map[string]interface{}{
+					"items": []interface{}{map[string]interface{}{"label": "Milk"}},
+				})
 			default:
 				// For any new type not handled above, use empty struct
 				props, _ = structpb.NewStruct(map[string]interface{}{})
@@ -790,7 +794,7 @@ func TestCompiler_Validate_AllComponentTypes(t *testing.T) {
 				Version: "1.0",
 				Title:   "Type Test: " + typ,
 				Components: []*loomv1.UIComponent{
-					{Type: typ, Props: props},
+					{Type: typ, Props: props, Id: "c1"},
 				},
 			}
 			assert.NoError(t, c.Validate(spec))
@@ -1182,4 +1186,37 @@ func TestRuntimeJS_ColorPalette(t *testing.T) {
 	// so the HSL overflow path is actually reachable.
 	assert.NotContains(t, src, "CHART_PALETTE[i % CHART_PALETTE.length] +",
 		"slice colors must route through chartColorAt, not raw palette indexing")
+}
+
+func TestCompiler_ValidateChecklist(t *testing.T) {
+	c, err := NewCompiler()
+	require.NoError(t, err)
+	checklist := func(id string, items ...interface{}) *loomv1.UIAppSpec {
+		props, err := structpb.NewStruct(map[string]interface{}{"items": items})
+		require.NoError(t, err)
+		return &loomv1.UIAppSpec{Version: "1.0", Components: []*loomv1.UIComponent{{Type: "checklist", Id: id, Props: props}}}
+	}
+	item := func(fields map[string]interface{}) interface{} { return fields }
+
+	assert.NoError(t, c.Validate(checklist("groceries",
+		item(map[string]interface{}{"id": "milk", "label": "Milk", "checked": true}),
+		item(map[string]interface{}{"label": "Eggs", "detail": "12"}))))
+
+	err = c.Validate(checklist("", item(map[string]interface{}{"label": "Milk"})))
+	assert.ErrorContains(t, err, "id is required")
+
+	err = c.Validate(checklist("g", item(map[string]interface{}{"label": "Milk"}), item(map[string]interface{}{"id": "Milk", "label": "Other"})))
+	assert.ErrorContains(t, err, `duplicate item id "Milk"`)
+
+	err = c.Validate(checklist("g", item(map[string]interface{}{"detail": "no label"})))
+	assert.ErrorContains(t, err, "needs a label or id")
+
+	// Nested inside a section, the same rules apply.
+	props, _ := structpb.NewStruct(map[string]interface{}{"items": []interface{}{map[string]interface{}{"label": "Milk"}}})
+	sectionProps, _ := structpb.NewStruct(map[string]interface{}{"title": "Lists"})
+	nested := &loomv1.UIAppSpec{Version: "1.0", Components: []*loomv1.UIComponent{{
+		Type: "section", Props: sectionProps,
+		Children: []*loomv1.UIComponent{{Type: "checklist", Props: props}},
+	}}}
+	assert.ErrorContains(t, c.Validate(nested), "id is required")
 }

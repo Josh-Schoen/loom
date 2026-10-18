@@ -56,8 +56,88 @@ func UIAppTools(compiler AppCompiler, provider AppProvider) []shuttle.Tool {
 		&listComponentTypesTool{compiler: compiler},
 		&updateUIAppTool{compiler: compiler, provider: provider},
 		&deleteUIAppTool{provider: provider},
+		&getUIAppTool{provider: provider},
 	}
 }
+
+// uiComponentSchema describes one spec component, including children for
+// layout components and the id that checklists and data updates need.
+func uiComponentSchema() *shuttle.JSONSchema {
+	return shuttle.NewObjectSchema(
+		"UI component",
+		map[string]*shuttle.JSONSchema{
+			"type":  shuttle.NewStringSchema("Component type identifier from list_component_types (e.g. 'chart', 'table', 'stat-cards', 'checklist')"),
+			"props": shuttle.NewObjectSchema("Type-specific component properties (see list_component_types for prop schemas)", nil, nil),
+			"id":    shuttle.NewStringSchema("Component ID. Required for checklist (ticks are saved against it); optional otherwise"),
+			"children": shuttle.NewArraySchema(
+				"Nested components, for section and tabs only (same structure as a component)",
+				shuttle.NewObjectSchema("Child component", nil, []string{"type"}),
+			),
+		},
+		[]string{"type"},
+	)
+}
+
+// ============================================================================
+// get_ui_app
+// ============================================================================
+
+// getUIAppTool returns an app's current spec, so an agent can change it
+// without losing state people set on the page (checklist ticks).
+type getUIAppTool struct {
+	provider AppProvider
+}
+
+func (t *getUIAppTool) Name() string { return "get_ui_app" }
+
+func (t *getUIAppTool) Description() string {
+	return "Get the current spec of a dynamic UI app, including checklist items people have ticked. Call this before update_ui_app and keep each item's checked value unless asked to change it."
+}
+
+func (t *getUIAppTool) InputSchema() *shuttle.JSONSchema {
+	return shuttle.NewObjectSchema(
+		"Parameters for reading a UI app",
+		map[string]*shuttle.JSONSchema{
+			"name": shuttle.NewStringSchema("App name (required)"),
+		},
+		[]string{"name"},
+	)
+}
+
+func (t *getUIAppTool) Execute(_ context.Context, params map[string]interface{}) (*shuttle.Result, error) {
+	start := time.Now()
+	fail := func(code, msg string) (*shuttle.Result, error) {
+		return &shuttle.Result{
+			Success:         false,
+			Error:           &shuttle.Error{Code: code, Message: msg},
+			ExecutionTimeMs: time.Since(start).Milliseconds(),
+		}, nil
+	}
+
+	name, _ := params["name"].(string)
+	if name == "" {
+		return fail("INVALID_PARAMS", "name is required")
+	}
+	specProvider, ok := t.provider.(AppSpecProvider)
+	if !ok {
+		return fail("PRECONDITION_FAILED", "this server does not keep app specs")
+	}
+	specJSON, err := specProvider.AppSpec(name)
+	if err != nil {
+		return fail("NOT_FOUND", err.Error())
+	}
+	var spec map[string]interface{}
+	if err := json.Unmarshal(specJSON, &spec); err != nil {
+		return fail("INTERNAL", fmt.Sprintf("stored spec is unreadable: %v", err))
+	}
+	return &shuttle.Result{
+		Success:         true,
+		Data:            map[string]interface{}{"name": name, "spec": spec},
+		ExecutionTimeMs: time.Since(start).Milliseconds(),
+	}, nil
+}
+
+func (t *getUIAppTool) Backend() string { return "" }
 
 // ============================================================================
 // create_ui_app
@@ -108,15 +188,7 @@ Records format (all chart types): provide data as row objects plus x_key and ser
 }
 
 func (t *createUIAppTool) InputSchema() *shuttle.JSONSchema {
-	componentSchema := shuttle.NewObjectSchema(
-		"UI component",
-		map[string]*shuttle.JSONSchema{
-			"type":  shuttle.NewStringSchema("Component type identifier from list_component_types (e.g. 'chart', 'table', 'stat-cards')"),
-			"props": shuttle.NewObjectSchema("Type-specific component properties (see list_component_types for prop schemas)", nil, nil),
-			"id":    shuttle.NewStringSchema("Optional ID for postMessage data-binding"),
-		},
-		[]string{"type"},
-	)
+	componentSchema := uiComponentSchema()
 	specSchema := shuttle.NewObjectSchema(
 		"Declarative app spec",
 		map[string]*shuttle.JSONSchema{
@@ -230,7 +302,7 @@ func (t *createUIAppTool) Execute(ctx context.Context, params map[string]interfa
 	overwrite, _ := params["overwrite"].(bool)
 
 	// Create app
-	info, overwritten, err := t.provider.CreateApp(name, displayName, description, html, overwrite)
+	info, overwritten, err := createAppFromSpec(t.provider, name, displayName, description, html, spec, overwrite)
 	if err != nil {
 		return &shuttle.Result{
 			Success:         false,
@@ -340,7 +412,7 @@ func (t *updateUIAppTool) InputSchema() *shuttle.JSONSchema {
 					"version":    shuttle.NewStringSchema("Spec version, always '1.0'").WithDefault("1.0"),
 					"title":      shuttle.NewStringSchema("App/dashboard title"),
 					"layout":     shuttle.NewStringSchema("Layout: 'stack', 'grid-2', 'grid-3', 'grid' (fully responsive 1→2→3→4)").WithDefault("grid"),
-					"components": shuttle.NewArraySchema("UI components", shuttle.NewObjectSchema("Component", map[string]*shuttle.JSONSchema{"type": shuttle.NewStringSchema("Component type"), "props": shuttle.NewObjectSchema("Props", nil, nil)}, []string{"type"})),
+					"components": shuttle.NewArraySchema("UI components", uiComponentSchema()),
 				},
 				[]string{"title", "components"},
 			),
@@ -410,7 +482,7 @@ func (t *updateUIAppTool) Execute(ctx context.Context, params map[string]interfa
 	displayName, _ := params["display_name"].(string)
 	description, _ := params["description"].(string)
 
-	info, err := t.provider.UpdateApp(name, displayName, description, html)
+	info, err := updateAppFromSpec(t.provider, name, displayName, description, html, spec)
 	if err != nil {
 		return &shuttle.Result{
 			Success:         false,

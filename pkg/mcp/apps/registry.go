@@ -45,6 +45,7 @@ type UIResource struct {
 	Meta        *protocol.UIResourceMeta // Security and display metadata
 	Dynamic     bool                     // true = agent-created, false = embedded
 	UpdatedAt   time.Time                // Last create/update (dynamic apps only)
+	Spec        []byte                   // protojson UIAppSpec the HTML was compiled from (dynamic apps; may be nil)
 }
 
 // UIResourceRegistry manages UI resources that the MCP server exposes.
@@ -96,6 +97,7 @@ func (r *UIResourceRegistry) EnablePersistence(dir string) (loaded int, skipped 
 			Meta:        &protocol.UIResourceMeta{PrefersBorder: boolPtrTrue()},
 			Dynamic:     true,
 			UpdatedAt:   app.UpdatedAt,
+			Spec:        specBytes(app.Spec),
 		}
 		if _, err := r.upsertLocked(res); err != nil {
 			skipped = append(skipped, app.Name+".json")
@@ -430,6 +432,12 @@ func (r *UIResourceRegistry) GetAppHTML(name string) ([]byte, *AppInfo, error) {
 // checks existence atomically, and returns the app info. This implements the
 // AppProvider interface for the gRPC server.
 func (r *UIResourceRegistry) CreateApp(name, displayName, description string, html []byte, overwrite bool) (*AppInfo, bool, error) {
+	return r.CreateAppWithSpec(name, displayName, description, html, nil, overwrite)
+}
+
+// CreateAppWithSpec is CreateApp that also keeps spec (protojson UIAppSpec),
+// so the app can later be changed in place (e.g. a checklist tick).
+func (r *UIResourceRegistry) CreateAppWithSpec(name, displayName, description string, html, spec []byte, overwrite bool) (*AppInfo, bool, error) {
 	uri := "ui://loom/" + name
 	res := &UIResource{
 		URI:         uri,
@@ -441,6 +449,7 @@ func (r *UIResourceRegistry) CreateApp(name, displayName, description string, ht
 			PrefersBorder: boolPtrTrue(),
 		},
 		Dynamic: true,
+		Spec:    spec,
 	}
 
 	var notify func()
@@ -481,8 +490,14 @@ func (r *UIResourceRegistry) CreateApp(name, displayName, description string, ht
 }
 
 // UpdateApp updates an existing dynamic app with new HTML. Returns an error
-// if the app doesn't exist or is embedded.
+// if the app doesn't exist or is embedded. The stored spec is dropped, since
+// it no longer matches the HTML.
 func (r *UIResourceRegistry) UpdateApp(name, displayName, description string, html []byte) (*AppInfo, error) {
+	return r.UpdateAppWithSpec(name, displayName, description, html, nil)
+}
+
+// UpdateAppWithSpec is UpdateApp that also replaces the stored spec.
+func (r *UIResourceRegistry) UpdateAppWithSpec(name, displayName, description string, html, spec []byte) (*AppInfo, error) {
 	uri := "ui://loom/" + name
 
 	var notify func()
@@ -517,6 +532,7 @@ func (r *UIResourceRegistry) UpdateApp(name, displayName, description string, ht
 			PrefersBorder: boolPtrTrue(),
 		},
 		Dynamic: true,
+		Spec:    spec,
 	}
 
 	_, err := r.upsertLocked(res)
@@ -540,6 +556,22 @@ func (r *UIResourceRegistry) UpdateApp(name, displayName, description string, ht
 		Dynamic:       true,
 		UpdatedAt:     res.UpdatedAt,
 	}, nil
+}
+
+// AppSpec returns the stored spec (protojson UIAppSpec) of a dynamic app, or
+// an error when the app does not exist or has no stored spec (apps created
+// before specs were kept, or through CreateApp/UpdateApp).
+func (r *UIResourceRegistry) AppSpec(name string) ([]byte, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	res, ok := r.resources["ui://loom/"+name]
+	if !ok || !res.Dynamic {
+		return nil, fmt.Errorf("app not found: %s", name)
+	}
+	if len(res.Spec) == 0 {
+		return nil, fmt.Errorf("app %s has no stored spec", name)
+	}
+	return append([]byte(nil), res.Spec...), nil
 }
 
 // DeleteApp deletes a dynamic app by short name.

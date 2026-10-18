@@ -552,6 +552,46 @@
         ]
       }
     },
+    "/v1/apps/{name}:set-checklist-item": {
+      "post": {
+        "summary": "SetUIAppChecklistItem ticks or unticks one item of a checklist component\nin a dynamic app and saves the app. Pages call this through their host\nwhen a person taps a checklist item. Requires an app whose spec the server\nstored (apps created or updated through CreateUIApp/UpdateUIApp or the\nagent tools); others return FAILED_PRECONDITION.",
+        "operationId": "LoomService_SetUIAppChecklistItem",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/v1SetUIAppChecklistItemResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "name",
+            "description": "App short name",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/LoomServiceSetUIAppChecklistItemBody"
+            }
+          }
+        ],
+        "tags": [
+          "LoomService"
+        ]
+      }
+    },
     "/v1/artifacts": {
       "get": {
         "summary": "ListArtifacts lists artifacts with optional filtering.",
@@ -3455,6 +3495,24 @@
     "LoomServiceResumeScheduleBody": {
       "type": "object",
       "description": "ResumeScheduleRequest resumes a paused schedule."
+    },
+    "LoomServiceSetUIAppChecklistItemBody": {
+      "type": "object",
+      "properties": {
+        "componentId": {
+          "type": "string",
+          "title": "id of the checklist component (UIComponent.id)"
+        },
+        "itemId": {
+          "type": "string",
+          "title": "Item id: the item's \"id\" prop, or its label when it has none"
+        },
+        "checked": {
+          "type": "boolean",
+          "title": "New state"
+        }
+      },
+      "description": "SetUIAppChecklistItemRequest ticks or unticks one checklist item."
     },
     "LoomServiceStartAgentBody": {
       "type": "object",
@@ -8407,6 +8465,15 @@
         }
       },
       "description": "SessionUpdate represents a real-time update for a session.\nSent when new messages arrive or session state changes."
+    },
+    "v1SetUIAppChecklistItemResponse": {
+      "type": "object",
+      "properties": {
+        "app": {
+          "$ref": "#/definitions/v1UIApp"
+        }
+      },
+      "description": "SetUIAppChecklistItemResponse returns the updated app."
     },
     "v1SharedMemoryNamespace": {
       "type": "string",

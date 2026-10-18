@@ -873,6 +873,124 @@ func (x *DeleteUIAppResponse) GetDeleted() bool {
 	return false
 }
 
+// SetUIAppChecklistItemRequest ticks or unticks one checklist item.
+type SetUIAppChecklistItemRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// App short name
+	Name string `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
+	// id of the checklist component (UIComponent.id)
+	ComponentId string `protobuf:"bytes,2,opt,name=component_id,json=componentId,proto3" json:"component_id,omitempty"`
+	// Item id: the item's "id" prop, or its label when it has none
+	ItemId string `protobuf:"bytes,3,opt,name=item_id,json=itemId,proto3" json:"item_id,omitempty"`
+	// New state
+	Checked       bool `protobuf:"varint,4,opt,name=checked,proto3" json:"checked,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SetUIAppChecklistItemRequest) Reset() {
+	*x = SetUIAppChecklistItemRequest{}
+	mi := &file_loom_v1_apps_proto_msgTypes[13]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SetUIAppChecklistItemRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SetUIAppChecklistItemRequest) ProtoMessage() {}
+
+func (x *SetUIAppChecklistItemRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_loom_v1_apps_proto_msgTypes[13]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SetUIAppChecklistItemRequest.ProtoReflect.Descriptor instead.
+func (*SetUIAppChecklistItemRequest) Descriptor() ([]byte, []int) {
+	return file_loom_v1_apps_proto_rawDescGZIP(), []int{13}
+}
+
+func (x *SetUIAppChecklistItemRequest) GetName() string {
+	if x != nil {
+		return x.Name
+	}
+	return ""
+}
+
+func (x *SetUIAppChecklistItemRequest) GetComponentId() string {
+	if x != nil {
+		return x.ComponentId
+	}
+	return ""
+}
+
+func (x *SetUIAppChecklistItemRequest) GetItemId() string {
+	if x != nil {
+		return x.ItemId
+	}
+	return ""
+}
+
+func (x *SetUIAppChecklistItemRequest) GetChecked() bool {
+	if x != nil {
+		return x.Checked
+	}
+	return false
+}
+
+// SetUIAppChecklistItemResponse returns the updated app.
+type SetUIAppChecklistItemResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	App           *UIApp                 `protobuf:"bytes,1,opt,name=app,proto3" json:"app,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SetUIAppChecklistItemResponse) Reset() {
+	*x = SetUIAppChecklistItemResponse{}
+	mi := &file_loom_v1_apps_proto_msgTypes[14]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SetUIAppChecklistItemResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SetUIAppChecklistItemResponse) ProtoMessage() {}
+
+func (x *SetUIAppChecklistItemResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_loom_v1_apps_proto_msgTypes[14]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SetUIAppChecklistItemResponse.ProtoReflect.Descriptor instead.
+func (*SetUIAppChecklistItemResponse) Descriptor() ([]byte, []int) {
+	return file_loom_v1_apps_proto_rawDescGZIP(), []int{14}
+}
+
+func (x *SetUIAppChecklistItemResponse) GetApp() *UIApp {
+	if x != nil {
+		return x.App
+	}
+	return nil
+}
+
 // ListComponentTypesRequest requests the catalog of available component types.
 type ListComponentTypesRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
@@ -882,7 +1000,7 @@ type ListComponentTypesRequest struct {
 
 func (x *ListComponentTypesRequest) Reset() {
 	*x = ListComponentTypesRequest{}
-	mi := &file_loom_v1_apps_proto_msgTypes[13]
+	mi := &file_loom_v1_apps_proto_msgTypes[15]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -894,7 +1012,7 @@ func (x *ListComponentTypesRequest) String() string {
 func (*ListComponentTypesRequest) ProtoMessage() {}
 
 func (x *ListComponentTypesRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_loom_v1_apps_proto_msgTypes[13]
+	mi := &file_loom_v1_apps_proto_msgTypes[15]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -907,7 +1025,7 @@ func (x *ListComponentTypesRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListComponentTypesRequest.ProtoReflect.Descriptor instead.
 func (*ListComponentTypesRequest) Descriptor() ([]byte, []int) {
-	return file_loom_v1_apps_proto_rawDescGZIP(), []int{13}
+	return file_loom_v1_apps_proto_rawDescGZIP(), []int{15}
 }
 
 // ComponentType describes a single component type in the catalog.
@@ -929,7 +1047,7 @@ type ComponentType struct {
 
 func (x *ComponentType) Reset() {
 	*x = ComponentType{}
-	mi := &file_loom_v1_apps_proto_msgTypes[14]
+	mi := &file_loom_v1_apps_proto_msgTypes[16]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -941,7 +1059,7 @@ func (x *ComponentType) String() string {
 func (*ComponentType) ProtoMessage() {}
 
 func (x *ComponentType) ProtoReflect() protoreflect.Message {
-	mi := &file_loom_v1_apps_proto_msgTypes[14]
+	mi := &file_loom_v1_apps_proto_msgTypes[16]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -954,7 +1072,7 @@ func (x *ComponentType) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ComponentType.ProtoReflect.Descriptor instead.
 func (*ComponentType) Descriptor() ([]byte, []int) {
-	return file_loom_v1_apps_proto_rawDescGZIP(), []int{14}
+	return file_loom_v1_apps_proto_rawDescGZIP(), []int{16}
 }
 
 func (x *ComponentType) GetType() string {
@@ -1003,7 +1121,7 @@ type ListComponentTypesResponse struct {
 
 func (x *ListComponentTypesResponse) Reset() {
 	*x = ListComponentTypesResponse{}
-	mi := &file_loom_v1_apps_proto_msgTypes[15]
+	mi := &file_loom_v1_apps_proto_msgTypes[17]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1015,7 +1133,7 @@ func (x *ListComponentTypesResponse) String() string {
 func (*ListComponentTypesResponse) ProtoMessage() {}
 
 func (x *ListComponentTypesResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_loom_v1_apps_proto_msgTypes[15]
+	mi := &file_loom_v1_apps_proto_msgTypes[17]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1028,7 +1146,7 @@ func (x *ListComponentTypesResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListComponentTypesResponse.ProtoReflect.Descriptor instead.
 func (*ListComponentTypesResponse) Descriptor() ([]byte, []int) {
-	return file_loom_v1_apps_proto_rawDescGZIP(), []int{15}
+	return file_loom_v1_apps_proto_rawDescGZIP(), []int{17}
 }
 
 func (x *ListComponentTypesResponse) GetTypes() []*ComponentType {
@@ -1099,7 +1217,14 @@ const file_loom_v1_apps_proto_rawDesc = "" +
 	"\x12DeleteUIAppRequest\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\"/\n" +
 	"\x13DeleteUIAppResponse\x12\x18\n" +
-	"\adeleted\x18\x01 \x01(\bR\adeleted\"\x1b\n" +
+	"\adeleted\x18\x01 \x01(\bR\adeleted\"\x88\x01\n" +
+	"\x1cSetUIAppChecklistItemRequest\x12\x12\n" +
+	"\x04name\x18\x01 \x01(\tR\x04name\x12!\n" +
+	"\fcomponent_id\x18\x02 \x01(\tR\vcomponentId\x12\x17\n" +
+	"\aitem_id\x18\x03 \x01(\tR\x06itemId\x12\x18\n" +
+	"\achecked\x18\x04 \x01(\bR\achecked\"A\n" +
+	"\x1dSetUIAppChecklistItemResponse\x12 \n" +
+	"\x03app\x18\x01 \x01(\v2\x0e.loom.v1.UIAppR\x03app\"\x1b\n" +
 	"\x19ListComponentTypesRequest\"\xc0\x01\n" +
 	"\rComponentType\x12\x12\n" +
 	"\x04type\x18\x01 \x01(\tR\x04type\x12 \n" +
@@ -1122,45 +1247,48 @@ func file_loom_v1_apps_proto_rawDescGZIP() []byte {
 	return file_loom_v1_apps_proto_rawDescData
 }
 
-var file_loom_v1_apps_proto_msgTypes = make([]protoimpl.MessageInfo, 16)
+var file_loom_v1_apps_proto_msgTypes = make([]protoimpl.MessageInfo, 18)
 var file_loom_v1_apps_proto_goTypes = []any{
-	(*UIApp)(nil),                      // 0: loom.v1.UIApp
-	(*ListUIAppsRequest)(nil),          // 1: loom.v1.ListUIAppsRequest
-	(*ListUIAppsResponse)(nil),         // 2: loom.v1.ListUIAppsResponse
-	(*GetUIAppRequest)(nil),            // 3: loom.v1.GetUIAppRequest
-	(*GetUIAppResponse)(nil),           // 4: loom.v1.GetUIAppResponse
-	(*UIAppSpec)(nil),                  // 5: loom.v1.UIAppSpec
-	(*UIComponent)(nil),                // 6: loom.v1.UIComponent
-	(*CreateUIAppRequest)(nil),         // 7: loom.v1.CreateUIAppRequest
-	(*CreateUIAppResponse)(nil),        // 8: loom.v1.CreateUIAppResponse
-	(*UpdateUIAppRequest)(nil),         // 9: loom.v1.UpdateUIAppRequest
-	(*UpdateUIAppResponse)(nil),        // 10: loom.v1.UpdateUIAppResponse
-	(*DeleteUIAppRequest)(nil),         // 11: loom.v1.DeleteUIAppRequest
-	(*DeleteUIAppResponse)(nil),        // 12: loom.v1.DeleteUIAppResponse
-	(*ListComponentTypesRequest)(nil),  // 13: loom.v1.ListComponentTypesRequest
-	(*ComponentType)(nil),              // 14: loom.v1.ComponentType
-	(*ListComponentTypesResponse)(nil), // 15: loom.v1.ListComponentTypesResponse
-	(*timestamppb.Timestamp)(nil),      // 16: google.protobuf.Timestamp
-	(*structpb.Struct)(nil),            // 17: google.protobuf.Struct
+	(*UIApp)(nil),                         // 0: loom.v1.UIApp
+	(*ListUIAppsRequest)(nil),             // 1: loom.v1.ListUIAppsRequest
+	(*ListUIAppsResponse)(nil),            // 2: loom.v1.ListUIAppsResponse
+	(*GetUIAppRequest)(nil),               // 3: loom.v1.GetUIAppRequest
+	(*GetUIAppResponse)(nil),              // 4: loom.v1.GetUIAppResponse
+	(*UIAppSpec)(nil),                     // 5: loom.v1.UIAppSpec
+	(*UIComponent)(nil),                   // 6: loom.v1.UIComponent
+	(*CreateUIAppRequest)(nil),            // 7: loom.v1.CreateUIAppRequest
+	(*CreateUIAppResponse)(nil),           // 8: loom.v1.CreateUIAppResponse
+	(*UpdateUIAppRequest)(nil),            // 9: loom.v1.UpdateUIAppRequest
+	(*UpdateUIAppResponse)(nil),           // 10: loom.v1.UpdateUIAppResponse
+	(*DeleteUIAppRequest)(nil),            // 11: loom.v1.DeleteUIAppRequest
+	(*DeleteUIAppResponse)(nil),           // 12: loom.v1.DeleteUIAppResponse
+	(*SetUIAppChecklistItemRequest)(nil),  // 13: loom.v1.SetUIAppChecklistItemRequest
+	(*SetUIAppChecklistItemResponse)(nil), // 14: loom.v1.SetUIAppChecklistItemResponse
+	(*ListComponentTypesRequest)(nil),     // 15: loom.v1.ListComponentTypesRequest
+	(*ComponentType)(nil),                 // 16: loom.v1.ComponentType
+	(*ListComponentTypesResponse)(nil),    // 17: loom.v1.ListComponentTypesResponse
+	(*timestamppb.Timestamp)(nil),         // 18: google.protobuf.Timestamp
+	(*structpb.Struct)(nil),               // 19: google.protobuf.Struct
 }
 var file_loom_v1_apps_proto_depIdxs = []int32{
-	16, // 0: loom.v1.UIApp.updated_at:type_name -> google.protobuf.Timestamp
+	18, // 0: loom.v1.UIApp.updated_at:type_name -> google.protobuf.Timestamp
 	0,  // 1: loom.v1.ListUIAppsResponse.apps:type_name -> loom.v1.UIApp
 	0,  // 2: loom.v1.GetUIAppResponse.app:type_name -> loom.v1.UIApp
 	6,  // 3: loom.v1.UIAppSpec.components:type_name -> loom.v1.UIComponent
-	17, // 4: loom.v1.UIComponent.props:type_name -> google.protobuf.Struct
+	19, // 4: loom.v1.UIComponent.props:type_name -> google.protobuf.Struct
 	6,  // 5: loom.v1.UIComponent.children:type_name -> loom.v1.UIComponent
 	5,  // 6: loom.v1.CreateUIAppRequest.spec:type_name -> loom.v1.UIAppSpec
 	0,  // 7: loom.v1.CreateUIAppResponse.app:type_name -> loom.v1.UIApp
 	5,  // 8: loom.v1.UpdateUIAppRequest.spec:type_name -> loom.v1.UIAppSpec
 	0,  // 9: loom.v1.UpdateUIAppResponse.app:type_name -> loom.v1.UIApp
-	17, // 10: loom.v1.ComponentType.props_schema:type_name -> google.protobuf.Struct
-	14, // 11: loom.v1.ListComponentTypesResponse.types:type_name -> loom.v1.ComponentType
-	12, // [12:12] is the sub-list for method output_type
-	12, // [12:12] is the sub-list for method input_type
-	12, // [12:12] is the sub-list for extension type_name
-	12, // [12:12] is the sub-list for extension extendee
-	0,  // [0:12] is the sub-list for field type_name
+	0,  // 10: loom.v1.SetUIAppChecklistItemResponse.app:type_name -> loom.v1.UIApp
+	19, // 11: loom.v1.ComponentType.props_schema:type_name -> google.protobuf.Struct
+	16, // 12: loom.v1.ListComponentTypesResponse.types:type_name -> loom.v1.ComponentType
+	13, // [13:13] is the sub-list for method output_type
+	13, // [13:13] is the sub-list for method input_type
+	13, // [13:13] is the sub-list for extension type_name
+	13, // [13:13] is the sub-list for extension extendee
+	0,  // [0:13] is the sub-list for field type_name
 }
 
 func init() { file_loom_v1_apps_proto_init() }
@@ -1174,7 +1302,7 @@ func file_loom_v1_apps_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_loom_v1_apps_proto_rawDesc), len(file_loom_v1_apps_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   16,
+			NumMessages:   18,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

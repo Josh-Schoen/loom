@@ -118,6 +118,7 @@ const (
 	LoomService_CreateUIApp_FullMethodName                 = "/loom.v1.LoomService/CreateUIApp"
 	LoomService_UpdateUIApp_FullMethodName                 = "/loom.v1.LoomService/UpdateUIApp"
 	LoomService_DeleteUIApp_FullMethodName                 = "/loom.v1.LoomService/DeleteUIApp"
+	LoomService_SetUIAppChecklistItem_FullMethodName       = "/loom.v1.LoomService/SetUIAppChecklistItem"
 	LoomService_ListComponentTypes_FullMethodName          = "/loom.v1.LoomService/ListComponentTypes"
 	LoomService_ListAgentPresets_FullMethodName            = "/loom.v1.LoomService/ListAgentPresets"
 	LoomService_ListWorkflowTemplates_FullMethodName       = "/loom.v1.LoomService/ListWorkflowTemplates"
@@ -313,6 +314,12 @@ type LoomServiceClient interface {
 	UpdateUIApp(ctx context.Context, in *UpdateUIAppRequest, opts ...grpc.CallOption) (*UpdateUIAppResponse, error)
 	// DeleteUIApp deletes a dynamic UI app.
 	DeleteUIApp(ctx context.Context, in *DeleteUIAppRequest, opts ...grpc.CallOption) (*DeleteUIAppResponse, error)
+	// SetUIAppChecklistItem ticks or unticks one item of a checklist component
+	// in a dynamic app and saves the app. Pages call this through their host
+	// when a person taps a checklist item. Requires an app whose spec the server
+	// stored (apps created or updated through CreateUIApp/UpdateUIApp or the
+	// agent tools); others return FAILED_PRECONDITION.
+	SetUIAppChecklistItem(ctx context.Context, in *SetUIAppChecklistItemRequest, opts ...grpc.CallOption) (*SetUIAppChecklistItemResponse, error)
 	// ListComponentTypes returns the catalog of available component types
 	// for building dynamic UI apps.
 	ListComponentTypes(ctx context.Context, in *ListComponentTypesRequest, opts ...grpc.CallOption) (*ListComponentTypesResponse, error)
@@ -1237,6 +1244,16 @@ func (c *loomServiceClient) DeleteUIApp(ctx context.Context, in *DeleteUIAppRequ
 	return out, nil
 }
 
+func (c *loomServiceClient) SetUIAppChecklistItem(ctx context.Context, in *SetUIAppChecklistItemRequest, opts ...grpc.CallOption) (*SetUIAppChecklistItemResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(SetUIAppChecklistItemResponse)
+	err := c.cc.Invoke(ctx, LoomService_SetUIAppChecklistItem_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *loomServiceClient) ListComponentTypes(ctx context.Context, in *ListComponentTypesRequest, opts ...grpc.CallOption) (*ListComponentTypesResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ListComponentTypesResponse)
@@ -1466,6 +1483,12 @@ type LoomServiceServer interface {
 	UpdateUIApp(context.Context, *UpdateUIAppRequest) (*UpdateUIAppResponse, error)
 	// DeleteUIApp deletes a dynamic UI app.
 	DeleteUIApp(context.Context, *DeleteUIAppRequest) (*DeleteUIAppResponse, error)
+	// SetUIAppChecklistItem ticks or unticks one item of a checklist component
+	// in a dynamic app and saves the app. Pages call this through their host
+	// when a person taps a checklist item. Requires an app whose spec the server
+	// stored (apps created or updated through CreateUIApp/UpdateUIApp or the
+	// agent tools); others return FAILED_PRECONDITION.
+	SetUIAppChecklistItem(context.Context, *SetUIAppChecklistItemRequest) (*SetUIAppChecklistItemResponse, error)
 	// ListComponentTypes returns the catalog of available component types
 	// for building dynamic UI apps.
 	ListComponentTypes(context.Context, *ListComponentTypesRequest) (*ListComponentTypesResponse, error)
@@ -1738,6 +1761,9 @@ func (UnimplementedLoomServiceServer) UpdateUIApp(context.Context, *UpdateUIAppR
 }
 func (UnimplementedLoomServiceServer) DeleteUIApp(context.Context, *DeleteUIAppRequest) (*DeleteUIAppResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method DeleteUIApp not implemented")
+}
+func (UnimplementedLoomServiceServer) SetUIAppChecklistItem(context.Context, *SetUIAppChecklistItemRequest) (*SetUIAppChecklistItemResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method SetUIAppChecklistItem not implemented")
 }
 func (UnimplementedLoomServiceServer) ListComponentTypes(context.Context, *ListComponentTypesRequest) (*ListComponentTypesResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ListComponentTypes not implemented")
@@ -3235,6 +3261,24 @@ func _LoomService_DeleteUIApp_Handler(srv interface{}, ctx context.Context, dec 
 	return interceptor(ctx, in, info, handler)
 }
 
+func _LoomService_SetUIAppChecklistItem_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SetUIAppChecklistItemRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LoomServiceServer).SetUIAppChecklistItem(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LoomService_SetUIAppChecklistItem_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LoomServiceServer).SetUIAppChecklistItem(ctx, req.(*SetUIAppChecklistItemRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _LoomService_ListComponentTypes_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(ListComponentTypesRequest)
 	if err := dec(in); err != nil {
@@ -3621,6 +3665,10 @@ var LoomService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "DeleteUIApp",
 			Handler:    _LoomService_DeleteUIApp_Handler,
+		},
+		{
+			MethodName: "SetUIAppChecklistItem",
+			Handler:    _LoomService_SetUIAppChecklistItem_Handler,
 		},
 		{
 			MethodName: "ListComponentTypes",

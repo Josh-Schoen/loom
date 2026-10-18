@@ -161,6 +161,8 @@ type MultiAgentServer struct {
 
 	// UI App compiler for CreateUIApp/UpdateUIApp RPCs
 	appCompiler AppCompiler
+	// checklistMu serializes SetUIAppChecklistItem read-modify-writes.
+	checklistMu sync.Mutex
 
 	// Storage backend for health checks and migration RPCs
 	storageBackend     backend.StorageBackend

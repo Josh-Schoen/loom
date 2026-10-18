@@ -23,6 +23,7 @@ import (
 
 	loomv1 "github.com/teradata-labs/loom/gen/go/loom/v1"
 	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/types/known/structpb"
 )
 
 // Structural limits for spec validation.
@@ -228,6 +229,12 @@ func (c *Compiler) validateComponents(components []*loomv1.UIComponent, depth in
 			}
 		}
 
+		if comp.Type == "checklist" {
+			if err := validateChecklist(comp); err != nil {
+				return fmt.Errorf("component[%d] \"checklist\": %w", i, err)
+			}
+		}
+
 		// Validate children
 		if len(comp.Children) > 0 {
 			if !c.catalog.HasChildren(comp.Type) {
@@ -240,6 +247,50 @@ func (c *Compiler) validateComponents(components []*loomv1.UIComponent, depth in
 	}
 
 	return nil
+}
+
+// validateChecklist requires what saving a tick needs: a component id, and
+// item ids (explicit, or the label) that are unique within the checklist.
+func validateChecklist(comp *loomv1.UIComponent) error {
+	if comp.Id == "" {
+		return fmt.Errorf("id is required so ticks can be saved")
+	}
+	seen := make(map[string]bool)
+	for n, item := range ChecklistItems(comp) {
+		id := ChecklistItemID(item)
+		if id == "" {
+			return fmt.Errorf("item %d needs a label or id", n)
+		}
+		if seen[id] {
+			return fmt.Errorf("duplicate item id %q", id)
+		}
+		seen[id] = true
+	}
+	return nil
+}
+
+// ChecklistItems returns the item objects of a checklist component.
+func ChecklistItems(comp *loomv1.UIComponent) []*structpb.Struct {
+	itemsVal, ok := comp.GetProps().GetFields()["items"]
+	if !ok {
+		return nil
+	}
+	var items []*structpb.Struct
+	for _, v := range itemsVal.GetListValue().GetValues() {
+		if obj := v.GetStructValue(); obj != nil {
+			items = append(items, obj)
+		}
+	}
+	return items
+}
+
+// ChecklistItemID is an item's id, or its label when it has none (the
+// runtime uses the same rule).
+func ChecklistItemID(item *structpb.Struct) string {
+	if id := item.GetFields()["id"].GetStringValue(); id != "" {
+		return id
+	}
+	return item.GetFields()["label"].GetStringValue()
 }
 
 // sanitizeStruct recursively checks a map for dangerous keys and values.

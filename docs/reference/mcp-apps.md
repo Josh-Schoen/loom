@@ -19,6 +19,9 @@ Declarative spec format for building interactive UI apps rendered as MCP resourc
   - [gRPC RPCs](#grpc-rpcs)
   - [MCP Tools](#mcp-tools)
   - [Agent Tools](#agent-tools)
+- [Persistence](#persistence)
+- [Checklist State](#checklist-state)
+- [HTTP Access Control](#http-access-control)
 - [Security Constraints](#security-constraints)
 
 ## Overview
@@ -27,7 +30,7 @@ MCP Apps are standalone HTML documents compiled from a declarative JSON spec. Th
 
 - **gRPC**: `CreateUIApp` / `UpdateUIApp` / `DeleteUIApp` RPCs
 - **MCP tools**: `loom_create_app` / `loom_update_app` / `loom_delete_app` (for Claude Code, Cursor, etc.)
-- **Agent tools**: `create_ui_app` / `update_ui_app` / `delete_ui_app` (lazily disclosed to all server-side agents)
+- **Agent tools**: `create_ui_app` / `update_ui_app` / `delete_ui_app` / `get_ui_app` (lazily disclosed to all server-side agents)
 
 Apps are served as MCP resources at `ui://loom/<name>` and via HTTP at `/apps/<name>`.
 
@@ -483,6 +486,39 @@ Roles: `"user"`, `"assistant"`, `"system"`, `"tool"`
 
 ---
 
+#### `checklist`
+
+Tappable list of items. Tapping a row toggles its `checked` value in the page and sends a `ui/notifications/checklist-changed` notification to the host (see [Checklist State](#checklist-state)). The component shows "N of M done" under the list.
+
+**Props:**
+
+| Prop | Type | Required | Description |
+|------|------|----------|-------------|
+| `title` | string | No | Checklist title |
+| `items` | array | Yes | Array of `{id?, label, detail?, checked?}` |
+
+**Constraints** (validation errors on create/update):
+
+- The component needs an `id` (it is how a host addresses it).
+- Each item needs `label` or `id`. An item's identifier is its `id`, or its `label` when it has no `id`; identifiers must be unique within the checklist.
+- `checked` defaults to `false`.
+
+```json
+{
+  "type": "checklist",
+  "id": "groceries",
+  "props": {
+    "title": "Groceries",
+    "items": [
+      {"id": "peppers", "label": "Bell peppers", "detail": "2, any color"},
+      {"id": "tortillas", "label": "Corn tortillas", "checked": true}
+    ]
+  }
+}
+```
+
+---
+
 ## Colors
 
 All components that accept a `color` prop use the Tokyonight Dark theme palette:
@@ -515,7 +551,7 @@ You can also pass hex colors (e.g., `"#ff6b6b"`), but named colors are preferred
 
 ### gRPC RPCs
 
-6 RPCs in `LoomService` (defined in `proto/loom/v1/loom.proto`):
+7 RPCs in `LoomService` (defined in `proto/loom/v1/loom.proto`):
 
 | RPC | HTTP | Description |
 |-----|------|-------------|
@@ -525,6 +561,7 @@ You can also pass hex colors (e.g., `"#ff6b6b"`), but named colors are preferred
 | `UpdateUIApp` | `PUT /v1/apps/{name}` | Update an existing dynamic app |
 | `DeleteUIApp` | `DELETE /v1/apps/{name}` | Delete a dynamic app |
 | `ListComponentTypes` | `GET /v1/apps/component-types` | Discover available component types |
+| `SetUIAppChecklistItem` | `POST /v1/apps/{name}:set-checklist-item` | Tick or untick one checklist item and save the app (see [Checklist State](#checklist-state)) |
 
 ### MCP Tools
 
@@ -542,7 +579,7 @@ Exposed by `loom-mcp` bridge to MCP clients (Claude Code, Cursor, etc.):
 Registered to all server-side Loom agents in one of two ways:
 
 - **Lazy disclosure** (default): the tools appear in the active tool set only when the user message contains UI-related keywords like "dashboard", "chart", "visualization", etc.
-- **Always offered**: an agent whose YAML lists any of these tools under `tools.builtin` (or the flat `tools:` list) has all four from the first turn, whatever the wording. Use this for assistants that build pages on request ("plan my meals for the week"). The startup log shows `mode: declared` or `mode: lazy` per agent.
+- **Always offered**: an agent whose YAML lists any of these tools under `tools.builtin` (or the flat `tools:` list) has all five from the first turn, whatever the wording. Use this for assistants that build pages on request ("plan my meals for the week"). The startup log shows `mode: declared` or `mode: lazy` per agent.
 
 ```yaml
 spec:
@@ -557,16 +594,53 @@ spec:
 | `update_ui_app` | Update an existing dynamic app |
 | `delete_ui_app` | Delete a dynamic app |
 | `list_component_types` | Discover available component types and prop schemas |
+| `get_ui_app` | Return an app's current spec (`{name, spec}`), including checklist ticks. Fails with `NOT_FOUND` for unknown apps or apps without a stored spec |
 
-Agents should call `list_component_types` first to discover the catalog, then use `create_ui_app` with a spec.
+Agents should call `list_component_types` first to discover the catalog, then use `create_ui_app` with a spec. Before `update_ui_app` on an app with a checklist, agents should call `get_ui_app` and keep each item's `checked` value; `update_ui_app` replaces the whole spec, so ticks missing from the new spec are lost.
 
 ## Persistence
 
-`looms serve` stores each dynamic app as `$LOOM_DATA_DIR/apps/<name>.json` (compiled HTML, display name, description, `updated_at`; mode 0600) and loads them at startup, so apps survive restarts. Create, update, and delete write the file before the change is visible; if the write fails, the operation fails and the previous version stays. Unreadable files, files whose `name` does not match the file name, and files beyond the registry limits are skipped (logged) and left in place. Embedded apps are not stored.
+`looms serve` stores each dynamic app as `$LOOM_DATA_DIR/apps/<name>.json` (compiled HTML, the spec it was compiled from, display name, description, `updated_at`; mode 0600) and loads them at startup, so apps survive restarts. Create, update, and delete write the file before the change is visible; if the write fails, the operation fails and the previous version stays. Unreadable files, files whose `name` does not match the file name, and files beyond the registry limits are skipped (logged) and left in place. Embedded apps are not stored.
+
+The spec is stored for apps created or updated from a spec (`CreateUIApp`, `UpdateUIApp`, `create_ui_app`, `update_ui_app`). Files written before specs were stored have none; such apps load and serve as before, but `get_ui_app` and `SetUIAppChecklistItem` fail for them until the next update.
 
 `UIApp.updated_at` (`updatedAt` on the gateway) is the last create or update of a dynamic app; unset for embedded apps.
 
 Apps are shared by all users of a server; there is no per-user ownership.
+
+## Checklist State
+
+A page shows checklist ticks immediately; saving them is the host's job. On each toggle the page posts this JSON-RPC notification to `window.parent` (only when it is framed; target origin is the origin of the host's first response, or `*` before one):
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "ui/notifications/checklist-changed",
+  "params": {"component_id": "groceries", "item_id": "peppers", "checked": true}
+}
+```
+
+A host that renders the page unframed (a native web view) can listen for the same message with a `message` event listener injected at document start.
+
+The host saves the tick with `SetUIAppChecklistItem`:
+
+```bash
+curl -X POST http://localhost:5006/v1/apps/groceries:set-checklist-item \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"component_id": "groceries", "item_id": "peppers", "checked": true}'
+```
+
+The server loads the stored spec, finds the checklist by `id` at any depth (inside `section`/`tabs` children), sets the item's `checked`, recompiles, and saves (same persistence rules as `UpdateUIApp`). Calls are serialized server-wide, so concurrent ticks on one page all land. The response is `{"app": UIApp}` with the new `updated_at`; display name and description are unchanged.
+
+| Code | Condition |
+|------|-----------|
+| `INVALID_ARGUMENT` | Invalid app name, or empty `component_id` / `item_id` |
+| `NOT_FOUND` | Unknown app, no checklist with that `component_id`, or no item with that identifier |
+| `FAILED_PRECONDITION` | The app has no stored spec, or the server has no spec-keeping app store or compiler |
+| `INTERNAL` | Stored spec unreadable, recompile failed, or the save failed (the previous version stays) |
+
+Ticks are stored in the spec, so they survive restarts and appear to every viewer. Apps are shared by all users of a server.
 
 ## HTTP Access Control
 

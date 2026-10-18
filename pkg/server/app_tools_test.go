@@ -36,9 +36,9 @@ func TestUIAppTools_ImplementsShuttleTool(t *testing.T) {
 		html:  map[string][]byte{},
 	})
 
-	require.Len(t, tools, 4)
+	require.Len(t, tools, 5)
 
-	expectedNames := []string{"create_ui_app", "list_component_types", "update_ui_app", "delete_ui_app"}
+	expectedNames := []string{"create_ui_app", "list_component_types", "update_ui_app", "delete_ui_app", "get_ui_app"}
 	for i, tool := range tools {
 		assert.Equal(t, expectedNames[i], tool.Name())
 		assert.NotEmpty(t, tool.Description())

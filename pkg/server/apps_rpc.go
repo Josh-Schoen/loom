@@ -7,6 +7,7 @@ package server
 
 import (
 	"context"
+	"fmt"
 	"regexp"
 	"strings"
 
@@ -15,6 +16,8 @@ import (
 	"go.uber.org/zap"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/types/known/structpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
@@ -36,6 +39,41 @@ type AppProvider interface {
 	CreateApp(name, displayName, description string, html []byte, overwrite bool) (*apps.AppInfo, bool, error)
 	UpdateApp(name, displayName, description string, html []byte) (*apps.AppInfo, error)
 	DeleteApp(name string) error
+}
+
+// AppSpecProvider is implemented by providers that also keep the spec an app
+// was compiled from, so the app can be changed in place later (checklist
+// ticks) and an agent can read it back before updating. apps.UIResourceRegistry
+// implements it; providers that do not still work for everything else.
+type AppSpecProvider interface {
+	CreateAppWithSpec(name, displayName, description string, html, spec []byte, overwrite bool) (*apps.AppInfo, bool, error)
+	UpdateAppWithSpec(name, displayName, description string, html, spec []byte) (*apps.AppInfo, error)
+	AppSpec(name string) ([]byte, error)
+}
+
+// createAppFromSpec stores a compiled app, with its spec when the provider
+// keeps specs.
+func createAppFromSpec(provider AppProvider, name, displayName, description string, html []byte, spec *loomv1.UIAppSpec, overwrite bool) (*apps.AppInfo, bool, error) {
+	if sp, ok := provider.(AppSpecProvider); ok {
+		specJSON, err := protojson.Marshal(spec)
+		if err != nil {
+			return nil, false, fmt.Errorf("marshal spec: %w", err)
+		}
+		return sp.CreateAppWithSpec(name, displayName, description, html, specJSON, overwrite)
+	}
+	return provider.CreateApp(name, displayName, description, html, overwrite)
+}
+
+// updateAppFromSpec is createAppFromSpec for updates.
+func updateAppFromSpec(provider AppProvider, name, displayName, description string, html []byte, spec *loomv1.UIAppSpec) (*apps.AppInfo, error) {
+	if sp, ok := provider.(AppSpecProvider); ok {
+		specJSON, err := protojson.Marshal(spec)
+		if err != nil {
+			return nil, fmt.Errorf("marshal spec: %w", err)
+		}
+		return sp.UpdateAppWithSpec(name, displayName, description, html, specJSON)
+	}
+	return provider.UpdateApp(name, displayName, description, html)
 }
 
 // AppCompiler compiles UIAppSpec to HTML. Separated from AppProvider to keep
@@ -157,7 +195,7 @@ func (s *MultiAgentServer) CreateUIApp(ctx context.Context, req *loomv1.CreateUI
 	}
 
 	// Create app in registry
-	info, overwritten, err := provider.CreateApp(req.Name, displayName, req.Description, html, req.Overwrite)
+	info, overwritten, err := createAppFromSpec(provider, req.Name, displayName, req.Description, html, req.Spec, req.Overwrite)
 	if err != nil {
 		errMsg := err.Error()
 		switch {
@@ -215,7 +253,7 @@ func (s *MultiAgentServer) UpdateUIApp(ctx context.Context, req *loomv1.UpdateUI
 	}
 
 	// Update in registry
-	info, err := provider.UpdateApp(req.Name, req.DisplayName, req.Description, html)
+	info, err := updateAppFromSpec(provider, req.Name, req.DisplayName, req.Description, html, req.Spec)
 	if err != nil {
 		return nil, status.Errorf(codes.NotFound, "%v", err)
 	}
@@ -231,6 +269,83 @@ func (s *MultiAgentServer) UpdateUIApp(ctx context.Context, req *loomv1.UpdateUI
 		App:     appInfoToProto(info),
 		Content: html,
 	}, nil
+}
+
+// SetUIAppChecklistItem ticks or unticks one checklist item and saves the app.
+func (s *MultiAgentServer) SetUIAppChecklistItem(ctx context.Context, req *loomv1.SetUIAppChecklistItemRequest) (*loomv1.SetUIAppChecklistItemResponse, error) {
+	if !appNameRegex.MatchString(req.GetName()) {
+		return nil, status.Errorf(codes.InvalidArgument, "invalid app name %q", req.GetName())
+	}
+	if req.GetComponentId() == "" || req.GetItemId() == "" {
+		return nil, status.Error(codes.InvalidArgument, "component_id and item_id are required")
+	}
+
+	s.mu.RLock()
+	provider := s.appProvider
+	compiler := s.appCompiler
+	s.mu.RUnlock()
+	specProvider, ok := provider.(AppSpecProvider)
+	if !ok || compiler == nil {
+		return nil, status.Error(codes.FailedPrecondition, "this server cannot change apps in place")
+	}
+
+	// Read-modify-write of one app's spec; serialize so concurrent ticks on
+	// the same page do not overwrite each other.
+	s.checklistMu.Lock()
+	defer s.checklistMu.Unlock()
+
+	specJSON, err := specProvider.AppSpec(req.GetName())
+	if err != nil {
+		if strings.Contains(err.Error(), "not found") {
+			return nil, status.Errorf(codes.NotFound, "%v", err)
+		}
+		return nil, status.Errorf(codes.FailedPrecondition, "%v", err)
+	}
+	spec := &loomv1.UIAppSpec{}
+	if err := protojson.Unmarshal(specJSON, spec); err != nil {
+		return nil, status.Errorf(codes.Internal, "stored spec for %s is unreadable: %v", req.GetName(), err)
+	}
+	if err := setChecklistItem(spec.GetComponents(), req.GetComponentId(), req.GetItemId(), req.GetChecked()); err != nil {
+		return nil, err
+	}
+
+	html, err := compiler.Compile(spec)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "recompile %s: %v", req.GetName(), err)
+	}
+	info, err := updateAppFromSpec(provider, req.GetName(), "", "", html, spec)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "save %s: %v", req.GetName(), err)
+	}
+	return &loomv1.SetUIAppChecklistItemResponse{App: appInfoToProto(info)}, nil
+}
+
+// setChecklistItem finds the checklist component componentID (at any depth)
+// and sets the checked prop of its item itemID.
+func setChecklistItem(components []*loomv1.UIComponent, componentID, itemID string, checked bool) error {
+	comp := findComponent(components, componentID)
+	if comp == nil || comp.GetType() != "checklist" {
+		return status.Errorf(codes.NotFound, "checklist %q not found", componentID)
+	}
+	for _, item := range apps.ChecklistItems(comp) {
+		if apps.ChecklistItemID(item) == itemID {
+			item.Fields["checked"] = structpb.NewBoolValue(checked)
+			return nil
+		}
+	}
+	return status.Errorf(codes.NotFound, "item %q not found in checklist %q", itemID, componentID)
+}
+
+func findComponent(components []*loomv1.UIComponent, id string) *loomv1.UIComponent {
+	for _, comp := range components {
+		if comp.GetId() == id {
+			return comp
+		}
+		if found := findComponent(comp.GetChildren(), id); found != nil {
+			return found
+		}
+	}
+	return nil
 }
 
 // DeleteUIApp deletes a dynamic UI app.

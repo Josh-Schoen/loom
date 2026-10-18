@@ -142,6 +142,32 @@ func NewComponentCatalog() *ComponentCatalog {
 			ExampleJSON: `{"type":"key-value","props":{"title":"Database Info","items":[{"key":"Host","value":"prod-db-01"},{"key":"Status","value":"Online","color":"success"}]}}`,
 		},
 		{
+			Type:        "checklist",
+			Description: "Tappable checklist (shopping, packing, chores, to-dos). People tick items on the page and the ticks are saved. Give the component an id; give each item a short stable id (defaults to its label) and set checked to keep a tick when you update the page.",
+			Category:    "display",
+			PropsSchema: map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"title": map[string]interface{}{"type": "string"},
+					"items": map[string]interface{}{
+						"type": "array",
+						"items": map[string]interface{}{
+							"type": "object",
+							"properties": map[string]interface{}{
+								"id":      map[string]interface{}{"type": "string", "description": "Stable item id; defaults to label"},
+								"label":   map[string]interface{}{"type": "string"},
+								"detail":  map[string]interface{}{"type": "string", "description": "Secondary text, e.g. a quantity"},
+								"checked": map[string]interface{}{"type": "boolean"},
+							},
+							"required": []string{"label"},
+						},
+					},
+				},
+				"required": []string{"items"},
+			},
+			ExampleJSON: `{"type":"checklist","id":"groceries","props":{"title":"Produce","items":[{"id":"spinach","label":"Spinach","detail":"2 bags"},{"id":"limes","label":"Limes","detail":"3","checked":true}]}}`,
+		},
+		{
 			Type:        "text",
 			Description: "Text block with inline HTML formatting. Use HTML tags for rich text — NEVER use markdown syntax (no **bold**, no *italic*, no bullet hyphens). Supported tags: <strong>, <em>, <br>, <p>, <ul>, <ol>, <li>, <code>. Optional style: default, note, warning, error.",
 			Category:    "display",

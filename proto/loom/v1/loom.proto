@@ -611,6 +611,18 @@ service LoomService {
     option (google.api.http) = {delete: "/v1/apps/{name}"};
   }
 
+  // SetUIAppChecklistItem ticks or unticks one item of a checklist component
+  // in a dynamic app and saves the app. Pages call this through their host
+  // when a person taps a checklist item. Requires an app whose spec the server
+  // stored (apps created or updated through CreateUIApp/UpdateUIApp or the
+  // agent tools); others return FAILED_PRECONDITION.
+  rpc SetUIAppChecklistItem(SetUIAppChecklistItemRequest) returns (SetUIAppChecklistItemResponse) {
+    option (google.api.http) = {
+      post: "/v1/apps/{name}:set-checklist-item"
+      body: "*"
+    };
+  }
+
   // ListComponentTypes returns the catalog of available component types
   // for building dynamic UI apps.
   rpc ListComponentTypes(ListComponentTypesRequest) returns (ListComponentTypesResponse) {

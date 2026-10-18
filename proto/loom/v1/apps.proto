@@ -179,6 +179,26 @@ message DeleteUIAppResponse {
   bool deleted = 1;
 }
 
+// SetUIAppChecklistItemRequest ticks or unticks one checklist item.
+message SetUIAppChecklistItemRequest {
+  // App short name
+  string name = 1;
+
+  // id of the checklist component (UIComponent.id)
+  string component_id = 2;
+
+  // Item id: the item's "id" prop, or its label when it has none
+  string item_id = 3;
+
+  // New state
+  bool checked = 4;
+}
+
+// SetUIAppChecklistItemResponse returns the updated app.
+message SetUIAppChecklistItemResponse {
+  UIApp app = 1;
+}
+
 // ============================================================================
 // Component Catalog (Discovery)
 // ============================================================================
