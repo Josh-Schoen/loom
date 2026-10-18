@@ -114,6 +114,25 @@ func TestRespond_AfterToolUsesResultAndDoesNotRecall(t *testing.T) {
 	assert.Equal(t, "Not saved: DECLINED_BY_USER", s.Respond(declined, nil).Content)
 }
 
+// System notes the agent adds to a call (request context, soft reminders)
+// come after the conversation; they are not turns.
+func TestRespond_IgnoresTrailingSystemNotes(t *testing.T) {
+	s := mustParse(t, reminderScript)
+	note := types.Message{Role: "system", Content: "Context sent with this message: local_time ..."}
+	history := []types.Message{
+		user("remind me to buy milk"),
+		{Role: "assistant", ToolCalls: []types.ToolCall{{ID: "c1", Name: "device_add_reminder"}}},
+		{Role: "tool", ToolUseID: "c1", Content: `{"reminder_id":"r1"}`, ToolResult: &shuttle.Result{Success: true}},
+		note,
+	}
+	resp := s.Respond(history, offer("device_add_reminder"))
+	assert.Empty(t, resp.ToolCalls, "the tool result is still the newest turn")
+	assert.Equal(t, `Saved: {"reminder_id":"r1"}`, resp.Content)
+
+	resp = s.Respond([]types.Message{user("remind me to buy milk"), note, note}, offer("device_add_reminder"))
+	require.Len(t, resp.ToolCalls, 1, "a user message followed by notes is still the user's turn")
+}
+
 func TestRespond_FirstMatchingRuleWins(t *testing.T) {
 	s := mustParse(t, reminderScript)
 	assert.Equal(t, "Hi there.", s.Respond([]types.Message{user("Hello loom")}, nil).Content)

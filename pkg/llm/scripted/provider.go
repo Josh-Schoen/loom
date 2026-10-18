@@ -128,14 +128,20 @@ func conversationState(messages []types.Message) (TemplateData, bool) {
 			break
 		}
 	}
-	if len(messages) == 0 || messages[len(messages)-1].Role != "tool" {
+	// Trailing system messages are notes for this call (request context, soft
+	// reminders), not turns: the newest turn is the last message before them.
+	last := len(messages) - 1
+	for last >= 0 && messages[last].Role == "system" {
+		last--
+	}
+	if last < 0 || messages[last].Role != "tool" {
 		return data, false
 	}
 
-	newest := messages[len(messages)-1]
+	newest := messages[last]
 	data.ToolResult = messageText(newest)
 	data.ToolSucceeded = newest.ToolResult == nil || newest.ToolResult.Success
-	for i := len(messages) - 2; i >= 0 && data.ToolName == ""; i-- {
+	for i := last - 1; i >= 0 && data.ToolName == ""; i-- {
 		for _, call := range messages[i].ToolCalls {
 			if call.ID == newest.ToolUseID {
 				data.ToolName = call.Name

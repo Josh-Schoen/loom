@@ -16,6 +16,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Scripted provider: `after_tool` rules match with system notes present** — the provider treated the newest message as the newest turn, so a trailing system note (the new request context, a soft reminder) hid a tool result: `after_tool` rules stopped matching and tool-calling rules fired again in a loop. Trailing system messages are now skipped.
+
 - **`get_ui_app` in agent YAML no longer logged as an unknown builtin tool** — declaring it under `tools` logged "Unknown builtin tool" although the UI app subsystem provides it.
 
 - **`WeaveRequest.context` now reaches the model** — the field was documented as "context variables for prompt interpolation" but nothing read it. Its entries are now shown to the model as a system note on every LLM call of that request (`Context sent with this message ...`), never stored in the session or history, so a client can send facts like its `local_time` and `time_zone` (at most 16 entries; keys 64, values 256 characters). Reference: `docs/reference/streaming.md`.
