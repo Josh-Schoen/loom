@@ -293,6 +293,11 @@ type DevicePairingConfig struct {
 	// LinkScheme is the URL scheme of pairing links (default: "loompair")
 	LinkScheme string `mapstructure:"link_scheme"`
 
+	// LinkBase, when set, is an https URL pairing links are built on instead
+	// of link_scheme, e.g. "https://setup.example.com/pair": links become
+	// <link_base>#server=...&code=... (default: empty)
+	LinkBase string `mapstructure:"link_base"`
+
 	// CodeTTLSeconds is how long a pairing code works (default: 600, max: 3600)
 	CodeTTLSeconds int `mapstructure:"code_ttl_seconds"`
 }
@@ -1168,6 +1173,7 @@ func setDefaults() {
 	viper.SetDefault("server.device_pairing.required", false)
 	viper.SetDefault("server.device_pairing.public_url", "")
 	viper.SetDefault("server.device_pairing.link_scheme", "loompair")
+	viper.SetDefault("server.device_pairing.link_base", "")
 	viper.SetDefault("server.device_pairing.code_ttl_seconds", 600)
 
 	// CORS defaults (permissive for development, MUST be configured for production)
@@ -1520,6 +1526,12 @@ func (c *Config) validateDevicePairing() error {
 	}
 	if !linkSchemePattern.MatchString(d.LinkScheme) {
 		return fmt.Errorf("server.device_pairing.link_scheme %q is not a valid URL scheme", d.LinkScheme)
+	}
+	if d.LinkBase != "" {
+		u, err := url.Parse(d.LinkBase)
+		if err != nil || u.Scheme != "https" || u.Host == "" || u.RawQuery != "" || u.Fragment != "" || u.User != nil {
+			return fmt.Errorf("server.device_pairing.link_base must be an https URL with a host and no query or fragment, got %q", d.LinkBase)
+		}
 	}
 	if d.PublicURL != "" {
 		u, err := url.Parse(d.PublicURL)

@@ -4068,6 +4068,7 @@ func buildDeviceServer(config *Config, defaultUserID string, logger *zap.Logger)
 		PublicURL:     dp.PublicURL,
 		HTTPPort:      config.Server.HTTPPort,
 		LinkScheme:    dp.LinkScheme,
+		LinkBase:      dp.LinkBase,
 		CodeTTL:       time.Duration(dp.CodeTTLSeconds) * time.Second,
 		DefaultUserID: defaultUserID,
 		AdminToken:    adminToken,

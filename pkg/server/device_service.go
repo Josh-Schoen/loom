@@ -53,7 +53,15 @@ type DevicePairingConfig struct {
 	// HTTPPort is the gateway port used when PublicURL is empty.
 	HTTPPort int
 	// LinkScheme is the URL scheme of pairing links (default "loompair").
+	// Ignored when LinkBase is set.
 	LinkScheme string
+	// LinkBase, when set, is an https URL (e.g. "https://setup.example.com/pair")
+	// that pairing links are built on instead of LinkScheme: the server and
+	// code go in the fragment ("#server=...&code=..."), which browsers do not
+	// send to the web host. Opened on a phone with the app, an associated
+	// domain hands the link to the app; without the app, the page there can
+	// offer the download.
+	LinkBase string
 	// CodeTTL is the default and maximum pairing code lifetime.
 	CodeTTL time.Duration
 	// DefaultUserID is the user a device acts as when the code names none.
@@ -123,10 +131,16 @@ func (s *DeviceServer) CreatePairingCode(_ context.Context, req *loomv1.CreatePa
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "create pairing code: %v", err)
 	}
-	link := url.URL{
-		Scheme:   s.cfg.LinkScheme,
-		Host:     "pair",
-		RawQuery: url.Values{"server": {serverURL}, "code": {code}}.Encode(),
+	params := url.Values{"server": {serverURL}, "code": {code}}.Encode()
+	link := url.URL{Scheme: s.cfg.LinkScheme, Host: "pair", RawQuery: params}
+	if s.cfg.LinkBase != "" {
+		base, err := url.Parse(s.cfg.LinkBase)
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "invalid link base: %v", err)
+		}
+		link = *base
+		link.RawFragment = params
+		link.Fragment, _ = url.PathUnescape(params)
 	}
 	s.logger.Info("pairing code issued", zap.String("user_id", userID), zap.Time("expires_at", expires))
 	return &loomv1.CreatePairingCodeResponse{

@@ -51,6 +51,11 @@ func TestValidateDevicePairing(t *testing.T) {
 		{"public url without scheme", func(c *Config) { c.Server.DevicePairing.PublicURL = "assistant.example.com" }, true},
 		{"public url wrong scheme", func(c *Config) { c.Server.DevicePairing.PublicURL = "ftp://host" }, true},
 		{"no gateway and no public url", func(c *Config) { c.Server.HTTPPort = 0 }, true},
+		{"https link base passes", func(c *Config) { c.Server.DevicePairing.LinkBase = "https://setup.example.com/pair" }, false},
+		{"http link base", func(c *Config) { c.Server.DevicePairing.LinkBase = "http://setup.example.com/pair" }, true},
+		{"link base with query", func(c *Config) { c.Server.DevicePairing.LinkBase = "https://setup.example.com/pair?x=1" }, true},
+		{"link base with fragment", func(c *Config) { c.Server.DevicePairing.LinkBase = "https://setup.example.com/pair#x" }, true},
+		{"link base without host", func(c *Config) { c.Server.DevicePairing.LinkBase = "https:///pair" }, true},
 		{"no gateway with public url", func(c *Config) {
 			c.Server.HTTPPort = 0
 			c.Server.DevicePairing.PublicURL = "https://proxy.example.com"

@@ -46,6 +46,7 @@ All keys are under `server.device_pairing`.
 | `enabled` | bool | `false` | Register `DeviceService` and accept device tokens. |
 | `required` | bool | `false` | Reject requests that carry no credential (`UNAUTHENTICATED`). Enables session ownership enforcement. Keep `false` while unpaired clients (CLI, TUI) connect. |
 | `public_url` | string | `""` | Gateway URL put in pairing links. Empty: `http://<first private IPv4>:<http_port>`, usable only on the same network and unencrypted. Must be `http` or `https` with a host. |
+| `link_base` | string | empty | An `https` URL (host, optional path; no query or fragment) to build pairing links on instead of `link_scheme`, e.g. `https://setup.example.com/pair`. Use it with a client that claims that domain (iOS associated domains), so one QR code opens the app if installed and a download page if not. |
 | `link_scheme` | string | `loompair` | URL scheme of pairing links (RFC 3986 scheme syntax). Must match the scheme the client app registers. The default avoids `loom`, which other apps may already claim on a phone. |
 | `code_ttl_seconds` | int | `600` | Code lifetime and the maximum a request may ask for. Range 60–3600. |
 
@@ -125,6 +126,18 @@ negative = `INVALID_ARGUMENT`). Response: `code`, `expires_at`, `server_url`,
 ```
 
 Example: `loompair://pair?code=DSE5KEC3ZQZD2SEQSAKQ5QF5GCL4BRVY&server=http%3A%2F%2F192.168.1.20%3A5006`
+
+With `link_base` set, the same values go in the fragment:
+
+```
+<link_base>#code=<code>&server=<url-encoded server_url>
+```
+
+Example: `https://setup.example.com/pair#code=DSE5KEC3ZQZD2SEQSAKQ5QF5GCL4BRVY&server=http%3A%2F%2F192.168.1.20%3A5006`
+
+Browsers do not send the fragment to the web host, so a page at `link_base`
+never receives the code; a page that wants to hand the link to the app reads
+it from `location.hash` in the browser.
 
 Clients should accept only `http`/`https` server URLs and treat the code as a
 secret until redeemed.

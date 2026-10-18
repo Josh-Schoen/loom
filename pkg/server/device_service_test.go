@@ -104,6 +104,37 @@ func TestCreatePairingCodeBuildsLink(t *testing.T) {
 	assert.Equal(t, codes.InvalidArgument, status.Code(err))
 }
 
+func TestCreatePairingCodeOnLinkBase(t *testing.T) {
+	dir := t.TempDir()
+	m, err := devices.Open(filepath.Join(dir, "devices.json"))
+	require.NoError(t, err)
+	admin, err := devices.LoadOrCreateAdminToken(filepath.Join(dir, "device-admin.token"))
+	require.NoError(t, err)
+	s, err := NewDeviceServer(m, DevicePairingConfig{
+		PublicURL:  "http://192.168.1.20:5006",
+		LinkBase:   "https://setup.example.com/pair",
+		CodeTTL:    10 * time.Minute,
+		AdminToken: admin,
+	})
+	require.NoError(t, err)
+
+	resp, err := s.CreatePairingCode(context.Background(), &loomv1.CreatePairingCodeRequest{})
+	require.NoError(t, err)
+	link, err := url.Parse(resp.GetPairingLink())
+	require.NoError(t, err)
+	assert.Equal(t, "https", link.Scheme)
+	assert.Equal(t, "setup.example.com", link.Host)
+	assert.Equal(t, "/pair", link.Path)
+	assert.Empty(t, link.RawQuery, "nothing secret is sent to the web host")
+	params, err := url.ParseQuery(link.EscapedFragment())
+	require.NoError(t, err)
+	assert.Equal(t, resp.GetServerUrl(), params.Get("server"))
+	assert.Equal(t, resp.GetCode(), params.Get("code"))
+	assert.Equal(t,
+		"https://setup.example.com/pair#"+url.Values{"server": {resp.GetServerUrl()}, "code": {resp.GetCode()}}.Encode(),
+		resp.GetPairingLink())
+}
+
 func TestRedeemPairingCode(t *testing.T) {
 	s := newTestDeviceServer(t, false)
 	created, err := s.CreatePairingCode(context.Background(), &loomv1.CreatePairingCodeRequest{UserId: "alice"})
