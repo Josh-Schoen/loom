@@ -288,7 +288,12 @@ type WeaveRequest struct {
 	MaxRounds int32 `protobuf:"varint,4,opt,name=max_rounds,json=maxRounds,proto3" json:"max_rounds,omitempty"`
 	// Timeout in seconds (default: 300)
 	TimeoutSeconds int32 `protobuf:"varint,5,opt,name=timeout_seconds,json=timeoutSeconds,proto3" json:"timeout_seconds,omitempty"`
-	// Context variables for prompt interpolation
+	// Facts the agent should know for this request only, such as the
+	// client's local time and time zone (e.g. local_time, time_zone). Shown
+	// to the model as a system note on every LLM call of this turn; never
+	// stored in the session or returned in conversation history. At most 16
+	// entries are used (in key order); keys are cut to 64 and values to 256
+	// characters, each on one line.
 	Context map[string]string `protobuf:"bytes,6,rep,name=context,proto3" json:"context,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
 	// Force specific pattern (bypass pattern selection)
 	ForcePattern string `protobuf:"bytes,7,opt,name=force_pattern,json=forcePattern,proto3" json:"force_pattern,omitempty"`

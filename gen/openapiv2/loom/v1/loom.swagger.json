@@ -10561,7 +10561,7 @@
           "additionalProperties": {
             "type": "string"
           },
-          "title": "Context variables for prompt interpolation"
+          "description": "Facts the agent should know for this request only, such as the\nclient's local time and time zone (e.g. local_time, time_zone). Shown\nto the model as a system note on every LLM call of this turn; never\nstored in the session or returned in conversation history. At most 16\nentries are used (in key order); keys are cut to 64 and values to 256\ncharacters, each on one line."
         },
         "forcePattern": {
           "type": "string",

@@ -16,6 +16,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`WeaveRequest.context` now reaches the model** — the field was documented as "context variables for prompt interpolation" but nothing read it. Its entries are now shown to the model as a system note on every LLM call of that request (`Context sent with this message ...`), never stored in the session or history, so a client can send facts like its `local_time` and `time_zone` (at most 16 entries; keys 64, values 256 characters). Reference: `docs/reference/streaming.md`.
+
 - **Graph memory per-user follow-ups** — `GraphMemoryService.Forget` returned `INTERNAL` for a memory that does not exist or belongs to another user; it now returns `NOT_FOUND`. The skill-eviction salience boost ran without a user identity, so with per-user graph memory it reached only `default-user`'s memories; it now runs as the user whose session used the skill.
 
 - **Sessions readable after a restart** — `GetSession`, `GetConversationHistory`, and `ListSessions` looked only at sessions loaded in memory, and a session is loaded from the store only when its next message arrives. After `looms serve` restarted, a client reopening a conversation got `NOT_FOUND` and an empty list although the next message continued it. They now fall back to the session store (owner-scoped, as before: another user's session still answers as not found). Reading does not load the session into memory.

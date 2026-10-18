@@ -527,7 +527,7 @@ message WeaveRequest {
   map<string, string> backend_config = 3; // Optional: Backend configuration overrides
   int32 max_rounds = 4;               // Optional: Maximum execution rounds (default: 3)
   int32 timeout_seconds = 5;          // Optional: Timeout in seconds (default: 300)
-  map<string, string> context = 6;    // Optional: Context variables for prompt interpolation
+  map<string, string> context = 6;    // Optional: facts for this request only (e.g. local_time, time_zone); see below
   string force_pattern = 7;           // Optional: Force specific pattern (bypass selection)
   bool enable_trace = 8;              // Optional: Enable tracing for this request
   string agent_id = 9;               // Optional: Agent ID to route request to (uses default if empty)
@@ -535,6 +535,19 @@ message WeaveRequest {
   google.protobuf.Timestamp occurred_at = 11; // Optional: historical arrival time for replayed/imported conversations
 }
 ```
+
+**`context` (per-request facts):** key/value facts the model should know for
+this request only, such as a phone app's `local_time`
+(`2026-10-18T07:05:00-05:00`) and `time_zone` (`America/Chicago`), so "tomorrow
+at 5pm" resolves in the person's time zone. The agent adds them as a system
+note ("Context sent with this message ...") to every LLM call of the turn,
+after the conversation; they are never added to the session, persisted, or
+returned by `GetConversationHistory`. At most 16 entries are used (in key
+order); keys are cut to 64 and values to 256 characters, line breaks become
+spaces. On Anthropic the note becomes the last system block: the tools and
+system prompt before it stay cacheable, but conversation messages after it are
+not read from the prompt cache on calls that carry a different note (the
+graph memory recall note behaves the same way).
 
 **`occurred_at` (replay/import only):** when set, every message persisted
 during the call — user turn, assistant reply, tool rows — carries this

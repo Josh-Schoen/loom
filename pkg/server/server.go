@@ -130,6 +130,9 @@ func (s *Server) Weave(ctx context.Context, req *loomv1.WeaveRequest) (*loomv1.W
 	if err != nil {
 		return nil, err
 	}
+	// Request facts the model sees for this turn only (e.g. the caller's
+	// local time); see agent.WithRequestContext.
+	ctx = agent.WithRequestContext(ctx, req.GetContext())
 
 	// Get or create session
 	sessionID := req.SessionId
@@ -212,6 +215,9 @@ func (s *Server) StreamWeave(req *loomv1.WeaveRequest, stream loomv1.LoomService
 	if err != nil {
 		return err
 	}
+	// Request facts the model sees for this turn only (e.g. the caller's
+	// local time); see agent.WithRequestContext.
+	ctx = agent.WithRequestContext(ctx, req.GetContext())
 
 	// Generate session ID if not provided
 	sessionID := req.SessionId

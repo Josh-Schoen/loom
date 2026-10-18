@@ -864,6 +864,9 @@ func (s *MultiAgentServer) Weave(ctx context.Context, req *loomv1.WeaveRequest) 
 	if err != nil {
 		return nil, err
 	}
+	// Request facts the model sees for this turn only (e.g. the caller's
+	// local time); see agent.WithRequestContext.
+	ctx = agent.WithRequestContext(ctx, req.GetContext())
 
 	// Get agent: if no agent_id specified but session_id is, look up which agent owns the session.
 	// This fixes the bug where Weave(session_id=X) without agent_id falls through to the
@@ -1091,6 +1094,9 @@ func (s *MultiAgentServer) StreamWeave(req *loomv1.WeaveRequest, stream loomv1.L
 	if err != nil {
 		return err
 	}
+	// Request facts the model sees for this turn only (e.g. the caller's
+	// local time); see agent.WithRequestContext.
+	ctx = agent.WithRequestContext(ctx, req.GetContext())
 
 	// Get agent: if no agent_id specified but session_id is, look up which agent owns the session.
 	var ag *agent.Agent

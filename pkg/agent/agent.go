@@ -2451,7 +2451,10 @@ func (a *Agent) runConversationLoop(ctx Context) (*Response, error) {
 		// withReminder appends the turn's soft reminder as a trailing system
 		// message on a copy — transient, past every cache breakpoint, never
 		// stored — so both the normal send and the recovery resend carry it.
+		// The request context (WeaveRequest.context, e.g. the caller's local
+		// time) is applied the same way: transient, every call of the turn.
 		withReminder := func(msgs []Message) []Message {
+			msgs = withRequestContext(ctx, msgs)
 			if softReminder == "" {
 				return msgs
 			}
@@ -3148,7 +3151,7 @@ func (a *Agent) synthesizeFinalResponse(ctx Context, session *Session, turnCount
 	}, false)
 
 	// Make final LLM call WITHOUT tools to force synthesis
-	finalResp, err := a.chatWithRetry(ctx, session.GetMessages(), nil)
+	finalResp, err := a.chatWithRetry(ctx, withRequestContext(ctx, session.GetMessages()), nil)
 	if err != nil {
 		// Only fall back to guidance message if synthesis fails
 		maxTurnsMessage := a.getGuidanceMessage(ctx, "max_turns_reached", nil)
