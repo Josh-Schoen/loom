@@ -16,6 +16,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Sessions readable after a restart** — `GetSession`, `GetConversationHistory`, and `ListSessions` looked only at sessions loaded in memory, and a session is loaded from the store only when its next message arrives. After `looms serve` restarted, a client reopening a conversation got `NOT_FOUND` and an empty list although the next message continued it. They now fall back to the session store (owner-scoped, as before: another user's session still answers as not found). Reading does not load the session into memory.
+
 - **Anthropic: current models no longer rejected** — the Anthropic client always sent `temperature` (default 1.0), which Claude Opus 4.7 and later Opus, Fable, and Mythos reject with a 400 (Sonnet 5.x and Haiku 5.x reject non-default values). It now omits sampling parameters for those models (`pkg/llm/anthropic/models.go`); older models are unchanged. On the Claude API endpoint, Claude Opus 5.5, Opus 5, Fable 5.1, and Sonnet 5.5 requests also send `"fallbacks": "default"` (beta `server-side-fallback-2026-07-01`), so a safety-classifier refusal is retried on another model instead of returning an empty reply.
 
 - **UI app runtime message handling** — the runtime treated any incoming message with an `id` as a response, including its own `ui/initialize` request when the page was not framed (a native web view), which set the trusted origin to `"null"` and made later `postMessage` calls throw. It now treats only messages with `result` or `error` as responses, never trusts a `"null"` origin, and skips the `ui/initialize` handshake when not framed.

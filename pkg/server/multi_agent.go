@@ -3154,8 +3154,6 @@ func (s *MultiAgentServer) GetSession(ctx context.Context, req *loomv1.GetSessio
 
 	// Try to find the session in any agent
 	s.mu.RLock()
-	defer s.mu.RUnlock()
-
 	for _, ag := range s.agents {
 		session, ok := ag.GetSession(req.SessionId)
 		if ok {
@@ -3163,11 +3161,32 @@ func (s *MultiAgentServer) GetSession(ctx context.Context, req *loomv1.GetSessio
 			if !s.sessionAccessibleBy(callerUserID, session) {
 				continue
 			}
+			s.mu.RUnlock()
 			return ConvertSession(session), nil
 		}
 	}
+	s.mu.RUnlock()
 
+	if stored := s.storedSession(ctx, req.SessionId, callerUserID); stored != nil {
+		return ConvertSession(stored), nil
+	}
 	return nil, status.Error(codes.NotFound, "session not found")
+}
+
+// storedSession returns the caller's persisted session when no agent has it
+// loaded, as after a restart: a session is restored into memory only when its
+// next message arrives, and reading it must not wait for that. The store read
+// is owner-scoped; nil when absent, not the caller's, or there is no store.
+// A failed read counts as absent, as in resolveSessionOwner.
+func (s *MultiAgentServer) storedSession(ctx context.Context, sessionID, callerUserID string) *agent.Session {
+	if s.sessionStore == nil {
+		return nil
+	}
+	stored, err := s.sessionStore.LoadSession(ctx, sessionID)
+	if err != nil || stored == nil || !s.sessionAccessibleBy(callerUserID, stored) {
+		return nil
+	}
+	return stored
 }
 
 // ListSessions lists all sessions across all agents.
@@ -3183,9 +3202,11 @@ func (s *MultiAgentServer) ListSessions(ctx context.Context, req *loomv1.ListSes
 
 	s.mu.RLock()
 	var memSessions []*agent.Session
+	loaded := make(map[string]bool)
 	for _, ag := range s.agents {
 		sessions := ag.ListSessions()
 		for _, sess := range sessions {
+			loaded[sess.ID] = true
 			if !s.sessionAccessibleBy(callerUserID, sess) {
 				continue
 			}
@@ -3193,6 +3214,23 @@ func (s *MultiAgentServer) ListSessions(ctx context.Context, req *loomv1.ListSes
 		}
 	}
 	s.mu.RUnlock()
+
+	// Persisted sessions no agent has loaded yet (after a restart) are the
+	// caller's too; the store lists only the caller's own.
+	if s.sessionStore != nil {
+		storedIDs, err := s.sessionStore.ListSessions(ctx)
+		if err != nil {
+			s.logger.Warn("list persisted sessions failed", zap.Error(err))
+		}
+		for _, id := range storedIDs {
+			if loaded[id] {
+				continue
+			}
+			if stored := s.storedSession(ctx, id, callerUserID); stored != nil {
+				memSessions = append(memSessions, stored)
+			}
+		}
+	}
 
 	allSessions := make([]*loomv1.Session, 0, len(memSessions))
 	for _, sess := range memSessions {
@@ -3303,26 +3341,33 @@ func (s *MultiAgentServer) GetConversationHistory(ctx context.Context, req *loom
 			if !s.sessionAccessibleBy(callerUserID, session) {
 				continue
 			}
-			// Reload messages from database to ensure IDs are populated
-			// (in-memory messages don't have database IDs until reloaded)
-			messages, err := s.sessionStore.LoadMessages(ctx, req.SessionId)
-			if err != nil {
-				return nil, status.Errorf(codes.Internal, "failed to load messages: %v", err)
-			}
-
-			protoMessages := make([]*loomv1.Message, len(messages))
-			for i, msg := range messages {
-				protoMessages[i] = ConvertMessage(&msg)
-			}
-
-			return &loomv1.ConversationHistory{
-				SessionId: req.SessionId,
-				Messages:  protoMessages,
-			}, nil
+			return s.storedHistory(ctx, req.SessionId)
 		}
 	}
 
+	if s.storedSession(ctx, req.SessionId, callerUserID) != nil {
+		return s.storedHistory(ctx, req.SessionId)
+	}
 	return nil, status.Error(codes.NotFound, "session not found")
+}
+
+// storedHistory reads a session's messages from the database, so IDs are
+// populated (in-memory messages don't have database IDs until reloaded).
+func (s *MultiAgentServer) storedHistory(ctx context.Context, sessionID string) (*loomv1.ConversationHistory, error) {
+	messages, err := s.sessionStore.LoadMessages(ctx, sessionID)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to load messages: %v", err)
+	}
+
+	protoMessages := make([]*loomv1.Message, len(messages))
+	for i, msg := range messages {
+		protoMessages[i] = ConvertMessage(&msg)
+	}
+
+	return &loomv1.ConversationHistory{
+		SessionId: sessionID,
+		Messages:  protoMessages,
+	}, nil
 }
 
 // ListTools lists all registered tools from the default agent.

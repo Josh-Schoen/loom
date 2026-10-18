@@ -236,3 +236,52 @@ func TestWeaveStoreOnlySessionCannotBeSquatted(t *testing.T) {
 	require.Error(t, err)
 	assert.Equal(t, codes.FailedPrecondition, status.Code(err))
 }
+
+// After a restart a session lives only in the store until its next message
+// arrives. Its owner can still read it (a phone reopening the conversation
+// shows it); anyone else gets exactly what a missing session produces.
+func TestStoreOnlySessionIsReadableByOwnerOnly(t *testing.T) {
+	store, err := agent.NewSessionStore(filepath.Join(t.TempDir(), "sessions.db"), observability.NewNoOpTracer())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = store.Close() })
+
+	ag := createTestAgent()
+	srv := NewMultiAgentServer(map[string]*agent.Agent{"agent-1": ag}, store)
+	srv.SetEnforceSessionOwnership(true)
+
+	ownerCtx := ctxFor("owner")
+	stored := &agent.Session{ID: "stored-only", Name: "Conversation", AgentID: ag.GetName(), Context: map[string]interface{}{}}
+	require.NoError(t, store.SaveSession(ownerCtx, stored))
+	require.NoError(t, store.SaveMessage(ownerCtx, "stored-only", &agent.Message{Role: "user", Content: "plan my meals"}, true))
+	_, inMemory := ag.GetSession("stored-only")
+	require.False(t, inMemory)
+
+	got, err := srv.GetSession(ownerCtx, &loomv1.GetSessionRequest{SessionId: "stored-only"})
+	require.NoError(t, err)
+	assert.Equal(t, "Conversation", got.Name)
+
+	history, err := srv.GetConversationHistory(ownerCtx, &loomv1.GetConversationHistoryRequest{SessionId: "stored-only"})
+	require.NoError(t, err)
+	require.Len(t, history.Messages, 1)
+	assert.Equal(t, "plan my meals", history.Messages[0].Content)
+
+	list, err := srv.ListSessions(ownerCtx, &loomv1.ListSessionsRequest{})
+	require.NoError(t, err)
+	require.Len(t, list.Sessions, 1)
+	assert.Equal(t, "stored-only", list.Sessions[0].Id)
+
+	// Reading does not load the session into memory (the next message does).
+	_, inMemory = ag.GetSession("stored-only")
+	assert.False(t, inMemory)
+
+	otherCtx := ctxFor("someone-else")
+	_, errCross := srv.GetSession(otherCtx, &loomv1.GetSessionRequest{SessionId: "stored-only"})
+	_, errMissing := srv.GetSession(otherCtx, &loomv1.GetSessionRequest{SessionId: "no-such-session"})
+	require.Error(t, errCross)
+	assert.Equal(t, errMissing.Error(), errCross.Error(), "wrong-owner must be indistinguishable from not-found")
+	_, err = srv.GetConversationHistory(otherCtx, &loomv1.GetConversationHistoryRequest{SessionId: "stored-only"})
+	assert.Equal(t, codes.NotFound, status.Code(err))
+	list, err = srv.ListSessions(otherCtx, &loomv1.ListSessionsRequest{})
+	require.NoError(t, err)
+	assert.Empty(t, list.Sessions)
+}
