@@ -16,8 +16,10 @@ package main
 import (
 	"fmt"
 	"net"
+	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -207,10 +209,11 @@ type ServerConfig struct {
 	InsecureAdmin     bool                `mapstructure:"insecure_admin"`      // Allow admin endpoints without LOOM_ADMIN_TOKEN (default: false)
 	AllowTimeOverride bool                `mapstructure:"allow_time_override"` // Honor WeaveRequest.occurred_at for replayed/imported conversations (default: false)
 	TLS               TLSConfig           `mapstructure:"tls"`
-	Clarification     ClarificationConfig `mapstructure:"clarification"` // Clarification question timeouts
-	ClientTools       ClientToolsConfig   `mapstructure:"client_tools"`  // Client-executed tool wait policy
-	CORS              CORSServerConfig    `mapstructure:"cors"`          // CORS configuration for HTTP endpoints
-	Auth              AuthConfig          `mapstructure:"auth"`          // Endpoint authentication (Supabase JWT)
+	Clarification     ClarificationConfig `mapstructure:"clarification"`  // Clarification question timeouts
+	ClientTools       ClientToolsConfig   `mapstructure:"client_tools"`   // Client-executed tool wait policy
+	DevicePairing     DevicePairingConfig `mapstructure:"device_pairing"` // Pair phones/desktop apps by QR code
+	CORS              CORSServerConfig    `mapstructure:"cors"`           // CORS configuration for HTTP endpoints
+	Auth              AuthConfig          `mapstructure:"auth"`           // Endpoint authentication (Supabase JWT)
 }
 
 // AuthConfig gates JWT authentication of Loom's gRPC/HTTP endpoints. When
@@ -268,6 +271,30 @@ type ClientToolsConfig struct {
 
 	// MaxTimeoutSeconds caps any requested timeout (default: 900)
 	MaxTimeoutSeconds int `mapstructure:"max_timeout_seconds"`
+}
+
+// DevicePairingConfig enables pairing client devices by QR code or link
+// (`looms pair`). See docs/architecture/device-pairing.md.
+type DevicePairingConfig struct {
+	// Enabled registers DeviceService and accepts device tokens (default: false)
+	Enabled bool `mapstructure:"enabled"`
+
+	// Required rejects requests without a valid credential (device token,
+	// Supabase JWT when auth is enabled). Leave false while other clients
+	// (CLI, TUI) connect without credentials (default: false)
+	Required bool `mapstructure:"required"`
+
+	// PublicURL is the HTTP gateway address devices should use, e.g.
+	// "https://assistant.example.com" or a VPN address. Empty uses this
+	// machine's first private IPv4 address and http_port, which only works
+	// on the same network.
+	PublicURL string `mapstructure:"public_url"`
+
+	// LinkScheme is the URL scheme of pairing links (default: "loom")
+	LinkScheme string `mapstructure:"link_scheme"`
+
+	// CodeTTLSeconds is how long a pairing code works (default: 600, max: 3600)
+	CodeTTLSeconds int `mapstructure:"code_ttl_seconds"`
 }
 
 // TLSConfig holds TLS/HTTPS configuration for the server.
@@ -1137,6 +1164,11 @@ func setDefaults() {
 	viper.SetDefault("server.clarification.channel_send_timeout_ms", 100)
 	viper.SetDefault("server.client_tools.default_timeout_seconds", int(clienttools.DefaultTimeout/time.Second))
 	viper.SetDefault("server.client_tools.max_timeout_seconds", int(clienttools.DefaultMaxTimeout/time.Second))
+	viper.SetDefault("server.device_pairing.enabled", false)
+	viper.SetDefault("server.device_pairing.required", false)
+	viper.SetDefault("server.device_pairing.public_url", "")
+	viper.SetDefault("server.device_pairing.link_scheme", "loom")
+	viper.SetDefault("server.device_pairing.code_ttl_seconds", 600)
 
 	// CORS defaults (permissive for development, MUST be configured for production)
 	// SECURITY WARNING: Defaults to wildcard origins for best DX - change in production!
@@ -1477,6 +1509,33 @@ func GetSecretMappings() []SecretMapping {
 	}
 }
 
+// validateDevicePairing checks device pairing settings when enabled.
+func (c *Config) validateDevicePairing() error {
+	d := c.Server.DevicePairing
+	if !d.Enabled {
+		return nil
+	}
+	if d.CodeTTLSeconds < 60 || d.CodeTTLSeconds > 3600 {
+		return fmt.Errorf("server.device_pairing.code_ttl_seconds must be 60-3600, got %d", d.CodeTTLSeconds)
+	}
+	if !linkSchemePattern.MatchString(d.LinkScheme) {
+		return fmt.Errorf("server.device_pairing.link_scheme %q is not a valid URL scheme", d.LinkScheme)
+	}
+	if d.PublicURL != "" {
+		u, err := url.Parse(d.PublicURL)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			return fmt.Errorf("server.device_pairing.public_url must be an http(s) URL with a host, got %q", d.PublicURL)
+		}
+	}
+	if d.PublicURL == "" && c.Server.HTTPPort <= 0 {
+		return fmt.Errorf("server.device_pairing needs the HTTP gateway (server.http_port) or a public_url")
+	}
+	return nil
+}
+
+// linkSchemePattern is RFC 3986's scheme syntax.
+var linkSchemePattern = regexp.MustCompile(`^[a-zA-Z][a-zA-Z0-9+.-]*$`)
+
 // validateAuth checks the endpoint authentication configuration when enabled.
 func (c *Config) validateAuth() error {
 	a := c.Server.Auth
@@ -1627,6 +1686,9 @@ func (c *Config) Validate() error {
 	}
 
 	if err := c.validateAuth(); err != nil {
+		return err
+	}
+	if err := c.validateDevicePairing(); err != nil {
 		return err
 	}
 

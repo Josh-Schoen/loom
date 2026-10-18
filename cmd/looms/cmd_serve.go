@@ -36,6 +36,7 @@ import (
 	"github.com/teradata-labs/loom/pkg/clienttools"
 	"github.com/teradata-labs/loom/pkg/communication"
 	loomconfig "github.com/teradata-labs/loom/pkg/config"
+	"github.com/teradata-labs/loom/pkg/devices"
 	"github.com/teradata-labs/loom/pkg/embedding"
 	"github.com/teradata-labs/loom/pkg/evals"
 	"github.com/teradata-labs/loom/pkg/fabric"
@@ -2321,8 +2322,18 @@ func runServe(cmd *cobra.Command, args []string) {
 	// first and establishes the user identity from the token's subject; the
 	// legacy user-id interceptor then defers to that identity (see extractUserID).
 	// When auth is disabled, only the legacy interceptor runs (unchanged behavior).
-	unaryInterceptors := make([]grpc.UnaryServerInterceptor, 0, 2)
-	streamInterceptors := make([]grpc.StreamServerInterceptor, 0, 2)
+	unaryInterceptors := make([]grpc.UnaryServerInterceptor, 0, 3)
+	streamInterceptors := make([]grpc.StreamServerInterceptor, 0, 3)
+
+	// Device pairing runs first: a device token establishes the identity, the
+	// pairing RPCs carry their own credentials, and any other bearer falls
+	// through to the Supabase authenticator below.
+	var deviceServer *server.DeviceServer
+	if config.Server.DevicePairing.Enabled {
+		deviceServer = buildDeviceServer(config, userIDCfg.DefaultUserID, logger)
+		unaryInterceptors = append(unaryInterceptors, deviceServer.UnaryServerInterceptor())
+		streamInterceptors = append(streamInterceptors, deviceServer.StreamServerInterceptor())
+	}
 	if config.Server.Auth.Enabled {
 		authr, err := server.NewAuthenticator(context.Background(), buildServerAuthConfig(config, logger))
 		if err != nil {
@@ -2357,8 +2368,12 @@ func runServe(cmd *cobra.Command, args []string) {
 	// Authenticated deployments are multi-tenant: blank identities must not
 	// act as session-ownership wildcards. Unauthenticated deployments keep
 	// the explicit single-tenant compatibility mode.
-	loomService.SetEnforceSessionOwnership(config.Server.Auth.Enabled)
+	loomService.SetEnforceSessionOwnership(config.Server.Auth.Enabled ||
+		(config.Server.DevicePairing.Enabled && config.Server.DevicePairing.Required))
 	loomv1.RegisterLoomServiceServer(grpcServer, loomService)
+	if deviceServer != nil {
+		loomv1.RegisterDeviceServiceServer(grpcServer, deviceServer)
+	}
 
 	// LLM slot scheduler observability/admin surface (enablement and the
 	// registry logger were both installed at startup, before any LLM client
@@ -4018,4 +4033,40 @@ func copyFile(src, dst string) error {
 	}
 
 	return nil
+}
+
+// buildDeviceServer opens the paired-device store and admin token in the
+// data directory. Startup fails if either cannot be read or created.
+func buildDeviceServer(config *Config, defaultUserID string, logger *zap.Logger) *server.DeviceServer {
+	dataDir := loomconfig.GetLoomDataDir()
+	manager, err := devices.Open(filepath.Join(dataDir, devicesFileName))
+	if err != nil {
+		logger.Fatal("failed to open paired devices", zap.Error(err))
+	}
+	adminToken, err := devices.LoadOrCreateAdminToken(filepath.Join(dataDir, deviceAdminTokenFileName))
+	if err != nil {
+		logger.Fatal("failed to load device pairing admin token", zap.Error(err))
+	}
+	dp := config.Server.DevicePairing
+	ds, err := server.NewDeviceServer(manager, server.DevicePairingConfig{
+		Required:      dp.Required,
+		PublicURL:     dp.PublicURL,
+		HTTPPort:      config.Server.HTTPPort,
+		LinkScheme:    dp.LinkScheme,
+		CodeTTL:       time.Duration(dp.CodeTTLSeconds) * time.Second,
+		DefaultUserID: defaultUserID,
+		AdminToken:    adminToken,
+		Logger:        logger,
+	})
+	if err != nil {
+		logger.Fatal("failed to start device pairing", zap.Error(err))
+	}
+	if !strings.HasPrefix(dp.PublicURL, "https://") {
+		logger.Warn("Paired devices will reach this server over plain HTTP: device tokens are readable by others on the same network. Set server.device_pairing.public_url to an https address (reverse proxy, Tailscale) for use outside a trusted network.",
+			zap.String("public_url", dp.PublicURL))
+	}
+	logger.Info("Device pairing enabled; run `looms pair` to connect a phone",
+		zap.Bool("required", dp.Required),
+		zap.Int("paired_devices", len(manager.List())))
+	return ds
 }

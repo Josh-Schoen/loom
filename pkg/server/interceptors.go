@@ -83,6 +83,11 @@ func extractUserID(ctx context.Context, cfg UserIDConfig) (context.Context, erro
 	if existing := postgres.UserIDFromContext(ctx); existing != "" {
 		return ctx, nil
 	}
+	// Device pairing RPCs authenticated upstream (the redeem code or the admin
+	// token) act for no user, so the user-id requirement does not apply.
+	if isAuthenticated(ctx) {
+		return ctx, nil
+	}
 
 	md, ok := metadata.FromIncomingContext(ctx)
 	if ok {

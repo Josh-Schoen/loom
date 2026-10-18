@@ -13,6 +13,8 @@ Command reference for `loom` (client) and `looms` (server).
 - [looms config](#looms-config) - Manage server configuration and secrets
 - [looms hitl](#looms-hitl) - Human-in-the-loop request management
 - [looms upgrade](#looms-upgrade) - Upgrade database schema
+- [looms pair](#looms-pair) - Pair a phone or app by QR code
+- [looms devices](#looms-devices) - List or revoke paired devices
 - [looms pattern](#looms-pattern) - Create and watch patterns
 - [looms workflow](#looms-workflow) - Manage and execute workflow orchestrations
 - [looms learning](#looms-learning) - Manage learning agent operations
@@ -55,6 +57,9 @@ Command reference for `loom` (client) and `looms` (server).
 | `looms config get-key` | Retrieve secret from keyring | `<key-name>` |
 | `looms config delete-key` | Delete secret from keyring | `<key-name>` |
 | `looms config list-keys` | List available secret keys | |
+| `looms pair` | Show a QR code that pairs a device | `--ttl`, `--user`, `--link-only`, `--server` |
+| `looms devices list` | List paired devices | `--server` |
+| `looms devices revoke` | Revoke a paired device | `<device-id>`, `--server` |
 | `looms hitl list` | List pending HITL requests | `--session`, `--agent`, `--db` |
 | `looms hitl show` | Show HITL request details | `<request-id>`, `--db` |
 | `looms hitl respond` | Respond to HITL request | `<request-id>`, `--status`, `--message` |
@@ -357,6 +362,56 @@ Upgrade without prompting:
 looms upgrade --yes
 ```
 
+
+### looms pair
+
+Issue a single-use pairing code on the running server and print it as a QR code and link. Requires `server.device_pairing.enabled: true`; run as the user that runs `looms serve`, with the same `LOOM_DATA_DIR` (the command reads `device-admin.token` from it). See [device-pairing.md](device-pairing.md).
+
+**Usage:**
+```bash
+looms pair [flags]
+```
+
+**Flags:**
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--server` | string | `localhost:60051` | gRPC address (plaintext) |
+| `--user` | string | server default user | User the paired device acts as |
+| `--ttl` | duration | `server.device_pairing.code_ttl_seconds` | Code lifetime; capped at the server setting |
+| `--link-only` | bool | `false` | Print only the pairing link |
+
+**Examples:**
+
+```bash
+looms pair
+# Scan this with the phone's camera to connect it:
+# <QR code>
+# Or open this link on the phone:
+#   loom://pair?code=DSE5KEC3ZQZD2SEQSAKQ5QF5GCL4BRVY&server=http%3A%2F%2F192.168.1.20%3A5006
+# The phone will connect to http://192.168.1.20:5006.
+# ...
+```
+
+```bash
+looms pair --ttl 5m --link-only
+# loom://pair?code=...&server=...
+```
+
+**Errors:** pairing disabled on the server (`UNIMPLEMENTED`), server not running (`UNAVAILABLE`), admin token missing or rejected.
+
+### looms devices
+
+List or revoke paired devices. Same requirements and `--server` flag as `looms pair`.
+
+```bash
+looms devices list
+# ID                    NAME         PLATFORM  USER          PAIRED            LAST SEEN         STATUS
+# dev_c4f44b6ed2ae5c23  Test iPhone  ios       default-user  2026-10-18 02:48  2026-10-18 02:48  active
+
+looms devices revoke dev_c4f44b6ed2ae5c23
+# Revoked dev_c4f44b6ed2ae5c23 (Test iPhone). It can no longer connect.
+```
 
 ### looms pattern
 

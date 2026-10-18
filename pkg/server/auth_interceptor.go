@@ -141,6 +141,10 @@ func (a *Authenticator) ValidateToken(raw string) (jwt.MapClaims, error) {
 // for RLS). When the token is missing and auth is optional, ctx is returned
 // unchanged so the legacy x-user-id path applies.
 func (a *Authenticator) authenticate(ctx context.Context) (context.Context, error) {
+	// A device token or the pairing admin token was already verified upstream.
+	if isAuthenticated(ctx) {
+		return ctx, nil
+	}
 	raw := bearerFromContext(ctx)
 	if raw == "" {
 		if a.required {

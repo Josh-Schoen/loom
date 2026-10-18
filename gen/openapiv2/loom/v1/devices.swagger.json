@@ -1,0 +1,197 @@
+{
+  "swagger": "2.0",
+  "info": {
+    "title": "loom/v1/devices.proto",
+    "version": "version not set"
+  },
+  "tags": [
+    {
+      "name": "DeviceService"
+    }
+  ],
+  "consumes": [
+    "application/json"
+  ],
+  "produces": [
+    "application/json"
+  ],
+  "paths": {
+    "/v1/pairing:redeem": {
+      "post": {
+        "summary": "RedeemPairingCode exchanges a pairing code for a device token. Each code\nworks once; an unknown, used, or expired code is rejected\n(UNAUTHENTICATED) without saying which.",
+        "operationId": "DeviceService_RedeemPairingCode",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/v1RedeemPairingCodeResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "body",
+            "description": "RedeemPairingCodeRequest is sent by the device being paired.",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/v1RedeemPairingCodeRequest"
+            }
+          }
+        ],
+        "tags": [
+          "DeviceService"
+        ]
+      }
+    }
+  },
+  "definitions": {
+    "protobufAny": {
+      "type": "object",
+      "properties": {
+        "@type": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": {}
+    },
+    "rpcStatus": {
+      "type": "object",
+      "properties": {
+        "code": {
+          "type": "integer",
+          "format": "int32"
+        },
+        "message": {
+          "type": "string"
+        },
+        "details": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "$ref": "#/definitions/protobufAny"
+          }
+        }
+      }
+    },
+    "v1CreatePairingCodeResponse": {
+      "type": "object",
+      "properties": {
+        "code": {
+          "type": "string",
+          "description": "The single-use code. Treat it as a secret until it expires."
+        },
+        "expiresAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "When the code stops working."
+        },
+        "serverUrl": {
+          "type": "string",
+          "description": "Base URL of the HTTP gateway that devices should use\n(server.device_pairing.public_url, or a detected local-network address)."
+        },
+        "pairingLink": {
+          "type": "string",
+          "description": "Link that carries server_url and code, for QR codes:\n\"\u003clink_scheme\u003e://pair?server=\u003cserver_url\u003e\u0026code=\u003ccode\u003e\"."
+        }
+      },
+      "description": "CreatePairingCodeResponse carries the code and a ready-to-share link."
+    },
+    "v1Device": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "platform": {
+          "type": "string"
+        },
+        "userId": {
+          "type": "string"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "lastSeenAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Last time the device authenticated a request (updated at most once a minute)."
+        },
+        "revokedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Set when the device was revoked."
+        }
+      },
+      "description": "Device describes a paired device."
+    },
+    "v1ListDevicesResponse": {
+      "type": "object",
+      "properties": {
+        "devices": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "$ref": "#/definitions/v1Device"
+          }
+        }
+      },
+      "description": "ListDevicesResponse contains paired devices, oldest first."
+    },
+    "v1RedeemPairingCodeRequest": {
+      "type": "object",
+      "properties": {
+        "code": {
+          "type": "string",
+          "description": "The code from the pairing link."
+        },
+        "deviceName": {
+          "type": "string",
+          "description": "Name shown in ListDevices, e.g. \"Josh's iPhone\". Optional, max 100 chars."
+        },
+        "platform": {
+          "type": "string",
+          "description": "Client platform, e.g. \"ios\". Optional, informational."
+        }
+      },
+      "description": "RedeemPairingCodeRequest is sent by the device being paired."
+    },
+    "v1RedeemPairingCodeResponse": {
+      "type": "object",
+      "properties": {
+        "deviceId": {
+          "type": "string",
+          "description": "Identifier of the new device."
+        },
+        "deviceToken": {
+          "type": "string",
+          "description": "Bearer token for all later requests. Returned only here; the server\nstores a hash."
+        },
+        "userId": {
+          "type": "string",
+          "description": "User the device acts as."
+        }
+      },
+      "description": "RedeemPairingCodeResponse carries the device's credential."
+    },
+    "v1RevokeDeviceResponse": {
+      "type": "object",
+      "properties": {
+        "device": {
+          "$ref": "#/definitions/v1Device"
+        }
+      },
+      "description": "RevokeDeviceResponse is returned after a successful revoke."
+    }
+  }
+}

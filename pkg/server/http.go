@@ -148,6 +148,12 @@ func (h *HTTPServer) Start(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("failed to register gateway: %w", err)
 	}
+	// Device pairing (POST /v1/pairing:redeem). When pairing is disabled the
+	// gRPC server does not register DeviceService and these routes return
+	// UNIMPLEMENTED.
+	if err := loomv1.RegisterDeviceServiceHandlerFromEndpoint(ctx, mux, h.grpcAddr, opts); err != nil {
+		return fmt.Errorf("failed to register device gateway: %w", err)
+	}
 
 	// Create root mux with custom handlers
 	rootMux := http.NewServeMux()

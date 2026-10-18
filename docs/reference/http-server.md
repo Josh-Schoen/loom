@@ -275,9 +275,10 @@ CORS headers will be present in response.
 
 | Header | Effect |
 |--------|--------|
+| `Authorization: Bearer loomd_…` | Device token, when `server.device_pairing.enabled: true`; the paired device's user becomes the user. See [device-pairing.md](device-pairing.md). |
 | `Authorization: Bearer <jwt>` | Verified when `server.auth.enabled: true`; the token subject becomes the user. |
 | `Grpc-Metadata-X-User-Id: <id>` | Legacy user identity when auth is disabled (as on gateway routes). |
-| neither | SQLite storage: `default-user`. PostgreSQL storage: `storage.postgres.default_user_id`, or `401 Unauthorized` when `storage.postgres.require_user_id` is true. Always `401` when `server.auth.enabled` is true. |
+| neither | SQLite storage: `default-user`. PostgreSQL storage: `storage.postgres.default_user_id`, or `401 Unauthorized` when `storage.postgres.require_user_id` is true. Always `401` when `server.auth.enabled` is true or `server.device_pairing.required` is true. |
 
 A rejected request returns a plain HTTP error status before any SSE headers are written; the agent does not run.
 

@@ -1,0 +1,131 @@
+// Copyright © 2026 Teradata Corporation - All Rights Reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+
+syntax = "proto3";
+
+package loom.v1;
+
+import "google/api/annotations.proto";
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/teradata-labs/loom/gen/go/loom/v1;loomv1";
+
+// DeviceService pairs client devices (phones, desktop apps) with a self-hosted
+// server without typing addresses or secrets.
+//
+// Flow: the operator runs `looms pair` on the server machine, which calls
+// CreatePairingCode and shows the result as a QR code and link. The device
+// reads it and calls RedeemPairingCode, which returns a long-lived device
+// token. The device then sends "authorization: Bearer <device_token>" on every
+// request.
+//
+// CreatePairingCode, ListDevices, and RevokeDevice require the server's admin
+// token (written to the data directory at startup, readable only by the user
+// running the server) on gRPC and on the gateway's default routes
+// (POST /loom.v1.DeviceService/<Method>). RedeemPairingCode needs no
+// credential: the single-use code is the credential.
+service DeviceService {
+  // CreatePairingCode issues a single-use code that expires after ttl_seconds.
+  rpc CreatePairingCode(CreatePairingCodeRequest) returns (CreatePairingCodeResponse) {}
+
+  // RedeemPairingCode exchanges a pairing code for a device token. Each code
+  // works once; an unknown, used, or expired code is rejected
+  // (UNAUTHENTICATED) without saying which.
+  rpc RedeemPairingCode(RedeemPairingCodeRequest) returns (RedeemPairingCodeResponse) {
+    option (google.api.http) = {
+      post: "/v1/pairing:redeem"
+      body: "*"
+    };
+  }
+
+  // ListDevices lists paired devices, including revoked ones.
+  rpc ListDevices(ListDevicesRequest) returns (ListDevicesResponse) {}
+
+  // RevokeDevice permanently disables a device token.
+  rpc RevokeDevice(RevokeDeviceRequest) returns (RevokeDeviceResponse) {}
+}
+
+// CreatePairingCodeRequest asks for a new pairing code.
+message CreatePairingCodeRequest {
+  // User the paired device acts as. Empty uses the server's default user.
+  string user_id = 1;
+
+  // Lifetime of the code in seconds. 0 uses the server default
+  // (server.device_pairing.code_ttl_seconds); larger values are capped at it.
+  int32 ttl_seconds = 2;
+}
+
+// CreatePairingCodeResponse carries the code and a ready-to-share link.
+message CreatePairingCodeResponse {
+  // The single-use code. Treat it as a secret until it expires.
+  string code = 1;
+
+  // When the code stops working.
+  google.protobuf.Timestamp expires_at = 2;
+
+  // Base URL of the HTTP gateway that devices should use
+  // (server.device_pairing.public_url, or a detected local-network address).
+  string server_url = 3;
+
+  // Link that carries server_url and code, for QR codes:
+  // "<link_scheme>://pair?server=<server_url>&code=<code>".
+  string pairing_link = 4;
+}
+
+// RedeemPairingCodeRequest is sent by the device being paired.
+message RedeemPairingCodeRequest {
+  // The code from the pairing link.
+  string code = 1;
+
+  // Name shown in ListDevices, e.g. "Josh's iPhone". Optional, max 100 chars.
+  string device_name = 2;
+
+  // Client platform, e.g. "ios". Optional, informational.
+  string platform = 3;
+}
+
+// RedeemPairingCodeResponse carries the device's credential.
+message RedeemPairingCodeResponse {
+  // Identifier of the new device.
+  string device_id = 1;
+
+  // Bearer token for all later requests. Returned only here; the server
+  // stores a hash.
+  string device_token = 2;
+
+  // User the device acts as.
+  string user_id = 3;
+}
+
+// Device describes a paired device.
+message Device {
+  string id = 1;
+  string name = 2;
+  string platform = 3;
+  string user_id = 4;
+  google.protobuf.Timestamp created_at = 5;
+  // Last time the device authenticated a request (updated at most once a minute).
+  google.protobuf.Timestamp last_seen_at = 6;
+  // Set when the device was revoked.
+  google.protobuf.Timestamp revoked_at = 7;
+}
+
+// ListDevicesRequest lists paired devices.
+message ListDevicesRequest {}
+
+// ListDevicesResponse contains paired devices, oldest first.
+message ListDevicesResponse {
+  repeated Device devices = 1;
+}
+
+// RevokeDeviceRequest revokes one device.
+message RevokeDeviceRequest {
+  string device_id = 1;
+}
+
+// RevokeDeviceResponse is returned after a successful revoke.
+message RevokeDeviceResponse {
+  Device device = 1;
+}
