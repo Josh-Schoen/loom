@@ -13,6 +13,17 @@
 // limitations under the License.
 package main
 
+import (
+	"os"
+
+	"github.com/teradata-labs/loom/pkg/sandbox/script"
+)
+
 func main() {
+	// A script child (pkg/sandbox/script) runs before anything else: it must
+	// not read settings or keys, which the commands below do on start.
+	if len(os.Args) == 2 && os.Args[1] == script.ChildCommand {
+		os.Exit(script.ServeChild(os.Stdin, os.Stdout, os.Exit))
+	}
 	Execute()
 }

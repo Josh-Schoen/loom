@@ -1,8 +1,10 @@
 # Sandboxed Execution of Agent-Written Code
 
-**Status**: 🚧 In development. The spike below was run on 2026-10-19
-(results in [Spike results](#spike-results)); the first slice, a
-calculation-only `run_script` tool, follows from it.
+**Status**: ⚠️ Partial. The spike below was run on 2026-10-19 (results in
+[Spike results](#spike-results)). The first slice, a calculation-only
+`run_script` tool, is implemented (`pkg/sandbox/script`,
+[reference](../reference/run-script.md)); scripts that call tools or are
+saved for reuse are not.
 
 ## Need
 
@@ -96,8 +98,9 @@ Findings:
 3. Starlark's step limit stops loops deterministically and quickly; Lua
    relies on the wall clock.
 4. Starlark's `%` formatting has no precision (`"%.2f"` fails with
-   `unknown conversion %.`), which models will write; a `round` helper or
-   formatting builtin is needed.
+   `unknown conversion %.`), and there is no `**` operator; models write
+   both from Python habit. The tool adds `round(x, ndigits)` and its
+   description points to `round` and `math.pow`.
 5. Starting a child `looms` process costs about 57 ms (`looms --help`,
    20 runs), small next to an LLM turn.
 6. Not yet measured: how reliably current models write correct code in
@@ -113,9 +116,11 @@ Findings:
 - **Isolation: a child process.** Each script runs in a short-lived
   `looms` child process (a hidden subcommand) that reads the script and its
   inputs on stdin and writes the result on stdout. The parent kills it at
-  the time limit; the child also stops itself when its heap passes a cap,
-  and on Linux runs under an address-space limit (`RLIMIT_AS`). A script
-  that exhausts memory ends the child, not the server.
+  the time limit; the child also stops itself when its heap passes a cap
+  (a watchdog polling the Go heap every 5 ms). A script that exhausts
+  memory ends the child, not the server. An OS address-space limit
+  (`RLIMIT_AS`) was not used: macOS does not enforce it, and Go reserves
+  address space well beyond what it uses.
 - **Scope: calculations only.** No modules, files, network, time or
   randomness; inputs come in as values, the result goes back as JSON. A
   `run_script` agent tool exposes it.

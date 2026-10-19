@@ -62,6 +62,7 @@ import (
 	"github.com/teradata-labs/loom/pkg/observability"
 	"github.com/teradata-labs/loom/pkg/orchestration"
 	"github.com/teradata-labs/loom/pkg/prompts"
+	"github.com/teradata-labs/loom/pkg/sandbox/script"
 	"github.com/teradata-labs/loom/pkg/scheduler"
 	"github.com/teradata-labs/loom/pkg/server"
 	"github.com/teradata-labs/loom/pkg/shuttle"
@@ -219,6 +220,7 @@ func registerYAMLBuiltinTools(
 		"delete_ui_app":                   "UI app subsystem (AppCompiler/AppProvider)",
 		"get_ui_app":                      "UI app subsystem (AppCompiler/AppProvider)",
 		"contact_human":                   "HITL store (registerContactHumanFromYAML)",
+		script.ToolName:                   "script sandbox (registerScriptTool; runs in a child looms process)",
 	}
 
 	logger.Info(indent+"Registering builtin tools", zap.Int("count", len(cfg.Tools.Builtin)))
@@ -1665,6 +1667,8 @@ func runServe(cmd *cobra.Command, args []string) {
 	// Agents whose YAML lists a UI app tool in tools.builtin are always
 	// offered the UI app tools (see registerUIAppTools); keyed like agents.
 	uiAppToolsDeclared := make(map[string]bool)
+	// Agents whose YAML lists run_script get the sandboxed script tool.
+	runScriptDeclared := make(map[string]bool)
 	logger.Info("Agents will be loaded from $LOOM_DATA_DIR/agents/ directory via registry system")
 
 	// Also load agents from $LOOM_DATA_DIR/agents/ directory (created by meta-agent)
@@ -2147,6 +2151,7 @@ func runServe(cmd *cobra.Command, args []string) {
 				// Store agent with GUID as key for stable references
 				agents[agentGUID] = ag
 				uiAppToolsDeclared[agentGUID] = declaresUIAppTools(cfg)
+				runScriptDeclared[agentGUID] = declaresBuiltinTool(cfg, script.ToolName)
 			}
 		}
 		// DO NOT close registry - keep it alive for hot-reload
@@ -3093,6 +3098,12 @@ func runServe(cmd *cobra.Command, args []string) {
 		}
 	}
 
+	for agentID, ag := range agents {
+		if runScriptDeclared[agentID] {
+			registerScriptTool(ag, agentID, logger)
+		}
+	}
+
 	// Enable reflection if configured
 	if config.Server.EnableReflection {
 		reflection.Register(grpcServer)
@@ -3416,6 +3427,10 @@ func runServe(cmd *cobra.Command, args []string) {
 				uiAppTools := server.UIAppTools(appCompiler, uiRegistry)
 				mode := registerUIAppTools(newAgent, uiAppTools, declared)
 				logger.Info("  UI app tools registered", zap.String("mode", mode), zap.Int("num_tools", len(uiAppTools)))
+			}
+
+			if declaresBuiltinTool(agentConfig, script.ToolName) {
+				registerScriptTool(newAgent, agentConfig.GetName(), logger)
 			}
 
 			// Check if agent already exists in server (by GUID)
@@ -4052,6 +4067,35 @@ const spendingFileName = "spending.json"
 var uiAppToolNames = map[string]bool{
 	"create_ui_app": true, "update_ui_app": true, "delete_ui_app": true, "list_component_types": true,
 	"get_ui_app": true,
+}
+
+// declaresBuiltinTool reports whether cfg lists name in tools.builtin.
+func declaresBuiltinTool(cfg *loomv1.AgentConfig, name string) bool {
+	if cfg == nil || cfg.Tools == nil {
+		return false
+	}
+	for _, n := range cfg.Tools.Builtin {
+		if n == name {
+			return true
+		}
+	}
+	return false
+}
+
+// registerScriptTool gives ag the run_script tool. Each script runs in a
+// child of this binary (`looms sandbox-run`, see main), so a script that
+// exhausts memory ends the child, not the server.
+func registerScriptTool(ag *agent.Agent, name string, logger *zap.Logger) {
+	exe, err := os.Executable()
+	if err != nil {
+		logger.Warn("run_script not available: cannot find this program's path", zap.String("agent", name), zap.Error(err))
+		return
+	}
+	ag.RegisterTools(script.NewTool(script.ChildRunner{
+		Command: []string{exe, script.ChildCommand},
+		Limits:  script.DefaultLimits,
+	}))
+	logger.Info("  Script tool registered", zap.String("agent", name), zap.String("tool", script.ToolName))
 }
 
 // declaresUIAppTools reports whether cfg lists any UI app tool in tools.builtin.

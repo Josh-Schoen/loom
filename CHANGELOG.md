@@ -49,6 +49,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`run_script` tool** — agents that list `run_script` in `tools.builtin` can run a short Starlark calculation script and get its exact result (`pkg/sandbox/script`). Each script runs in a child `looms sandbox-run` process with an empty environment, no file, network, process, module, clock or random access, and limits of 10M steps, 5 s, 256 MB heap and 64 KiB output; a script that exhausts memory ends the child, not the server. Reference: `docs/reference/run-script.md`; design and Lua-vs-Starlark measurements: `docs/plans/sandboxed-script-execution.md`.
+
 - **Monthly spending limit** — `server.spending.monthly_limit_usd` refuses new turns with `RESOURCE_EXHAUSTED` (HTTP 429; ErrorInfo reason `SPENDING_LIMIT_REACHED`) once the month's estimated LLM cost reaches it. Every provider `looms serve` builds is counted (`pkg/llm/spending`); the month's total is kept in `$LOOM_DATA_DIR/spending.json` even without a limit. A turn admitted under the limit finishes. `/v1/weave:stream` error frames now also carry `code` and, when present, `reason`. Reference: `docs/reference/spending-limit.md`.
 - **Claude Opus 5.5 and Claude Haiku 5.5 in the model catalog**, with their prices ($4/$20 and $0.10/$0.50 per million tokens), so their costs are no longer estimated with fallback rates.
 
