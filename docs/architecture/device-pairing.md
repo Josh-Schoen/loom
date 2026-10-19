@@ -131,6 +131,14 @@ whether a request is the redeem call, an admin call, a device-token call, or
 something for the next authenticator. It marks requests it has verified, so
 later authenticators do not re-validate the same bearer as a JWT.
 
+A device token is accepted only for an allowlist of RPCs a phone needs: the
+conversation (Weave, StreamWeave, sessions, history, client tool results,
+clarification answers), the caller's own UI apps and user memories, and
+reading agents and health. Every other RPC, on every service, needs the admin
+token: managing agents, MCP servers, tools, storage and skills changes the
+server for all users or starts programs on the host, so a household member's
+phone must not reach it.
+
 ### CLI (`cmd/looms/cmd_pair.go`)
 
 **Responsibility**: issue codes and manage devices from the server machine.
@@ -168,14 +176,24 @@ request ─▶ [device pairing] ─▶ [Supabase JWT] ─▶ [legacy x-user-id] 
               │                      │                   │
               │ redeem: pass, marked │ marked: skip      │ user set or marked:
               │ admin RPC: admin tok │ else validate JWT │ skip
-              │ loomd_…: set user    │                   │ else header/default
-              │ other bearer: pass   │                   │
+              │ loomd_…: set user,   │                   │ else header/default
+              │   allowlisted RPCs   │                   │
+              │ admin token: pass    │                   │
+              │ other bearer: reject │                   │
+              │   if required, unless│                   │
+              │   JWT auth follows   │                   │
               │ none: reject if      │                   │
               │       required       │                   │
 ```
 
 The same chain runs for gRPC and for the in-process SSE endpoint
 (`/v1/weave:stream`), so a device token works for streaming turns too.
+
+When pairing is required and Supabase-JWT authentication is off, nothing
+after the device authenticator verifies a bearer, and the legacy interceptor
+takes the identity from the `x-user-id` header. A bearer that is neither a
+device token nor the admin token is therefore rejected in that case; passing
+it on would let any caller choose whose data it acts on.
 
 ## Design Trade-offs
 
@@ -239,6 +257,9 @@ sees a pairing QR code, or one who obtains a phone.
 | Server file disclosure | Device tokens stored only as SHA-256 hashes; codes not stored |
 | Network eavesdropping | **Not mitigated by loom**: the gateway is plain HTTP. Tokens on a LAN are readable by others on it. The server logs a warning unless `public_url` is `https://`; use an HTTPS reverse proxy or a VPN |
 | Timing attacks on the admin token | Constant-time comparison |
+| A paired phone (or its owner) calling admin RPCs | Device tokens are limited to an allowlist of RPCs; the rest need the admin token |
+| An unverified bearer with an `x-user-id` header | Rejected when pairing is required, unless a JWT authenticator follows |
+| Oversized request bodies before authentication | HTTP bodies are capped at 4 MiB (gRPC's default receive limit) |
 | Unpaired callers when `required: false` | They follow the existing (unauthenticated) legacy path, unchanged from before pairing |
 
 **Trust boundaries**: the data directory (admin token, device store) and the

@@ -4003,7 +4003,10 @@ func buildDeviceServer(config *Config, defaultUserID string, logger *zap.Logger)
 		CodeTTL:       time.Duration(dp.CodeTTLSeconds) * time.Second,
 		DefaultUserID: defaultUserID,
 		AdminToken:    adminToken,
-		Logger:        logger,
+		// A bearer that is not a device or admin token is only acceptable
+		// when the Supabase-JWT authenticator runs next to verify it.
+		OtherBearersAllowed: config.Server.Auth.Enabled,
+		Logger:              logger,
 	})
 	if err != nil {
 		logger.Fatal("failed to start device pairing", zap.Error(err))

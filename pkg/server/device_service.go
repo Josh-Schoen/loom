@@ -66,9 +66,15 @@ type DevicePairingConfig struct {
 	CodeTTL time.Duration
 	// DefaultUserID is the user a device acts as when the code names none.
 	DefaultUserID string
-	// AdminToken authorizes CreatePairingCode, ListDevices, and RevokeDevice.
+	// AdminToken authorizes CreatePairingCode, ListDevices, and RevokeDevice,
+	// and every RPC a device token may not call (see deviceAllowedMethods).
 	AdminToken string
-	Logger     *zap.Logger
+	// OtherBearersAllowed lets a bearer that is neither a device token nor
+	// the admin token pass to the next interceptor when Required is set. Set
+	// it only when an authenticator that verifies such bearers (Supabase JWT)
+	// runs next; otherwise a junk bearer would reach the x-user-id path.
+	OtherBearersAllowed bool
+	Logger              *zap.Logger
 }
 
 // DeviceServer implements loomv1.DeviceService and authenticates device
@@ -193,19 +199,63 @@ func (s *DeviceServer) RevokeDevice(_ context.Context, req *loomv1.RevokeDeviceR
 	return &loomv1.RevokeDeviceResponse{Device: deviceProto(d)}, nil
 }
 
+// deviceAllowedMethods are the RPCs a paired device may call: the
+// conversation, the person's own pages and memories, and reading which
+// assistants exist. Everything else (managing agents, MCP servers, tools,
+// storage, other services) changes the server for everyone or runs programs
+// on the host, so it needs the admin token.
+var deviceAllowedMethods = map[string]bool{
+	"/loom.v1.LoomService/Weave":                       true,
+	"/loom.v1.LoomService/StreamWeave":                 true,
+	"/loom.v1.LoomService/SubmitClientToolResult":      true,
+	"/loom.v1.LoomService/AnswerClarificationQuestion": true,
+	"/loom.v1.LoomService/CreateSession":               true,
+	"/loom.v1.LoomService/GetSession":                  true,
+	"/loom.v1.LoomService/ListSessions":                true,
+	"/loom.v1.LoomService/DeleteSession":               true,
+	"/loom.v1.LoomService/SubscribeToSession":          true,
+	"/loom.v1.LoomService/GetConversationHistory":      true,
+	"/loom.v1.LoomService/ListAgents":                  true,
+	"/loom.v1.LoomService/GetAgent":                    true,
+	"/loom.v1.LoomService/GetHealth":                   true,
+	"/loom.v1.LoomService/ListUIApps":                  true,
+	"/loom.v1.LoomService/GetUIApp":                    true,
+	"/loom.v1.LoomService/CreateUIApp":                 true,
+	"/loom.v1.LoomService/UpdateUIApp":                 true,
+	"/loom.v1.LoomService/DeleteUIApp":                 true,
+	"/loom.v1.LoomService/SetUIAppChecklistItem":       true,
+	"/loom.v1.LoomService/SetUIAppSharing":             true,
+	"/loom.v1.LoomService/ListComponentTypes":          true,
+	"/loom.v1.LoomService/ListUserMemories":            true,
+	"/loom.v1.LoomService/AddUserMemory":               true,
+	"/loom.v1.LoomService/CorrectUserMemory":           true,
+	"/loom.v1.LoomService/ForgetUserMemory":            true,
+	"/loom.v1.LoomService/ForgetAllUserMemories":       true,
+}
+
+// DeviceMayCall reports whether a device token may call fullMethod.
+func DeviceMayCall(fullMethod string) bool {
+	return deviceAllowedMethods[fullMethod]
+}
+
 // authenticate applies the device-pairing rules for one RPC:
 //   - RedeemPairingCode needs no credential (the code is the credential).
 //   - Other DeviceService RPCs need the admin token.
-//   - Elsewhere, a device token establishes the device's user identity; any
-//     other bearer passes to the next interceptor; no bearer passes only when
-//     pairing is not required.
+//   - A device token establishes the device's user identity, and only for
+//     the RPCs in deviceAllowedMethods.
+//   - The admin token passes to the next interceptor (the server owner acts
+//     as any user, as without pairing).
+//   - Any other bearer, or none, is rejected when pairing is required; any
+//     other bearer passes only when OtherBearersAllowed (a JWT authenticator
+//     follows), and no bearer passes only when pairing is not required.
 func (s *DeviceServer) authenticate(ctx context.Context, fullMethod string) (context.Context, error) {
 	raw := bearerFromContext(ctx)
 	if fullMethod == deviceServiceRedeemMethod {
 		return contextWithAuthenticated(ctx), nil
 	}
+	isAdmin := raw != "" && devices.TokensEqual(raw, s.cfg.AdminToken)
 	if strings.HasPrefix(fullMethod, deviceServicePrefix) {
-		if raw == "" || !devices.TokensEqual(raw, s.cfg.AdminToken) {
+		if !isAdmin {
 			return nil, status.Error(codes.PermissionDenied, "this operation needs the server admin token")
 		}
 		return contextWithAuthenticated(ctx), nil
@@ -215,11 +265,23 @@ func (s *DeviceServer) authenticate(ctx context.Context, fullMethod string) (con
 		if !ok {
 			return nil, status.Error(codes.Unauthenticated, "unknown or revoked device token")
 		}
+		if !deviceAllowedMethods[fullMethod] {
+			return nil, status.Error(codes.PermissionDenied, "paired devices cannot call this operation; it needs the server admin token")
+		}
 		ctx = postgres.ContextWithUserID(ctx, d.UserID)
 		return contextWithAuthenticated(ctx), nil
 	}
-	if raw == "" && s.cfg.Required {
+	if isAdmin {
+		return ctx, nil
+	}
+	if !s.cfg.Required {
+		return ctx, nil
+	}
+	if raw == "" {
 		return nil, status.Error(codes.Unauthenticated, "a device token is required; pair this device with `looms pair`")
+	}
+	if !s.cfg.OtherBearersAllowed {
+		return nil, status.Error(codes.Unauthenticated, "unknown token; pair this device with `looms pair`")
 	}
 	return ctx, nil
 }

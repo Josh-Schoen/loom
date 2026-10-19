@@ -40,17 +40,20 @@ const testWeaveMethod = "/loom.v1.LoomService/Weave"
 
 func newTestDeviceServer(t *testing.T, required bool) *DeviceServer {
 	t.Helper()
+	return newTestDeviceServerWith(t, DevicePairingConfig{Required: required})
+}
+
+func newTestDeviceServerWith(t *testing.T, cfg DevicePairingConfig) *DeviceServer {
+	t.Helper()
 	dir := t.TempDir()
 	m, err := devices.Open(filepath.Join(dir, "devices.json"))
 	require.NoError(t, err)
 	admin, err := devices.LoadOrCreateAdminToken(filepath.Join(dir, "device-admin.token"))
 	require.NoError(t, err)
-	s, err := NewDeviceServer(m, DevicePairingConfig{
-		Required:   required,
-		PublicURL:  "http://192.168.1.20:5006/",
-		CodeTTL:    10 * time.Minute,
-		AdminToken: admin,
-	})
+	cfg.PublicURL = "http://192.168.1.20:5006/"
+	cfg.CodeTTL = 10 * time.Minute
+	cfg.AdminToken = admin
+	s, err := NewDeviceServer(m, cfg)
 	require.NoError(t, err)
 	return s
 }
@@ -192,6 +195,10 @@ func TestDeviceAuthenticateRules(t *testing.T) {
 		{"device token sets user", withBearer(token), testWeaveMethod, codes.OK, "default-user", true},
 		{"unknown device token", withBearer(devices.TokenPrefix + "forged"), testWeaveMethod, codes.Unauthenticated, "", false},
 		{"other bearer passes through", withBearer("eyJ.some.jwt"), testWeaveMethod, codes.OK, "", false},
+		{"device token cannot manage the server", withBearer(token), "/loom.v1.LoomService/CreateAgentFromConfig", codes.PermissionDenied, "", false},
+		{"device token cannot start programs", withBearer(token), "/loom.v1.LoomService/TestMCPServerConnection", codes.PermissionDenied, "", false},
+		{"device token cannot reach other services", withBearer(token), "/loom.v1.SkillsImportService/AddSkill", codes.PermissionDenied, "", false},
+		{"admin token passes elsewhere", withBearer(s.cfg.AdminToken), "/loom.v1.LoomService/CreateAgentFromConfig", codes.OK, "", false},
 		{"no bearer passes when optional", context.Background(), testWeaveMethod, codes.OK, "", false},
 	}
 	for _, tt := range tests {
@@ -209,12 +216,51 @@ func TestDeviceAuthenticateRules(t *testing.T) {
 
 func TestDeviceAuthenticateRequired(t *testing.T) {
 	s := newTestDeviceServer(t, true)
-	_, err := s.authenticate(context.Background(), testWeaveMethod)
-	assert.Equal(t, codes.Unauthenticated, status.Code(err))
+	token := pair(t, s).GetDeviceToken()
 
-	// Pairing itself still works without a credential.
-	_, err = s.authenticate(context.Background(), deviceServiceRedeemMethod)
+	tests := []struct {
+		name     string
+		ctx      context.Context
+		method   string
+		wantCode codes.Code
+	}{
+		{"no bearer", context.Background(), testWeaveMethod, codes.Unauthenticated},
+		// Without a JWT authenticator after it, a junk bearer must not reach
+		// the x-user-id path, which would let it act as anyone.
+		{"junk bearer", withBearer("x"), testWeaveMethod, codes.Unauthenticated},
+		{"junk bearer on another service", withBearer("x"), "/loom.v1.SkillsImportService/AddSkill", codes.Unauthenticated},
+		{"device token", withBearer(token), testWeaveMethod, codes.OK},
+		{"device token on an admin operation", withBearer(token), "/loom.v1.LoomService/AddMCPServer", codes.PermissionDenied},
+		{"admin token", withBearer(s.cfg.AdminToken), "/loom.v1.LoomService/AddMCPServer", codes.OK},
+		// Pairing itself still works without a credential.
+		{"redeem", context.Background(), deviceServiceRedeemMethod, codes.OK},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := s.authenticate(tt.ctx, tt.method)
+			assert.Equal(t, tt.wantCode, status.Code(err), "err: %v", err)
+		})
+	}
+}
+
+func TestDeviceAuthenticateRequiredWithJWT(t *testing.T) {
+	s := newTestDeviceServerWith(t, DevicePairingConfig{Required: true, OtherBearersAllowed: true})
+	// The JWT authenticator that follows verifies other bearers.
+	_, err := s.authenticate(withBearer("eyJ.some.jwt"), testWeaveMethod)
 	assert.NoError(t, err)
+	_, err = s.authenticate(context.Background(), testWeaveMethod)
+	assert.Equal(t, codes.Unauthenticated, status.Code(err))
+}
+
+func TestDeviceAllowedMethodsExist(t *testing.T) {
+	methods := map[string]bool{}
+	svc := loomv1.File_loom_v1_loom_proto.Services().ByName("LoomService")
+	for i := 0; i < svc.Methods().Len(); i++ {
+		methods["/loom.v1.LoomService/"+string(svc.Methods().Get(i).Name())] = true
+	}
+	for m := range deviceAllowedMethods {
+		assert.True(t, methods[m], "%s is not a LoomService RPC", m)
+	}
 }
 
 func TestDeviceInterceptorsChainWithSupabaseAndUserID(t *testing.T) {

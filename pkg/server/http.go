@@ -184,10 +184,13 @@ func (h *HTTPServer) Start(ctx context.Context) error {
 	// All other endpoints use grpc-gateway
 	rootMux.Handle("/", mux)
 
-	// Wrap with CORS middleware if enabled
-	var handler http.Handler = rootMux
+	// Bodies are read before authentication (the gateway buffers them, the
+	// SSE handler decodes them), so cap their size: an unauthenticated client
+	// could otherwise stream one body until the server runs out of memory.
+	// gRPC's default receive limit is the same, so no valid request is lost.
+	var handler http.Handler = http.MaxBytesHandler(rootMux, maxRequestBodyBytes)
 	if h.corsConfig.Enabled {
-		handler = h.corsMiddleware(rootMux)
+		handler = h.corsMiddleware(handler)
 	}
 
 	h.httpServer.Handler = handler
@@ -384,6 +387,10 @@ func withHTTPSlotOrigin(ctx context.Context, r *http.Request) context.Context {
 // streamWeaveFullMethod is StreamWeave's gRPC method name, as interceptors and
 // the gateway see it.
 const streamWeaveFullMethod = "/loom.v1.LoomService/StreamWeave"
+
+// maxRequestBodyBytes caps every HTTP request body (gRPC's default
+// maximum receive message size).
+const maxRequestBodyBytes = 4 << 20
 
 // handleStreamWeaveSSE handles SSE streaming for /v1/weave:stream
 func (h *HTTPServer) handleStreamWeaveSSE(w http.ResponseWriter, r *http.Request) {
