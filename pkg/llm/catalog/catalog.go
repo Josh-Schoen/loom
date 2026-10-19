@@ -40,8 +40,36 @@ func BuildCatalog() map[string][]*loomv1.ModelInfo {
 		// Verified against https://platform.claude.com/docs/en/docs/about-claude/models/overview
 		// on 2026-04-22. Deprecated Sonnet 4 / Opus 4 (20250514) intentionally omitted.
 		"anthropic": {
+			// Opus 5.5 and Haiku 5.5 prices verified against
+			// https://platform.claude.com/docs/en/models/opus-5-5/overview and
+			// .../haiku-5-5/overview on 2026-10-19. Haiku 5.5 is $0.50/$2.50 for
+			// prompts over 100K tokens; the catalog keeps one rate per model,
+			// so the shorter-prompt rate is listed.
 			{
-				// Current flagship. Uses adaptive thinking (not extended thinking).
+				// Uses adaptive thinking (budget_tokens is rejected).
+				Id:                  "claude-opus-5-5",
+				Name:                "Claude Opus 5.5",
+				Provider:            "anthropic",
+				Capabilities:        []string{"text", "vision", "tool-use", "thinking"},
+				ContextWindow:       1_000_000,
+				MaxOutputTokens:     128_000,
+				CostPer_1MInputUsd:  4.0,
+				CostPer_1MOutputUsd: 20.0,
+				IsReasoning:         true,
+				ShowInDropdown:      true,
+			},
+			{
+				Id:                  "claude-haiku-5-5",
+				Name:                "Claude Haiku 5.5",
+				Provider:            "anthropic",
+				Capabilities:        []string{"text", "tool-use"},
+				ContextWindow:       1_000_000,
+				MaxOutputTokens:     128_000,
+				CostPer_1MInputUsd:  0.10,
+				CostPer_1MOutputUsd: 0.50,
+				ShowInDropdown:      true,
+			},
+			{
 				Id:                  "claude-opus-4-7",
 				Name:                "Claude Opus 4.7",
 				Provider:            "anthropic",

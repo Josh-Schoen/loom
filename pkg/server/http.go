@@ -20,6 +20,7 @@ import (
 	loomv1 "github.com/teradata-labs/loom/gen/go/loom/v1"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
@@ -650,6 +651,14 @@ func (h *HTTPServer) sendSSEError(w http.ResponseWriter, flusher http.Flusher, e
 		"error":    err.Error(),
 		"stage":    "EXECUTION_STAGE_FAILED",
 		"progress": 0,
+	}
+	// The status code and ErrorInfo reason (e.g. SpendingLimitReason) let
+	// clients tell failures apart without parsing the message.
+	if st, ok := status.FromError(err); ok && st.Code() != codes.Unknown {
+		errorEvent["code"] = st.Code().String()
+	}
+	if reason := errorReason(err); reason != "" {
+		errorEvent["reason"] = reason
 	}
 
 	data, _ := json.Marshal(errorEvent)

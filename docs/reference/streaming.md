@@ -812,9 +812,23 @@ After FAILED event, stream terminates with gRPC error:
 
 ### HTTP/SSE Error
 
-After FAILED event, SSE stream closes:
+When `StreamWeave` returns an error after the SSE stream has started, the
+`/v1/weave:stream` handler sends one error frame and closes the stream:
 
-**Behavior**: Connection closed, client detects end of stream
+```
+data: {"code":"ResourceExhausted","error":"rpc error: code = ResourceExhausted desc = ...","progress":0,"reason":"SPENDING_LIMIT_REACHED","stage":"EXECUTION_STAGE_FAILED"}
+```
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `error` | string | The error text |
+| `stage` | string | Always `EXECUTION_STAGE_FAILED` |
+| `progress` | number | Always `0` |
+| `code` | string | gRPC code name (`ResourceExhausted`, `NotFound`, ...); absent for errors without a status code |
+| `reason` | string | `google.rpc.ErrorInfo` reason when the status carries one, e.g. `SPENDING_LIMIT_REACHED` ([Spending Limit](spending-limit.md)); otherwise absent |
+
+Errors before the stream starts (the authentication interceptors) are plain
+HTTP error responses instead.
 
 
 ### Common Errors

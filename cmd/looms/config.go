@@ -212,6 +212,7 @@ type ServerConfig struct {
 	Clarification     ClarificationConfig `mapstructure:"clarification"`  // Clarification question timeouts
 	ClientTools       ClientToolsConfig   `mapstructure:"client_tools"`   // Client-executed tool wait policy
 	DevicePairing     DevicePairingConfig `mapstructure:"device_pairing"` // Pair phones/desktop apps by QR code
+	Spending          SpendingConfig      `mapstructure:"spending"`       // Monthly limit on estimated AI spending
 	CORS              CORSServerConfig    `mapstructure:"cors"`           // CORS configuration for HTTP endpoints
 	Auth              AuthConfig          `mapstructure:"auth"`           // Endpoint authentication (Supabase JWT)
 }
@@ -271,6 +272,15 @@ type ClientToolsConfig struct {
 
 	// MaxTimeoutSeconds caps any requested timeout (default: 900)
 	MaxTimeoutSeconds int `mapstructure:"max_timeout_seconds"`
+}
+
+// SpendingConfig limits the estimated cost of the server's LLM calls per
+// calendar month (server time zone). The month's total is kept in
+// $LOOM_DATA_DIR/spending.json whether or not a limit is set.
+type SpendingConfig struct {
+	// MonthlyLimitUSD refuses new turns (RESOURCE_EXHAUSTED) once the
+	// month's estimated spending reaches it; 0 means no limit (default: 0)
+	MonthlyLimitUSD float64 `mapstructure:"monthly_limit_usd"`
 }
 
 // DevicePairingConfig enables pairing client devices by QR code or link
@@ -1169,6 +1179,7 @@ func setDefaults() {
 	viper.SetDefault("server.clarification.channel_send_timeout_ms", 100)
 	viper.SetDefault("server.client_tools.default_timeout_seconds", int(clienttools.DefaultTimeout/time.Second))
 	viper.SetDefault("server.client_tools.max_timeout_seconds", int(clienttools.DefaultMaxTimeout/time.Second))
+	viper.SetDefault("server.spending.monthly_limit_usd", 0.0)
 	viper.SetDefault("server.device_pairing.enabled", false)
 	viper.SetDefault("server.device_pairing.required", false)
 	viper.SetDefault("server.device_pairing.public_url", "")
@@ -1703,6 +1714,9 @@ func (c *Config) Validate() error {
 	}
 	if err := c.validateDevicePairing(); err != nil {
 		return err
+	}
+	if c.Server.Spending.MonthlyLimitUSD < 0 {
+		return fmt.Errorf("server.spending.monthly_limit_usd must be 0 (no limit) or more, got %g", c.Server.Spending.MonthlyLimitUSD)
 	}
 
 	// Validate LLM config

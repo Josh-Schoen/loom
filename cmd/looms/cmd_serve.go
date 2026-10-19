@@ -54,6 +54,7 @@ import (
 	"github.com/teradata-labs/loom/pkg/llm/openai"
 	llmscheduler "github.com/teradata-labs/loom/pkg/llm/scheduler"
 	"github.com/teradata-labs/loom/pkg/llm/scripted"
+	"github.com/teradata-labs/loom/pkg/llm/spending"
 	"github.com/teradata-labs/loom/pkg/mcp/apps"
 	"github.com/teradata-labs/loom/pkg/mcp/manager"
 	"github.com/teradata-labs/loom/pkg/memory"
@@ -1480,6 +1481,22 @@ func runServe(cmd *cobra.Command, args []string) {
 			zap.String("provider", config.LLM.Provider),
 			zap.Error(err))
 	}
+
+	// Every LLM provider the server makes goes behind the spending ledger
+	// (server.spending): it adds up the month's estimated cost and, with a
+	// limit, refuses work once the limit is reached. guardLLM is idempotent.
+	spendingLedger, err := spending.Open(filepath.Join(loomconfig.GetLoomDataDir(), spendingFileName), config.Server.Spending.MonthlyLimitUSD)
+	if err != nil {
+		logger.Fatal("Failed to open the spending ledger", zap.Error(err))
+	}
+	guardLLM := func(p agent.LLMProvider) agent.LLMProvider { return spending.Wrap(p, spendingLedger) }
+	llmProvider = guardLLM(llmProvider)
+	if st := spendingLedger.Status(); st.LimitUSD > 0 {
+		logger.Info("Monthly spending limit enabled",
+			zap.Float64("limit_usd", st.LimitUSD),
+			zap.Float64("spent_usd", st.SpentUSD),
+			zap.String("month", st.Month))
+	}
 	logger.Info("LLM provider created with rate limiting",
 		zap.String("provider", config.LLM.Provider),
 		zap.Float64("temperature", config.LLM.Temperature),
@@ -1680,6 +1697,7 @@ func runServe(cmd *cobra.Command, args []string) {
 		PermissionChecker: permissionChecker,
 		AdmissionChain:    admissionChain,
 		IdentityResolver:  postgres.UserIDFromContext,
+		LLMWrapper:        guardLLM,
 	})
 	if err != nil {
 		logger.Warn("Failed to create agent registry", zap.Error(err))
@@ -1917,7 +1935,7 @@ func runServe(cmd *cobra.Command, args []string) {
 							zap.Error(err))
 						// Fall back to server default LLM
 					} else {
-						agentLLMProvider = customLLM
+						agentLLMProvider = guardLLM(customLLM)
 						logger.Info("    Using custom LLM",
 							zap.String("provider", cfg.Llm.Provider),
 							zap.String("model", cfg.Llm.Model))
@@ -1947,6 +1965,7 @@ func runServe(cmd *cobra.Command, args []string) {
 						if tracer != nil {
 							compLLM = llm.NewInstrumentedProvider(compLLM, tracer)
 						}
+						compLLM = guardLLM(compLLM)
 						agentOpts = append(agentOpts, agent.WithCompressorLLM(compLLM))
 						logger.Info("    Compressor LLM configured",
 							zap.String("provider", cfg.CompressorLlm.Provider),
@@ -1964,6 +1983,7 @@ func runServe(cmd *cobra.Command, args []string) {
 						if tracer != nil {
 							classLLM = llm.NewInstrumentedProvider(classLLM, tracer)
 						}
+						classLLM = guardLLM(classLLM)
 						staticClassifierLLM = classLLM
 						agentOpts = append(agentOpts, agent.WithClassifierLLM(classLLM))
 						logger.Info("    Classifier LLM configured",
@@ -2360,7 +2380,7 @@ func runServe(cmd *cobra.Command, args []string) {
 					zap.String("provider", cprov),
 					zap.Error(err))
 			} else if llm, ok := rawLLM.(types.LLMProvider); ok {
-				classifyLLM = llm
+				classifyLLM = guardLLM(llm)
 				logger.Info("SkillsImportService: classify provider configured",
 					zap.String("provider", cprov),
 					zap.String("model", cmodel))
@@ -2444,6 +2464,7 @@ func runServe(cmd *cobra.Command, args []string) {
 	// Honor WeaveRequest.occurred_at only when the operator opted in —
 	// replay/import arrival times are rejected otherwise (see applyOccurredAt).
 	loomService.SetAllowTimeOverride(config.Server.AllowTimeOverride)
+	loomService.SetSpendingLedger(spendingLedger)
 	if config.Server.AllowTimeOverride {
 		logger.Info("Arrival-time override enabled (server.allow_time_override): WeaveRequest.occurred_at will be honored")
 	}
@@ -2458,6 +2479,9 @@ func runServe(cmd *cobra.Command, args []string) {
 	// single-provider server still gets its eval store and judge (the
 	// regression this hoisting fixes).
 	providerPool, poolErr := buildProviderPool(config, providerFactory, logger)
+	for name, p := range providerPool {
+		providerPool[name] = guardLLM(p)
+	}
 	if poolErr != nil {
 		logger.Warn("Failed to build provider pool from config; pool-based features will be unavailable",
 			zap.String("reason", "provider pool configuration error; check LLM provider settings"),
@@ -4019,6 +4043,10 @@ func buildDeviceServer(config *Config, defaultUserID string, logger *zap.Logger)
 		zap.Int("paired_devices", len(manager.List())))
 	return ds
 }
+
+// spendingFileName is the spending ledger in the data directory
+// (pkg/llm/spending); the setup app reads it to show the month's spending.
+const spendingFileName = "spending.json"
 
 // uiAppToolNames are the tools server.UIAppTools provides.
 var uiAppToolNames = map[string]bool{

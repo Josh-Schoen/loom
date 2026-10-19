@@ -23,6 +23,7 @@ import (
 	"github.com/teradata-labs/loom/pkg/communication"
 	"github.com/teradata-labs/loom/pkg/evals"
 	"github.com/teradata-labs/loom/pkg/llm/factory"
+	"github.com/teradata-labs/loom/pkg/llm/spending"
 	"github.com/teradata-labs/loom/pkg/mcp/manager"
 	"github.com/teradata-labs/loom/pkg/metaagent"
 	"github.com/teradata-labs/loom/pkg/metaagent/learning"
@@ -40,6 +41,7 @@ import (
 	toolregistry "github.com/teradata-labs/loom/pkg/tools/registry"
 	"github.com/teradata-labs/loom/pkg/types"
 	"go.uber.org/zap"
+	"google.golang.org/genproto/googleapis/rpc/errdetails"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/emptypb"
@@ -64,6 +66,11 @@ type MultiAgentServer struct {
 	// grounding, so honoring them is an explicit operator decision
 	// (server.allow_time_override). Set via SetAllowTimeOverride.
 	allowTimeOverride bool
+
+	// spending, when set, keeps the month's estimated LLM spending under a
+	// limit: turns are refused once it is reached (admitTurn), and
+	// providers made by SwitchModel are put behind it.
+	spending *spending.Ledger
 
 	// clientTools matches SubmitClientToolResult calls to the StreamWeave
 	// turns waiting on them; clientToolConfig is the operator's timeout policy
@@ -322,6 +329,56 @@ func (s *MultiAgentServer) SetAllowTimeOverride(allow bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.allowTimeOverride = allow
+}
+
+// SetSpendingLedger installs the monthly spending ledger (server.spending).
+// This should be called after NewMultiAgentServer(), before serving.
+func (s *MultiAgentServer) SetSpendingLedger(l *spending.Ledger) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.spending = l
+}
+
+// admitTurn starts a turn under the spending limit: RESOURCE_EXHAUSTED when
+// the month's limit is reached, otherwise a context whose LLM calls finish
+// the turn even if the limit is reached during it.
+func (s *MultiAgentServer) admitTurn(ctx context.Context) (context.Context, error) {
+	s.mu.RLock()
+	ledger := s.spending
+	s.mu.RUnlock()
+	ctx, err := ledger.Admit(ctx)
+	if err != nil {
+		return ctx, spendingLimitStatus(err)
+	}
+	return ctx, nil
+}
+
+// SpendingLimitReason is the google.rpc.ErrorInfo reason (domain "loom") on
+// the RESOURCE_EXHAUSTED status of a turn refused by the spending limit, so
+// clients can tell it from other failures. /v1/weave:stream error frames
+// carry it as "reason".
+const SpendingLimitReason = "SPENDING_LIMIT_REACHED"
+
+func spendingLimitStatus(err error) error {
+	st := status.New(codes.ResourceExhausted, err.Error())
+	if detailed, derr := st.WithDetails(&errdetails.ErrorInfo{Reason: SpendingLimitReason, Domain: "loom"}); derr == nil {
+		st = detailed
+	}
+	return st.Err()
+}
+
+// errorReason returns the ErrorInfo reason carried by a status error, or "".
+func errorReason(err error) string {
+	st, ok := status.FromError(err)
+	if !ok {
+		return ""
+	}
+	for _, d := range st.Details() {
+		if info, ok := d.(*errdetails.ErrorInfo); ok {
+			return info.GetReason()
+		}
+	}
+	return ""
 }
 
 // SetClientToolConfig sets the timeout policy for client-executed tools
@@ -867,6 +924,9 @@ func (s *MultiAgentServer) Weave(ctx context.Context, req *loomv1.WeaveRequest) 
 	// Request facts the model sees for this turn only (e.g. the caller's
 	// local time); see agent.WithRequestContext.
 	ctx = agent.WithRequestContext(ctx, req.GetContext())
+	if ctx, err = s.admitTurn(ctx); err != nil {
+		return nil, err
+	}
 
 	// Get agent: if no agent_id specified but session_id is, look up which agent owns the session.
 	// This fixes the bug where Weave(session_id=X) without agent_id falls through to the
@@ -1097,6 +1157,9 @@ func (s *MultiAgentServer) StreamWeave(req *loomv1.WeaveRequest, stream loomv1.L
 	// Request facts the model sees for this turn only (e.g. the caller's
 	// local time); see agent.WithRequestContext.
 	ctx = agent.WithRequestContext(ctx, req.GetContext())
+	if ctx, err = s.admitTurn(ctx); err != nil {
+		return err
+	}
 
 	// Get agent: if no agent_id specified but session_id is, look up which agent owns the session.
 	var ag *agent.Agent
@@ -3593,6 +3656,9 @@ func (s *MultiAgentServer) SwitchModel(ctx context.Context, req *loomv1.SwitchMo
 	if !ok {
 		return nil, status.Error(codes.Internal, "failed to cast provider to LLMProvider interface")
 	}
+	s.mu.RLock()
+	newProvider = spending.Wrap(newProvider, s.spending)
+	s.mu.RUnlock()
 
 	// Switch the agent's LLM provider for the specified role.
 	// When req.Role is LLM_ROLE_UNSPECIFIED, SetLLMProviderForRole delegates to the main agent LLM.

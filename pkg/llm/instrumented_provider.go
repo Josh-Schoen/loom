@@ -58,6 +58,11 @@ func (p *InstrumentedProvider) Model() string {
 	return p.provider.Model()
 }
 
+// Unwrap returns the wrapped provider.
+func (p *InstrumentedProvider) Unwrap() llmtypes.LLMProvider {
+	return p.provider
+}
+
 // HealthCheck delegates optional provider health checks through the instrumented wrapper.
 func (p *InstrumentedProvider) HealthCheck(ctx context.Context) error {
 	if hc, ok := p.provider.(llmtypes.HealthChecker); ok {

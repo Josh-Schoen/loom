@@ -72,10 +72,11 @@ type Registry struct {
 	onReload     ReloadCallback         // Callback when config changes
 
 	// Agent dependencies (injected by server)
-	permissionChecker *shuttle.PermissionChecker   // For permission validation
-	admissionChain    *shuttle.Chain               // Admission hook chain for tool-call admission
-	identityResolver  func(context.Context) string // Resolves AdmissionRequest.UserID from the call context
-	artifactStore     interface{}                  // artifacts.Store for workspace tool
+	permissionChecker *shuttle.PermissionChecker    // For permission validation
+	admissionChain    *shuttle.Chain                // Admission hook chain for tool-call admission
+	identityResolver  func(context.Context) string  // Resolves AdmissionRequest.UserID from the call context
+	llmWrapper        func(LLMProvider) LLMProvider // Wraps every provider an agent uses (RegistryConfig.LLMWrapper)
+	artifactStore     interface{}                   // artifacts.Store for workspace tool
 
 	// providerPool is the server-level named provider pool injected by cmd_serve.go.
 	// Agents can reference pool entries by name in their LLM config (e.g., provider: "fast").
@@ -151,10 +152,23 @@ type RegistryConfig struct {
 	AdmissionChain    *shuttle.Chain               // Admission hook chain for tool-call admission
 	IdentityResolver  func(context.Context) string // Resolves AdmissionRequest.UserID from the call context
 	ArtifactStore     interface{}                  // artifacts.Store for workspace tool
+	// LLMWrapper, when set, wraps every LLM provider an agent built here
+	// uses (after instrumentation), e.g. spending.Wrap for a monthly
+	// spending limit. It must return its argument unchanged when the
+	// provider is already wrapped: pooled and default providers are shared.
+	LLMWrapper func(LLMProvider) LLMProvider
 
 	// Database encryption (opt-in for enterprise deployments)
 	EncryptDatabase bool   // Enable SQLCipher encryption
 	EncryptionKey   string // Encryption key (or use LOOM_DB_KEY env var)
+}
+
+// wrapLLM applies the configured LLMWrapper, if any.
+func (r *Registry) wrapLLM(p LLMProvider) LLMProvider {
+	if r.llmWrapper == nil || p == nil {
+		return p
+	}
+	return r.llmWrapper(p)
 }
 
 // NewRegistry creates a new agent registry
@@ -215,6 +229,7 @@ func NewRegistry(config RegistryConfig) (*Registry, error) {
 		permissionChecker: config.PermissionChecker,
 		admissionChain:    config.AdmissionChain,
 		identityResolver:  config.IdentityResolver,
+		llmWrapper:        config.LLMWrapper,
 		artifactStore:     config.ArtifactStore,
 	}
 
@@ -604,6 +619,7 @@ func (r *Registry) buildAgent(ctx context.Context, config *loomv1.AgentConfig) (
 	if r.tracer != nil {
 		llmProvider = llm.NewInstrumentedProvider(llmProvider, r.tracer)
 	}
+	llmProvider = r.wrapLLM(llmProvider)
 
 	// Build options from config
 	opts := []Option{
@@ -623,6 +639,7 @@ func (r *Registry) buildAgent(ctx context.Context, config *loomv1.AgentConfig) (
 			if r.tracer != nil {
 				judgeLLM = llm.NewInstrumentedProvider(judgeLLM, r.tracer)
 			}
+			judgeLLM = r.wrapLLM(judgeLLM)
 			opts = append(opts, WithJudgeLLM(judgeLLM))
 		}
 	}
@@ -638,6 +655,7 @@ func (r *Registry) buildAgent(ctx context.Context, config *loomv1.AgentConfig) (
 			if r.tracer != nil {
 				orchLLM = llm.NewInstrumentedProvider(orchLLM, r.tracer)
 			}
+			orchLLM = r.wrapLLM(orchLLM)
 			opts = append(opts, WithOrchestratorLLM(orchLLM))
 		}
 	}
@@ -657,6 +675,7 @@ func (r *Registry) buildAgent(ctx context.Context, config *loomv1.AgentConfig) (
 			if r.tracer != nil {
 				classLLM = llm.NewInstrumentedProvider(classLLM, r.tracer)
 			}
+			classLLM = r.wrapLLM(classLLM)
 			classifierLLM = classLLM
 			opts = append(opts, WithClassifierLLM(classLLM))
 		}
@@ -673,6 +692,7 @@ func (r *Registry) buildAgent(ctx context.Context, config *loomv1.AgentConfig) (
 			if r.tracer != nil {
 				compLLM = llm.NewInstrumentedProvider(compLLM, r.tracer)
 			}
+			compLLM = r.wrapLLM(compLLM)
 			opts = append(opts, WithCompressorLLM(compLLM))
 		}
 	}
