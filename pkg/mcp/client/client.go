@@ -51,6 +51,7 @@ type Client struct {
 	clientInfo    protocol.Implementation
 	versionPin    string
 	mrtr          MRTRConfig
+	forwardCaller bool // Config.ForwardCallerIdentity
 
 	// Request tracking
 	nextID    int64
@@ -124,6 +125,13 @@ type Config struct {
 	// MRTR elicitation rounds legitimately outlive any fixed timeout — and
 	// use the per-call context instead.
 	RequestTimeout time.Duration
+
+	// ForwardCallerIdentity adds the caller's user ID (types.UserIDFromContext)
+	// to each tools/call request's _meta under protocol.MetaCallerUserID, so a
+	// server that keeps per-person data knows whose it is. Only for servers
+	// loom trusts with that identity: a stdio child, or an HTTP server
+	// reachable only by loom.
+	ForwardCallerIdentity bool
 }
 
 // SamplingHandler is called when a legacy server requests LLM completion.
@@ -163,6 +171,7 @@ func NewClient(config Config) *Client {
 		versionPin:       config.ProtocolVersion,
 		mrtr:             config.MRTR,
 		requestTimeout:   config.RequestTimeout,
+		forwardCaller:    config.ForwardCallerIdentity,
 		ctx:              ctx,
 		cancel:           cancel,
 		pending:          make(map[string]chan *protocol.Response),

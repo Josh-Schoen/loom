@@ -3519,6 +3519,20 @@ func runServe(cmd *cobra.Command, args []string) {
 		// The SSE StreamWeave endpoint calls the service in-process, so it runs
 		// the same stream interceptors (authentication, user identity) itself.
 		httpSrv.SetStreamInterceptors(streamInterceptors...)
+		for _, ext := range config.Server.Extensions {
+			route, err := server.ParseExtensionRoute(ext.Name, ext.PathPrefix, ext.Upstream, os.ExpandEnv(ext.Secret), ext.AllowDevices)
+			if err == nil {
+				err = httpSrv.AddExtensionRoute(route)
+			}
+			if err != nil {
+				logger.Fatal("invalid server.extensions entry", zap.Error(err))
+			}
+			if route.AllowDevices && deviceServer != nil {
+				deviceServer.AllowMethod(server.ExtensionMethod(route.Name))
+			}
+			logger.Info("Extension route", zap.String("name", route.Name), zap.String("path", route.PathPrefix),
+				zap.String("upstream", route.Upstream.String()), zap.Bool("devices", route.AllowDevices))
+		}
 		if pinnedCert != nil {
 			httpSrv.SetTLSCertificate(pinnedCert.Certificate)
 		}
@@ -3863,6 +3877,8 @@ func initializeMCPManager(config *Config, logger *zap.Logger) (*mcpManager, erro
 			EnableSessions:   serverConfig.EnableSessions,
 			EnableResumption: serverConfig.EnableResumption,
 			Enabled:          enabled,
+			// Per-person servers learn who the agent is acting for.
+			ForwardCallerIdentity: serverConfig.ForwardCallerIdentity,
 			ToolFilter: manager.ToolFilter{
 				All: true, // Register all tools from this server
 			},

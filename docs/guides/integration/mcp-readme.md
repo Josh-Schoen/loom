@@ -196,6 +196,39 @@ enable_sessions: true
 enable_resumption: true
 ```
 
+### Telling a Server Who Is Calling
+
+A server that keeps data per person (each person's notes, saved scripts) needs
+to know whose call it is. With `forward_caller_identity: true`, loom adds the
+user ID of the person the agent is acting for to each `tools/call` request's
+`_meta`, under `com.teradata.loom/callerUserId`:
+
+```yaml
+mcp:
+  servers:
+    household:
+      transport: streamable-http
+      url: http://127.0.0.1:5017/mcp
+      headers:
+        X-Loom-Extension-Secret: "${HOUSEHOLD_SECRET}"
+      forward_caller_identity: true   # default: false
+```
+
+```json
+{"method": "tools/call", "params": {"name": "household_notes", "arguments": {},
+ "_meta": {"com.teradata.loom/callerUserId": "sam-3f9a0c71"}}}
+```
+
+- The user ID is the one loom's interceptors established for the request:
+  the paired device's user, the JWT subject, or `X-User-Id`. With no user,
+  nothing is added.
+- Off by default. Turn it on only for a server loom trusts with that identity:
+  a stdio child, or an HTTP server only loom can reach (localhost plus a secret
+  header). The server must treat the value as authoritative only when the
+  request came from loom.
+- It's set in `looms.yaml` only; `AddMCPServer` / `UpdateMCPServer` don't set
+  it yet.
+
 ### Enabling/Disabling Servers
 
 Control which MCP servers start:

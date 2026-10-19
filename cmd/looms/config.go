@@ -213,6 +213,7 @@ type ServerConfig struct {
 	ClientTools       ClientToolsConfig   `mapstructure:"client_tools"`   // Client-executed tool wait policy
 	DevicePairing     DevicePairingConfig `mapstructure:"device_pairing"` // Pair phones/desktop apps by QR code
 	Spending          SpendingConfig      `mapstructure:"spending"`       // Monthly limit on estimated AI spending
+	Extensions        []ExtensionConfig   `mapstructure:"extensions"`     // Services on this machine served behind loom's authentication
 	CORS              CORSServerConfig    `mapstructure:"cors"`           // CORS configuration for HTTP endpoints
 	Auth              AuthConfig          `mapstructure:"auth"`           // Endpoint authentication (Supabase JWT)
 }
@@ -281,6 +282,24 @@ type SpendingConfig struct {
 	// MonthlyLimitUSD refuses new turns (RESOURCE_EXHAUSTED) once the
 	// month's estimated spending reaches it; 0 means no limit (default: 0)
 	MonthlyLimitUSD float64 `mapstructure:"monthly_limit_usd"`
+}
+
+// ExtensionConfig forwards a path on the HTTP gateway to a service on this
+// machine after loom authenticates the request (pkg/server ExtensionRoute).
+// See docs/reference/extension-routes.md.
+type ExtensionConfig struct {
+	// Name identifies the route (lowercase letters, digits, hyphens)
+	Name string `mapstructure:"name"`
+	// PathPrefix is the path served, e.g. "/v1/household/"
+	PathPrefix string `mapstructure:"path_prefix"`
+	// Upstream is the service's base URL on this machine, e.g.
+	// "http://127.0.0.1:5017"
+	Upstream string `mapstructure:"upstream"`
+	// Secret is sent as X-Loom-Extension-Secret so the service accepts only
+	// requests loom forwarded. Supports ${ENV_VAR} expansion.
+	Secret string `mapstructure:"secret"`
+	// AllowDevices lets paired devices call the route (default: false)
+	AllowDevices bool `mapstructure:"allow_devices"`
 }
 
 // DevicePairingConfig enables pairing client devices by QR code or link
@@ -772,6 +791,13 @@ type MCPServerConfig struct {
 
 	// WorkingDir is the working directory for the MCP server process (optional)
 	WorkingDir string `mapstructure:"working_dir"`
+
+	// ForwardCallerIdentity sends the user ID of the person the agent is
+	// acting for in each tool call's _meta ("com.teradata.loom/callerUserId"), for
+	// servers that keep data per person. Only for servers loom trusts with
+	// that identity: a stdio child, or an HTTP server only loom can reach
+	// (default: false)
+	ForwardCallerIdentity bool `mapstructure:"forward_caller_identity"`
 }
 
 // PromptsConfig holds configuration for PromptRegistry integration.
