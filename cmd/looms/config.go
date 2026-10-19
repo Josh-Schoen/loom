@@ -213,6 +213,7 @@ type ServerConfig struct {
 	ClientTools       ClientToolsConfig   `mapstructure:"client_tools"`   // Client-executed tool wait policy
 	DevicePairing     DevicePairingConfig `mapstructure:"device_pairing"` // Pair phones/desktop apps by QR code
 	Spending          SpendingConfig      `mapstructure:"spending"`       // Monthly limit on estimated AI spending
+	Household         HouseholdConfig     `mapstructure:"household"`      // People's names and notes between them
 	CORS              CORSServerConfig    `mapstructure:"cors"`           // CORS configuration for HTTP endpoints
 	Auth              AuthConfig          `mapstructure:"auth"`           // Endpoint authentication (Supabase JWT)
 }
@@ -281,6 +282,15 @@ type SpendingConfig struct {
 	// MonthlyLimitUSD refuses new turns (RESOURCE_EXHAUSTED) once the
 	// month's estimated spending reaches it; 0 means no limit (default: 0)
 	MonthlyLimitUSD float64 `mapstructure:"monthly_limit_usd"`
+}
+
+// HouseholdConfig turns on the household: the people who use this server
+// (named in <data dir>/people.json and by their paired devices) and short
+// notes they send each other. See docs/reference/household.md.
+type HouseholdConfig struct {
+	// Enabled registers the household RPCs and the household_members and
+	// household_notes tools for agents that list them (default: false)
+	Enabled bool `mapstructure:"enabled"`
 }
 
 // DevicePairingConfig enables pairing client devices by QR code or link

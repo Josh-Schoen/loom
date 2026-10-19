@@ -37,6 +37,7 @@ import (
 	loomv1 "github.com/teradata-labs/loom/gen/go/loom/v1"
 	loomconfig "github.com/teradata-labs/loom/pkg/config"
 	"github.com/teradata-labs/loom/pkg/devices"
+	"github.com/teradata-labs/loom/pkg/household"
 )
 
 const (
@@ -47,6 +48,7 @@ const (
 var (
 	pairServer   string
 	pairUser     string
+	pairName     string
 	pairTTL      time.Duration
 	pairLinkOnly bool
 	devicesJSON  bool
@@ -93,6 +95,7 @@ func init() {
 		cmd.Flags().StringVar(&pairServer, "server", "localhost:60051", "Loom gRPC server address (plaintext)")
 	}
 	pairCmd.Flags().StringVar(&pairUser, "user", "", "User the device acts as (default: the server's default user)")
+	pairCmd.Flags().StringVar(&pairName, "name", "", "Name of the person the device belongs to (\"Sam\"), kept in people.json for the household; needs --user")
 	pairCmd.Flags().DurationVar(&pairTTL, "ttl", 0, "How long the code works (default and maximum: server.device_pairing.code_ttl_seconds)")
 	pairCmd.Flags().BoolVar(&pairLinkOnly, "link-only", false, "Print only the pairing link (for scripts)")
 	devicesListCmd.Flags().BoolVar(&devicesJSON, "json", false, "Print the devices as JSON (loom.v1.ListDevicesResponse), for scripts and apps")
@@ -130,6 +133,15 @@ func explainDeviceError(err error) error {
 }
 
 func runPair(cmd *cobra.Command, _ []string) error {
+	if pairName != "" {
+		if pairUser == "" {
+			return errors.New("--name needs --user: the name is for that user")
+		}
+		people := household.NewPeople(filepath.Join(loomconfig.GetLoomDataDir(), household.PeopleFileName))
+		if err := people.SetName(pairUser, pairName); err != nil {
+			return fmt.Errorf("save the name: %w", err)
+		}
+	}
 	ctx, cancel := context.WithTimeout(cmd.Context(), 15*time.Second)
 	defer cancel()
 	client, ctx, closeConn, err := deviceClient(ctx)

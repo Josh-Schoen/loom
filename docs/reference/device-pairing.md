@@ -98,6 +98,7 @@ port in plaintext.
 | `looms pair --link-only` | Print only the link. |
 | `looms pair --ttl 5m` | Shorter lifetime (capped at `code_ttl_seconds`). |
 | `looms pair --user alice` | Device acts as `alice` (default: the server's default user). Pages the assistant makes for `alice` are hers alone; see `mcp-apps.md#ownership`. |
+| `looms pair --user alice --name Alice` | As above, and names the person `Alice` in `people.json` for the household (`--name` needs `--user`); see [household.md](household.md). |
 | `looms devices list` | Paired devices with status (`active` / `revoked`). |
 | `looms devices list --json` | The same as JSON: `loom.v1.ListDevicesResponse` in protojson (lowerCamelCase, every field present; `revokedAt` is `null` for active devices), for scripts and setup apps. |
 | `looms devices revoke <device-id>` | Disable a device token permanently. |

@@ -646,6 +646,9 @@ one with `CreateUIApp` `shared: true`, or share an existing app with
   whose name another user also uses return `FAILED_PRECONDITION` (agent
   tools: `NAME_IN_USE`). The error for the last two reveals that some user
   has an app with that name.
+- `UIApp.shared_by_name` is the sharer's display name when the household
+  knows it (`server.household.enabled` and a name in `people.json`; see
+  [household.md](household.md#members-and-names)); empty otherwise.
 - Updates keep an app shared and keep `shared_by`. Shared apps count against
   their own limits (100 apps, 50 MB), separate from each user's.
 - Shared apps are stored under the reserved owner `"\x01shared"` (user IDs

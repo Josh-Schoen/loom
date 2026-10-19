@@ -41,6 +41,7 @@ import (
 	"github.com/teradata-labs/loom/pkg/evals"
 	"github.com/teradata-labs/loom/pkg/fabric"
 	fabricfactory "github.com/teradata-labs/loom/pkg/fabric/factory"
+	"github.com/teradata-labs/loom/pkg/household"
 	"github.com/teradata-labs/loom/pkg/llm"
 	"github.com/teradata-labs/loom/pkg/llm/anthropic"
 	"github.com/teradata-labs/loom/pkg/llm/azureopenai"
@@ -225,6 +226,8 @@ func registerYAMLBuiltinTools(
 		script.RunSavedName:               "script sandbox (registerSandboxTools; saved scripts)",
 		script.ListSavedName:              "script sandbox (registerSandboxTools; saved scripts)",
 		script.DeleteSavedName:            "script sandbox (registerSandboxTools; saved scripts)",
+		household.MembersToolName:         "household (registerHouseholdTools; server.household)",
+		household.NotesToolName:           "household (registerHouseholdTools; server.household)",
 	}
 
 	logger.Info(indent+"Registering builtin tools", zap.Int("count", len(cfg.Tools.Builtin)))
@@ -1671,8 +1674,8 @@ func runServe(cmd *cobra.Command, args []string) {
 	// Agents whose YAML lists a UI app tool in tools.builtin are always
 	// offered the UI app tools (see registerUIAppTools); keyed like agents.
 	uiAppToolsDeclared := make(map[string]bool)
-	// Agents' YAML, keyed like agents, for the sandboxed script tools
-	// (registerSandboxTools).
+	// Agents' YAML, keyed like agents, for the sandboxed script tools and
+	// the household tools (registerSandboxTools, registerHouseholdTools).
 	sandboxToolConfigs := make(map[string]*loomv1.AgentConfig)
 	// Each person's saved calculation scripts, shared by every agent.
 	savedScripts := script.NewStore(filepath.Join(loomconfig.GetLoomDataDir(), "scripts"), script.DefaultLimits)
@@ -2420,6 +2423,23 @@ func runServe(cmd *cobra.Command, args []string) {
 	// replay/import arrival times are rejected otherwise (see applyOccurredAt).
 	loomService.SetAllowTimeOverride(config.Server.AllowTimeOverride)
 	loomService.SetSpendingLedger(spendingLedger)
+	// The household (server.household): people's names and the notes they
+	// send each other. Members are the people named in people.json and the
+	// users of paired devices.
+	var householdStore *household.Household
+	if config.Server.Household.Enabled {
+		var members household.Members
+		if deviceServer != nil {
+			members = deviceServer
+		}
+		dataDir := loomconfig.GetLoomDataDir()
+		householdStore = household.New(
+			filepath.Join(dataDir, "household", "notes.json"),
+			household.NewPeople(filepath.Join(dataDir, household.PeopleFileName)),
+			members)
+		loomService.SetHousehold(householdStore)
+		logger.Info("Household enabled: names and notes between people")
+	}
 	if config.Server.AllowTimeOverride {
 		logger.Info("Arrival-time override enabled (server.allow_time_override): WeaveRequest.occurred_at will be honored")
 	}
@@ -3050,6 +3070,7 @@ func runServe(cmd *cobra.Command, args []string) {
 
 	for agentID, ag := range agents {
 		registerSandboxTools(ag, sandboxToolConfigs[agentID], agentID, savedScripts, logger)
+		registerHouseholdTools(ag, sandboxToolConfigs[agentID], agentID, householdStore, logger)
 	}
 
 	// Enable reflection if configured
@@ -3380,6 +3401,7 @@ func runServe(cmd *cobra.Command, args []string) {
 			}
 
 			registerSandboxTools(newAgent, agentConfig, agentConfig.GetName(), savedScripts, logger)
+			registerHouseholdTools(newAgent, agentConfig, agentConfig.GetName(), householdStore, logger)
 
 			// Check if agent already exists in server (by GUID)
 			existingAgents := loomService.GetAgentIDs()
@@ -4174,6 +4196,25 @@ func registerSandboxTools(ag *agent.Agent, cfg *loomv1.AgentConfig, name string,
 		ag.RegisterTools(script.SavedTools(store, runner)...)
 	}
 	logger.Info("  Script tools registered", zap.String("agent", name), zap.Bool("run_script", wantsRun), zap.Bool("saved_scripts", wantsSaved))
+}
+
+// registerHouseholdTools gives ag the household tools (household_members,
+// household_notes: both read-only) when its YAML lists either and the
+// household is enabled.
+func registerHouseholdTools(ag *agent.Agent, cfg *loomv1.AgentConfig, name string, h *household.Household, logger *zap.Logger) {
+	wants := false
+	for _, n := range household.ToolNames {
+		wants = wants || declaresBuiltinTool(cfg, n)
+	}
+	if !wants {
+		return
+	}
+	if h == nil {
+		logger.Warn("Agent lists household tools but the household is off (server.household.enabled)", zap.String("agent", name))
+		return
+	}
+	ag.RegisterTools(household.Tools(h)...)
+	logger.Info("  Household tools registered", zap.String("agent", name))
 }
 
 // declaresUIAppTools reports whether cfg lists any UI app tool in tools.builtin.

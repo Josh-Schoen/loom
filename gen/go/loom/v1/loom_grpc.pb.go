@@ -126,6 +126,12 @@ const (
 	LoomService_ForgetAllUserMemories_FullMethodName       = "/loom.v1.LoomService/ForgetAllUserMemories"
 	LoomService_SetUIAppSharing_FullMethodName             = "/loom.v1.LoomService/SetUIAppSharing"
 	LoomService_ListComponentTypes_FullMethodName          = "/loom.v1.LoomService/ListComponentTypes"
+	LoomService_ListHouseholdMembers_FullMethodName        = "/loom.v1.LoomService/ListHouseholdMembers"
+	LoomService_SendHouseholdNote_FullMethodName           = "/loom.v1.LoomService/SendHouseholdNote"
+	LoomService_ListHouseholdNotes_FullMethodName          = "/loom.v1.LoomService/ListHouseholdNotes"
+	LoomService_AnswerHouseholdNote_FullMethodName         = "/loom.v1.LoomService/AnswerHouseholdNote"
+	LoomService_MarkHouseholdNotesRead_FullMethodName      = "/loom.v1.LoomService/MarkHouseholdNotesRead"
+	LoomService_GetHouseholdUpdates_FullMethodName         = "/loom.v1.LoomService/GetHouseholdUpdates"
 	LoomService_ListAgentPresets_FullMethodName            = "/loom.v1.LoomService/ListAgentPresets"
 	LoomService_ListWorkflowTemplates_FullMethodName       = "/loom.v1.LoomService/ListWorkflowTemplates"
 	LoomService_CreateWorkflowFromTemplate_FullMethodName  = "/loom.v1.LoomService/CreateWorkflowFromTemplate"
@@ -347,6 +353,23 @@ type LoomServiceClient interface {
 	// ListComponentTypes returns the catalog of available component types
 	// for building dynamic UI apps.
 	ListComponentTypes(ctx context.Context, in *ListComponentTypesRequest, opts ...grpc.CallOption) (*ListComponentTypesResponse, error)
+	// ListHouseholdMembers lists the people in the household, by name.
+	ListHouseholdMembers(ctx context.Context, in *ListHouseholdMembersRequest, opts ...grpc.CallOption) (*ListHouseholdMembersResponse, error)
+	// SendHouseholdNote sends a note from the caller to another member.
+	// INVALID_ARGUMENT for an unknown recipient, the caller themself, or empty
+	// or too long text.
+	SendHouseholdNote(ctx context.Context, in *SendHouseholdNoteRequest, opts ...grpc.CallOption) (*HouseholdNote, error)
+	// ListHouseholdNotes lists the notes the caller sent or received.
+	ListHouseholdNotes(ctx context.Context, in *ListHouseholdNotesRequest, opts ...grpc.CallOption) (*ListHouseholdNotesResponse, error)
+	// AnswerHouseholdNote answers an ask sent to the caller. NOT_FOUND for a
+	// note not sent to the caller; FAILED_PRECONDITION for a tell or an ask
+	// already answered.
+	AnswerHouseholdNote(ctx context.Context, in *AnswerHouseholdNoteRequest, opts ...grpc.CallOption) (*HouseholdNote, error)
+	// MarkHouseholdNotesRead marks notes to the caller read, and answers to
+	// the caller's asks seen.
+	MarkHouseholdNotesRead(ctx context.Context, in *MarkHouseholdNotesReadRequest, opts ...grpc.CallOption) (*MarkHouseholdNotesReadResponse, error)
+	// GetHouseholdUpdates returns what is new for the caller (badge counts).
+	GetHouseholdUpdates(ctx context.Context, in *GetHouseholdUpdatesRequest, opts ...grpc.CallOption) (*HouseholdUpdates, error)
 	// ListAgentPresets returns the set of preconfigured single-agent presets.
 	ListAgentPresets(ctx context.Context, in *ListAgentPresetsRequest, opts ...grpc.CallOption) (*ListAgentPresetsResponse, error)
 	// ListWorkflowTemplates returns the set of preconfigured workflow templates.
@@ -1348,6 +1371,66 @@ func (c *loomServiceClient) ListComponentTypes(ctx context.Context, in *ListComp
 	return out, nil
 }
 
+func (c *loomServiceClient) ListHouseholdMembers(ctx context.Context, in *ListHouseholdMembersRequest, opts ...grpc.CallOption) (*ListHouseholdMembersResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ListHouseholdMembersResponse)
+	err := c.cc.Invoke(ctx, LoomService_ListHouseholdMembers_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *loomServiceClient) SendHouseholdNote(ctx context.Context, in *SendHouseholdNoteRequest, opts ...grpc.CallOption) (*HouseholdNote, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(HouseholdNote)
+	err := c.cc.Invoke(ctx, LoomService_SendHouseholdNote_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *loomServiceClient) ListHouseholdNotes(ctx context.Context, in *ListHouseholdNotesRequest, opts ...grpc.CallOption) (*ListHouseholdNotesResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ListHouseholdNotesResponse)
+	err := c.cc.Invoke(ctx, LoomService_ListHouseholdNotes_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *loomServiceClient) AnswerHouseholdNote(ctx context.Context, in *AnswerHouseholdNoteRequest, opts ...grpc.CallOption) (*HouseholdNote, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(HouseholdNote)
+	err := c.cc.Invoke(ctx, LoomService_AnswerHouseholdNote_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *loomServiceClient) MarkHouseholdNotesRead(ctx context.Context, in *MarkHouseholdNotesReadRequest, opts ...grpc.CallOption) (*MarkHouseholdNotesReadResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(MarkHouseholdNotesReadResponse)
+	err := c.cc.Invoke(ctx, LoomService_MarkHouseholdNotesRead_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *loomServiceClient) GetHouseholdUpdates(ctx context.Context, in *GetHouseholdUpdatesRequest, opts ...grpc.CallOption) (*HouseholdUpdates, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(HouseholdUpdates)
+	err := c.cc.Invoke(ctx, LoomService_GetHouseholdUpdates_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *loomServiceClient) ListAgentPresets(ctx context.Context, in *ListAgentPresetsRequest, opts ...grpc.CallOption) (*ListAgentPresetsResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ListAgentPresetsResponse)
@@ -1594,6 +1677,23 @@ type LoomServiceServer interface {
 	// ListComponentTypes returns the catalog of available component types
 	// for building dynamic UI apps.
 	ListComponentTypes(context.Context, *ListComponentTypesRequest) (*ListComponentTypesResponse, error)
+	// ListHouseholdMembers lists the people in the household, by name.
+	ListHouseholdMembers(context.Context, *ListHouseholdMembersRequest) (*ListHouseholdMembersResponse, error)
+	// SendHouseholdNote sends a note from the caller to another member.
+	// INVALID_ARGUMENT for an unknown recipient, the caller themself, or empty
+	// or too long text.
+	SendHouseholdNote(context.Context, *SendHouseholdNoteRequest) (*HouseholdNote, error)
+	// ListHouseholdNotes lists the notes the caller sent or received.
+	ListHouseholdNotes(context.Context, *ListHouseholdNotesRequest) (*ListHouseholdNotesResponse, error)
+	// AnswerHouseholdNote answers an ask sent to the caller. NOT_FOUND for a
+	// note not sent to the caller; FAILED_PRECONDITION for a tell or an ask
+	// already answered.
+	AnswerHouseholdNote(context.Context, *AnswerHouseholdNoteRequest) (*HouseholdNote, error)
+	// MarkHouseholdNotesRead marks notes to the caller read, and answers to
+	// the caller's asks seen.
+	MarkHouseholdNotesRead(context.Context, *MarkHouseholdNotesReadRequest) (*MarkHouseholdNotesReadResponse, error)
+	// GetHouseholdUpdates returns what is new for the caller (badge counts).
+	GetHouseholdUpdates(context.Context, *GetHouseholdUpdatesRequest) (*HouseholdUpdates, error)
 	// ListAgentPresets returns the set of preconfigured single-agent presets.
 	ListAgentPresets(context.Context, *ListAgentPresetsRequest) (*ListAgentPresetsResponse, error)
 	// ListWorkflowTemplates returns the set of preconfigured workflow templates.
@@ -1887,6 +1987,24 @@ func (UnimplementedLoomServiceServer) SetUIAppSharing(context.Context, *SetUIApp
 }
 func (UnimplementedLoomServiceServer) ListComponentTypes(context.Context, *ListComponentTypesRequest) (*ListComponentTypesResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ListComponentTypes not implemented")
+}
+func (UnimplementedLoomServiceServer) ListHouseholdMembers(context.Context, *ListHouseholdMembersRequest) (*ListHouseholdMembersResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ListHouseholdMembers not implemented")
+}
+func (UnimplementedLoomServiceServer) SendHouseholdNote(context.Context, *SendHouseholdNoteRequest) (*HouseholdNote, error) {
+	return nil, status.Error(codes.Unimplemented, "method SendHouseholdNote not implemented")
+}
+func (UnimplementedLoomServiceServer) ListHouseholdNotes(context.Context, *ListHouseholdNotesRequest) (*ListHouseholdNotesResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ListHouseholdNotes not implemented")
+}
+func (UnimplementedLoomServiceServer) AnswerHouseholdNote(context.Context, *AnswerHouseholdNoteRequest) (*HouseholdNote, error) {
+	return nil, status.Error(codes.Unimplemented, "method AnswerHouseholdNote not implemented")
+}
+func (UnimplementedLoomServiceServer) MarkHouseholdNotesRead(context.Context, *MarkHouseholdNotesReadRequest) (*MarkHouseholdNotesReadResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method MarkHouseholdNotesRead not implemented")
+}
+func (UnimplementedLoomServiceServer) GetHouseholdUpdates(context.Context, *GetHouseholdUpdatesRequest) (*HouseholdUpdates, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetHouseholdUpdates not implemented")
 }
 func (UnimplementedLoomServiceServer) ListAgentPresets(context.Context, *ListAgentPresetsRequest) (*ListAgentPresetsResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ListAgentPresets not implemented")
@@ -3525,6 +3643,114 @@ func _LoomService_ListComponentTypes_Handler(srv interface{}, ctx context.Contex
 	return interceptor(ctx, in, info, handler)
 }
 
+func _LoomService_ListHouseholdMembers_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListHouseholdMembersRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LoomServiceServer).ListHouseholdMembers(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LoomService_ListHouseholdMembers_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LoomServiceServer).ListHouseholdMembers(ctx, req.(*ListHouseholdMembersRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LoomService_SendHouseholdNote_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SendHouseholdNoteRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LoomServiceServer).SendHouseholdNote(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LoomService_SendHouseholdNote_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LoomServiceServer).SendHouseholdNote(ctx, req.(*SendHouseholdNoteRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LoomService_ListHouseholdNotes_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListHouseholdNotesRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LoomServiceServer).ListHouseholdNotes(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LoomService_ListHouseholdNotes_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LoomServiceServer).ListHouseholdNotes(ctx, req.(*ListHouseholdNotesRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LoomService_AnswerHouseholdNote_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(AnswerHouseholdNoteRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LoomServiceServer).AnswerHouseholdNote(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LoomService_AnswerHouseholdNote_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LoomServiceServer).AnswerHouseholdNote(ctx, req.(*AnswerHouseholdNoteRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LoomService_MarkHouseholdNotesRead_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(MarkHouseholdNotesReadRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LoomServiceServer).MarkHouseholdNotesRead(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LoomService_MarkHouseholdNotesRead_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LoomServiceServer).MarkHouseholdNotesRead(ctx, req.(*MarkHouseholdNotesReadRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LoomService_GetHouseholdUpdates_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetHouseholdUpdatesRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LoomServiceServer).GetHouseholdUpdates(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LoomService_GetHouseholdUpdates_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LoomServiceServer).GetHouseholdUpdates(ctx, req.(*GetHouseholdUpdatesRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _LoomService_ListAgentPresets_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(ListAgentPresetsRequest)
 	if err := dec(in); err != nil {
@@ -3925,6 +4151,30 @@ var LoomService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ListComponentTypes",
 			Handler:    _LoomService_ListComponentTypes_Handler,
+		},
+		{
+			MethodName: "ListHouseholdMembers",
+			Handler:    _LoomService_ListHouseholdMembers_Handler,
+		},
+		{
+			MethodName: "SendHouseholdNote",
+			Handler:    _LoomService_SendHouseholdNote_Handler,
+		},
+		{
+			MethodName: "ListHouseholdNotes",
+			Handler:    _LoomService_ListHouseholdNotes_Handler,
+		},
+		{
+			MethodName: "AnswerHouseholdNote",
+			Handler:    _LoomService_AnswerHouseholdNote_Handler,
+		},
+		{
+			MethodName: "MarkHouseholdNotesRead",
+			Handler:    _LoomService_MarkHouseholdNotesRead_Handler,
+		},
+		{
+			MethodName: "GetHouseholdUpdates",
+			Handler:    _LoomService_GetHouseholdUpdates_Handler,
 		},
 		{
 			MethodName: "ListAgentPresets",

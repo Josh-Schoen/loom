@@ -23,6 +23,7 @@ import "loom/v1/agent_config.proto";
 import "loom/v1/apps.proto";
 import "loom/v1/bus.proto";
 import "loom/v1/communication.proto";
+import "loom/v1/household.proto";
 import "loom/v1/orchestration.proto";
 import "loom/v1/server.proto";
 import "loom/v1/shared_memory.proto";
@@ -679,6 +680,54 @@ service LoomService {
   // for building dynamic UI apps.
   rpc ListComponentTypes(ListComponentTypesRequest) returns (ListComponentTypesResponse) {
     option (google.api.http) = {get: "/v1/apps/component-types"};
+  }
+
+  // Household: the people on this server and the notes they send each other
+  // (proto/loom/v1/household.proto). FAILED_PRECONDITION unless
+  // server.household.enabled.
+
+  // ListHouseholdMembers lists the people in the household, by name.
+  rpc ListHouseholdMembers(ListHouseholdMembersRequest) returns (ListHouseholdMembersResponse) {
+    option (google.api.http) = {get: "/v1/household/members"};
+  }
+
+  // SendHouseholdNote sends a note from the caller to another member.
+  // INVALID_ARGUMENT for an unknown recipient, the caller themself, or empty
+  // or too long text.
+  rpc SendHouseholdNote(SendHouseholdNoteRequest) returns (HouseholdNote) {
+    option (google.api.http) = {
+      post: "/v1/household/notes"
+      body: "*"
+    };
+  }
+
+  // ListHouseholdNotes lists the notes the caller sent or received.
+  rpc ListHouseholdNotes(ListHouseholdNotesRequest) returns (ListHouseholdNotesResponse) {
+    option (google.api.http) = {get: "/v1/household/notes"};
+  }
+
+  // AnswerHouseholdNote answers an ask sent to the caller. NOT_FOUND for a
+  // note not sent to the caller; FAILED_PRECONDITION for a tell or an ask
+  // already answered.
+  rpc AnswerHouseholdNote(AnswerHouseholdNoteRequest) returns (HouseholdNote) {
+    option (google.api.http) = {
+      post: "/v1/household/notes/{note_id}:answer"
+      body: "*"
+    };
+  }
+
+  // MarkHouseholdNotesRead marks notes to the caller read, and answers to
+  // the caller's asks seen.
+  rpc MarkHouseholdNotesRead(MarkHouseholdNotesReadRequest) returns (MarkHouseholdNotesReadResponse) {
+    option (google.api.http) = {
+      post: "/v1/household/notes:mark-read"
+      body: "*"
+    };
+  }
+
+  // GetHouseholdUpdates returns what is new for the caller (badge counts).
+  rpc GetHouseholdUpdates(GetHouseholdUpdatesRequest) returns (HouseholdUpdates) {
+    option (google.api.http) = {get: "/v1/household/updates"};
   }
 
   // Templates & Presets — the scaffolding registries the weaver uses to

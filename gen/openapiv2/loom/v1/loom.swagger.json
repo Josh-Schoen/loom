@@ -1370,6 +1370,189 @@
         ]
       }
     },
+    "/v1/household/members": {
+      "get": {
+        "summary": "ListHouseholdMembers lists the people in the household, by name.",
+        "operationId": "LoomService_ListHouseholdMembers",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/v1ListHouseholdMembersResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "tags": [
+          "LoomService"
+        ]
+      }
+    },
+    "/v1/household/notes": {
+      "get": {
+        "summary": "ListHouseholdNotes lists the notes the caller sent or received.",
+        "operationId": "LoomService_ListHouseholdNotes",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/v1ListHouseholdNotesResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "limit",
+            "description": "Maximum notes to return, newest first (default 50, maximum 200).",
+            "in": "query",
+            "required": false,
+            "type": "integer",
+            "format": "int32"
+          }
+        ],
+        "tags": [
+          "LoomService"
+        ]
+      },
+      "post": {
+        "summary": "SendHouseholdNote sends a note from the caller to another member.\nINVALID_ARGUMENT for an unknown recipient, the caller themself, or empty\nor too long text.",
+        "operationId": "LoomService_SendHouseholdNote",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/v1HouseholdNote"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/v1SendHouseholdNoteRequest"
+            }
+          }
+        ],
+        "tags": [
+          "LoomService"
+        ]
+      }
+    },
+    "/v1/household/notes/{noteId}:answer": {
+      "post": {
+        "summary": "AnswerHouseholdNote answers an ask sent to the caller. NOT_FOUND for a\nnote not sent to the caller; FAILED_PRECONDITION for a tell or an ask\nalready answered.",
+        "operationId": "LoomService_AnswerHouseholdNote",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/v1HouseholdNote"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "noteId",
+            "description": "An ask sent to the caller, not yet answered.",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/LoomServiceAnswerHouseholdNoteBody"
+            }
+          }
+        ],
+        "tags": [
+          "LoomService"
+        ]
+      }
+    },
+    "/v1/household/notes:mark-read": {
+      "post": {
+        "summary": "MarkHouseholdNotesRead marks notes to the caller read, and answers to\nthe caller's asks seen.",
+        "operationId": "LoomService_MarkHouseholdNotesRead",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/v1MarkHouseholdNotesReadResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/v1MarkHouseholdNotesReadRequest"
+            }
+          }
+        ],
+        "tags": [
+          "LoomService"
+        ]
+      }
+    },
+    "/v1/household/updates": {
+      "get": {
+        "summary": "GetHouseholdUpdates returns what is new for the caller (badge counts).",
+        "operationId": "LoomService_GetHouseholdUpdates",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/v1HouseholdUpdates"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "tags": [
+          "LoomService"
+        ]
+      }
+    },
     "/v1/mcp/servers": {
       "get": {
         "summary": "ListMCPServers lists all configured MCP servers.",
@@ -3683,6 +3866,15 @@
       },
       "description": "AnswerClarificationRequest provides an answer to a clarification question."
     },
+    "LoomServiceAnswerHouseholdNoteBody": {
+      "type": "object",
+      "properties": {
+        "text": {
+          "type": "string",
+          "description": "The answer (at most 1000 characters)."
+        }
+      }
+    },
     "LoomServiceCorrectUserMemoryBody": {
       "type": "object",
       "properties": {
@@ -3989,7 +4181,7 @@
         "NULL_VALUE"
       ],
       "default": "NULL_VALUE",
-      "description": "Represents a JSON `null`.\n\n`NullValue` is a sentinel, using an enum with only one value to represent\nthe null value for the `Value` type union.\n\nA field of type `NullValue` with any value other than `0` is considered\ninvalid. Most ProtoJSON serializers will emit a Value with a `null_value` set\nas a JSON `null` regardless of the integer value, and so will round trip to\na `0` value.\n\n - NULL_VALUE: Null value."
+      "description": "`NullValue` is a singleton enumeration to represent the null value for the\n`Value` type union.\n\nThe JSON representation for `NullValue` is JSON `null`.\n\n - NULL_VALUE: Null value."
     },
     "rpcStatus": {
       "type": "object",
@@ -6039,6 +6231,116 @@
       },
       "description": "HealthStatus returns system health."
     },
+    "v1HouseholdMember": {
+      "type": "object",
+      "properties": {
+        "userId": {
+          "type": "string",
+          "description": "User ID (as given to `looms pair --user`)."
+        },
+        "name": {
+          "type": "string",
+          "description": "Display name (\"Sam\"); the user ID when no name was given."
+        },
+        "isYou": {
+          "type": "boolean",
+          "description": "True for the caller."
+        }
+      },
+      "description": "HouseholdMember is one person on the server."
+    },
+    "v1HouseholdNote": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "fromUserId": {
+          "type": "string"
+        },
+        "fromName": {
+          "type": "string",
+          "description": "Sender's display name."
+        },
+        "toUserId": {
+          "type": "string"
+        },
+        "toName": {
+          "type": "string",
+          "description": "Recipient's display name."
+        },
+        "kind": {
+          "$ref": "#/definitions/v1HouseholdNoteKind"
+        },
+        "text": {
+          "type": "string",
+          "description": "What the sender wrote (at most 1000 characters)."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "readAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "When the recipient read it; unset while unread."
+        },
+        "answer": {
+          "type": "string",
+          "description": "The recipient's answer to an ask; empty until answered."
+        },
+        "answeredAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "answerSeenAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "When the sender saw the answer; unset while the answer is new."
+        },
+        "fromYou": {
+          "type": "boolean",
+          "description": "True when the caller sent the note."
+        }
+      },
+      "description": "HouseholdNote is a note from one person to another, with its answer."
+    },
+    "v1HouseholdNoteKind": {
+      "type": "string",
+      "enum": [
+        "HOUSEHOLD_NOTE_KIND_UNSPECIFIED",
+        "HOUSEHOLD_NOTE_KIND_TELL",
+        "HOUSEHOLD_NOTE_KIND_ASK"
+      ],
+      "default": "HOUSEHOLD_NOTE_KIND_UNSPECIFIED",
+      "description": "HouseholdNoteKind says whether a note expects an answer.\n\n - HOUSEHOLD_NOTE_KIND_TELL: Passes something on (\"I'm running late\"); no answer expected.\n - HOUSEHOLD_NOTE_KIND_ASK: Asks something (\"Can you do pickup Thursday?\"); the recipient can answer\nonce with AnswerHouseholdNote."
+    },
+    "v1HouseholdUpdates": {
+      "type": "object",
+      "properties": {
+        "unreadNotes": {
+          "type": "integer",
+          "format": "int32",
+          "description": "Notes sent to the caller that they have not read."
+        },
+        "unansweredAsks": {
+          "type": "integer",
+          "format": "int32",
+          "description": "Asks sent to the caller that they have not answered."
+        },
+        "newAnswers": {
+          "type": "integer",
+          "format": "int32",
+          "description": "Answers to the caller's asks that they have not seen."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "When anything the caller can see last changed; unset when nothing has."
+        }
+      },
+      "description": "HouseholdUpdates is what is new for the caller, for a badge."
+    },
     "v1HygieneConfig": {
       "type": "object",
       "properties": {
@@ -6405,6 +6707,32 @@
         }
       },
       "description": "ListComponentTypesResponse returns the full catalog of component types."
+    },
+    "v1ListHouseholdMembersResponse": {
+      "type": "object",
+      "properties": {
+        "members": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "$ref": "#/definitions/v1HouseholdMember"
+          },
+          "description": "Everyone in the household, by name."
+        }
+      }
+    },
+    "v1ListHouseholdNotesResponse": {
+      "type": "object",
+      "properties": {
+        "notes": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "$ref": "#/definitions/v1HouseholdNote"
+          },
+          "description": "Notes the caller sent or received, newest first."
+        }
+      }
     },
     "v1ListMCPServerToolsResponse": {
       "type": "object",
@@ -6831,6 +7159,28 @@
         }
       },
       "description": "ManualTLSConfig for manually provided certificates."
+    },
+    "v1MarkHouseholdNotesReadRequest": {
+      "type": "object",
+      "properties": {
+        "noteIds": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Notes to mark: a note sent to the caller is marked read; an answered\nask the caller sent has its answer marked seen. Empty marks all of them."
+        }
+      }
+    },
+    "v1MarkHouseholdNotesReadResponse": {
+      "type": "object",
+      "properties": {
+        "marked": {
+          "type": "integer",
+          "format": "int32",
+          "description": "How many notes changed."
+        }
+      }
     },
     "v1MemoryCompressionBatchSizes": {
       "type": "object",
@@ -8587,6 +8937,21 @@
       },
       "description": "SendAsyncResponse confirms the async send operation."
     },
+    "v1SendHouseholdNoteRequest": {
+      "type": "object",
+      "properties": {
+        "toUserId": {
+          "type": "string",
+          "description": "Recipient's user ID: another member of the household."
+        },
+        "kind": {
+          "$ref": "#/definitions/v1HouseholdNoteKind"
+        },
+        "text": {
+          "type": "string"
+        }
+      }
+    },
     "v1ServerBehavior": {
       "type": "object",
       "properties": {
@@ -10275,6 +10640,10 @@
         "sharedBy": {
           "type": "string",
           "description": "For shared apps: the user ID of the person who shared it. Only they can\ndelete it or stop sharing it."
+        },
+        "sharedByName": {
+          "type": "string",
+          "description": "For shared apps: the display name of the person who shared it, when the\nserver knows people's names (the household); empty otherwise."
         }
       },
       "description": "UIApp represents an interactive HTML application exposed by the MCP server."

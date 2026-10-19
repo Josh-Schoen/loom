@@ -1,0 +1,119 @@
+// Copyright © 2026 Teradata Corporation - All Rights Reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+
+syntax = "proto3";
+
+package loom.v1;
+
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/teradata-labs/loom/gen/go/loom/v1;loomv1";
+
+// The household: the people who use one server (a family sharing an
+// assistant on their computer), their names, and short notes they send each
+// other ("I'm running late", "Can you do pickup Thursday?"). Enabled with
+// server.household.enabled. Every request acts as the caller's user ID: a
+// person reads the notes they sent and the notes sent to them, nothing else.
+// See docs/reference/household.md.
+
+// HouseholdMember is one person on the server.
+message HouseholdMember {
+  // User ID (as given to `looms pair --user`).
+  string user_id = 1;
+  // Display name ("Sam"); the user ID when no name was given.
+  string name = 2;
+  // True for the caller.
+  bool is_you = 3;
+}
+
+message ListHouseholdMembersRequest {}
+
+message ListHouseholdMembersResponse {
+  // Everyone in the household, by name.
+  repeated HouseholdMember members = 1;
+}
+
+// HouseholdNoteKind says whether a note expects an answer.
+enum HouseholdNoteKind {
+  HOUSEHOLD_NOTE_KIND_UNSPECIFIED = 0;
+  // Passes something on ("I'm running late"); no answer expected.
+  HOUSEHOLD_NOTE_KIND_TELL = 1;
+  // Asks something ("Can you do pickup Thursday?"); the recipient can answer
+  // once with AnswerHouseholdNote.
+  HOUSEHOLD_NOTE_KIND_ASK = 2;
+}
+
+// HouseholdNote is a note from one person to another, with its answer.
+message HouseholdNote {
+  string id = 1;
+  string from_user_id = 2;
+  // Sender's display name.
+  string from_name = 3;
+  string to_user_id = 4;
+  // Recipient's display name.
+  string to_name = 5;
+  HouseholdNoteKind kind = 6;
+  // What the sender wrote (at most 1000 characters).
+  string text = 7;
+  google.protobuf.Timestamp created_at = 8;
+  // When the recipient read it; unset while unread.
+  google.protobuf.Timestamp read_at = 9;
+  // The recipient's answer to an ask; empty until answered.
+  string answer = 10;
+  google.protobuf.Timestamp answered_at = 11;
+  // When the sender saw the answer; unset while the answer is new.
+  google.protobuf.Timestamp answer_seen_at = 12;
+  // True when the caller sent the note.
+  bool from_you = 13;
+}
+
+message SendHouseholdNoteRequest {
+  // Recipient's user ID: another member of the household.
+  string to_user_id = 1;
+  HouseholdNoteKind kind = 2;
+  string text = 3;
+}
+
+message ListHouseholdNotesRequest {
+  // Maximum notes to return, newest first (default 50, maximum 200).
+  int32 limit = 1;
+}
+
+message ListHouseholdNotesResponse {
+  // Notes the caller sent or received, newest first.
+  repeated HouseholdNote notes = 1;
+}
+
+message AnswerHouseholdNoteRequest {
+  // An ask sent to the caller, not yet answered.
+  string note_id = 1;
+  // The answer (at most 1000 characters).
+  string text = 2;
+}
+
+message MarkHouseholdNotesReadRequest {
+  // Notes to mark: a note sent to the caller is marked read; an answered
+  // ask the caller sent has its answer marked seen. Empty marks all of them.
+  repeated string note_ids = 1;
+}
+
+message MarkHouseholdNotesReadResponse {
+  // How many notes changed.
+  int32 marked = 1;
+}
+
+message GetHouseholdUpdatesRequest {}
+
+// HouseholdUpdates is what is new for the caller, for a badge.
+message HouseholdUpdates {
+  // Notes sent to the caller that they have not read.
+  int32 unread_notes = 1;
+  // Asks sent to the caller that they have not answered.
+  int32 unanswered_asks = 2;
+  // Answers to the caller's asks that they have not seen.
+  int32 new_answers = 3;
+  // When anything the caller can see last changed; unset when nothing has.
+  google.protobuf.Timestamp updated_at = 4;
+}

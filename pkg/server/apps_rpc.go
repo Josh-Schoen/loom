@@ -151,7 +151,7 @@ func (s *MultiAgentServer) ListUIApps(ctx context.Context, req *loomv1.ListUIApp
 	infos := provider.ListAppInfo(appOwner(ctx))
 	protoApps := make([]*loomv1.UIApp, 0, len(infos))
 	for _, info := range infos {
-		protoApps = append(protoApps, appInfoToProto(&info))
+		protoApps = append(protoApps, s.appInfoToProto(&info))
 	}
 
 	if s.logger != nil {
@@ -188,7 +188,7 @@ func (s *MultiAgentServer) GetUIApp(ctx context.Context, req *loomv1.GetUIAppReq
 	}
 
 	return &loomv1.GetUIAppResponse{
-		App:     appInfoToProto(info),
+		App:     s.appInfoToProto(info),
 		Content: content,
 	}, nil
 }
@@ -261,7 +261,7 @@ func (s *MultiAgentServer) CreateUIApp(ctx context.Context, req *loomv1.CreateUI
 	}
 
 	return &loomv1.CreateUIAppResponse{
-		App:         appInfoToProto(info),
+		App:         s.appInfoToProto(info),
 		Content:     html,
 		Overwritten: overwritten,
 	}, nil
@@ -308,7 +308,7 @@ func (s *MultiAgentServer) UpdateUIApp(ctx context.Context, req *loomv1.UpdateUI
 	}
 
 	return &loomv1.UpdateUIAppResponse{
-		App:     appInfoToProto(info),
+		App:     s.appInfoToProto(info),
 		Content: html,
 	}, nil
 }
@@ -359,7 +359,7 @@ func (s *MultiAgentServer) SetUIAppChecklistItem(ctx context.Context, req *loomv
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "save %s: %v", req.GetName(), err)
 	}
-	return &loomv1.SetUIAppChecklistItemResponse{App: appInfoToProto(info)}, nil
+	return &loomv1.SetUIAppChecklistItemResponse{App: s.appInfoToProto(info)}, nil
 }
 
 // setChecklistItem finds the checklist component componentID (at any depth)
@@ -457,11 +457,12 @@ func (s *MultiAgentServer) SetUIAppSharing(ctx context.Context, req *loomv1.SetU
 	case err != nil:
 		return nil, status.Errorf(codes.FailedPrecondition, "%v", err)
 	}
-	return &loomv1.SetUIAppSharingResponse{App: appInfoToProto(info)}, nil
+	return &loomv1.SetUIAppSharingResponse{App: s.appInfoToProto(info)}, nil
 }
 
-// appInfoToProto converts an apps.AppInfo to a proto UIApp message.
-func appInfoToProto(info *apps.AppInfo) *loomv1.UIApp {
+// appInfoToProto converts an apps.AppInfo to a proto UIApp message, naming
+// the person who shared a shared app when the household knows names.
+func (s *MultiAgentServer) appInfoToProto(info *apps.AppInfo) *loomv1.UIApp {
 	app := &loomv1.UIApp{
 		Name:          info.Name,
 		Uri:           info.URI,
@@ -475,6 +476,11 @@ func appInfoToProto(info *apps.AppInfo) *loomv1.UIApp {
 	}
 	if !info.UpdatedAt.IsZero() {
 		app.UpdatedAt = timestamppb.New(info.UpdatedAt)
+	}
+	if h := s.householdOrNil(); h != nil && info.SharedBy != "" {
+		if name := h.People().Name(info.SharedBy); name != info.SharedBy {
+			app.SharedByName = name
+		}
 	}
 	return app
 }

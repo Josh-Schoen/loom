@@ -45,6 +45,10 @@ message UIApp {
   // For shared apps: the user ID of the person who shared it. Only they can
   // delete it or stop sharing it.
   string shared_by = 10;
+
+  // For shared apps: the display name of the person who shared it, when the
+  // server knows people's names (the household); empty otherwise.
+  string shared_by_name = 11;
 }
 
 // ListUIAppsRequest lists all available UI apps.

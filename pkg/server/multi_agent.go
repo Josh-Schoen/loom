@@ -22,6 +22,7 @@ import (
 	"github.com/teradata-labs/loom/pkg/clienttools"
 	"github.com/teradata-labs/loom/pkg/communication"
 	"github.com/teradata-labs/loom/pkg/evals"
+	"github.com/teradata-labs/loom/pkg/household"
 	"github.com/teradata-labs/loom/pkg/llm/factory"
 	"github.com/teradata-labs/loom/pkg/llm/spending"
 	"github.com/teradata-labs/loom/pkg/mcp/manager"
@@ -71,6 +72,9 @@ type MultiAgentServer struct {
 	// limit: turns are refused once it is reached (admitTurn), and
 	// providers made by SwitchModel are put behind it.
 	spending *spending.Ledger
+	// household keeps people's names and the notes they send each other
+	// (server.household); nil when it is off.
+	household *household.Household
 
 	// clientTools matches SubmitClientToolResult calls to the StreamWeave
 	// turns waiting on them; clientToolConfig is the operator's timeout policy

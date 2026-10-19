@@ -52,7 +52,10 @@ type UIApp struct {
 	Shared bool `protobuf:"varint,9,opt,name=shared,proto3" json:"shared,omitempty"`
 	// For shared apps: the user ID of the person who shared it. Only they can
 	// delete it or stop sharing it.
-	SharedBy      string `protobuf:"bytes,10,opt,name=shared_by,json=sharedBy,proto3" json:"shared_by,omitempty"`
+	SharedBy string `protobuf:"bytes,10,opt,name=shared_by,json=sharedBy,proto3" json:"shared_by,omitempty"`
+	// For shared apps: the display name of the person who shared it, when the
+	// server knows people's names (the household); empty otherwise.
+	SharedByName  string `protobuf:"bytes,11,opt,name=shared_by_name,json=sharedByName,proto3" json:"shared_by_name,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -153,6 +156,13 @@ func (x *UIApp) GetShared() bool {
 func (x *UIApp) GetSharedBy() string {
 	if x != nil {
 		return x.SharedBy
+	}
+	return ""
+}
+
+func (x *UIApp) GetSharedByName() string {
+	if x != nil {
+		return x.SharedByName
 	}
 	return ""
 }
@@ -1291,7 +1301,7 @@ var File_loom_v1_apps_proto protoreflect.FileDescriptor
 
 const file_loom_v1_apps_proto_rawDesc = "" +
 	"\n" +
-	"\x12loom/v1/apps.proto\x12\aloom.v1\x1a\x1cgoogle/protobuf/struct.proto\x1a\x1fgoogle/protobuf/timestamp.proto\"\xc0\x02\n" +
+	"\x12loom/v1/apps.proto\x12\aloom.v1\x1a\x1cgoogle/protobuf/struct.proto\x1a\x1fgoogle/protobuf/timestamp.proto\"\xe6\x02\n" +
 	"\x05UIApp\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x10\n" +
 	"\x03uri\x18\x02 \x01(\tR\x03uri\x12!\n" +
@@ -1304,7 +1314,8 @@ const file_loom_v1_apps_proto_rawDesc = "" +
 	"updated_at\x18\b \x01(\v2\x1a.google.protobuf.TimestampR\tupdatedAt\x12\x16\n" +
 	"\x06shared\x18\t \x01(\bR\x06shared\x12\x1b\n" +
 	"\tshared_by\x18\n" +
-	" \x01(\tR\bsharedBy\"\x13\n" +
+	" \x01(\tR\bsharedBy\x12$\n" +
+	"\x0eshared_by_name\x18\v \x01(\tR\fsharedByName\"\x13\n" +
 	"\x11ListUIAppsRequest\"Y\n" +
 	"\x12ListUIAppsResponse\x12\"\n" +
 	"\x04apps\x18\x01 \x03(\v2\x0e.loom.v1.UIAppR\x04apps\x12\x1f\n" +
