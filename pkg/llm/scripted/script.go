@@ -176,6 +176,26 @@ var templateFuncs = template.FuncMap{
 		day := time.Date(now.Year(), now.Month(), now.Day(), hour, 0, 0, 0, time.UTC)
 		return day.AddDate(0, 0, days).Format(time.RFC3339)
 	},
+	// find returns the first capture group (or the whole match, without
+	// groups) of pattern in text, or "" when it does not match or pattern
+	// is invalid: picking an id out of an earlier tool result.
+	"find": func(pattern, text string) string {
+		re, err := regexp.Compile(pattern)
+		if err != nil {
+			return ""
+		}
+		m := re.FindStringSubmatch(text)
+		switch {
+		case m == nil:
+			return ""
+		case len(m) > 1:
+			return m[1]
+		default:
+			return m[0]
+		}
+	},
+	// quote escapes text for use inside a find pattern.
+	"quote": regexp.QuoteMeta,
 }
 
 // LoadFile reads and validates a script file.
