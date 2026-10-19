@@ -217,7 +217,6 @@ func registerYAMLBuiltinTools(
 		"update_ui_app":                   "UI app subsystem (AppCompiler/AppProvider)",
 		"delete_ui_app":                   "UI app subsystem (AppCompiler/AppProvider)",
 		"get_ui_app":                      "UI app subsystem (AppCompiler/AppProvider)",
-		"share_ui_app":                    "UI app subsystem (AppCompiler/AppProvider)",
 		"contact_human":                   "HITL store (registerContactHumanFromYAML)",
 	}
 
@@ -4024,7 +4023,7 @@ func buildDeviceServer(config *Config, defaultUserID string, logger *zap.Logger)
 // uiAppToolNames are the tools server.UIAppTools provides.
 var uiAppToolNames = map[string]bool{
 	"create_ui_app": true, "update_ui_app": true, "delete_ui_app": true, "list_component_types": true,
-	"get_ui_app": true, "share_ui_app": true,
+	"get_ui_app": true,
 }
 
 // declaresUIAppTools reports whether cfg lists any UI app tool in tools.builtin.

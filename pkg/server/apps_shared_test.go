@@ -6,14 +6,17 @@
 package server
 
 import (
+	"encoding/json"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	loomv1 "github.com/teradata-labs/loom/gen/go/loom/v1"
+	"github.com/teradata-labs/loom/pkg/mcp/apps"
 	"github.com/teradata-labs/loom/pkg/shuttle"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/encoding/protojson"
 )
 
 // A shared list: Alex makes it, Sam sees it and ticks an item, both see the
@@ -86,41 +89,39 @@ func TestSetUIAppSharing(t *testing.T) {
 	assert.Equal(t, codes.InvalidArgument, status.Code(err))
 }
 
-func TestShareUIAppTool(t *testing.T) {
+// Agents cannot share: create_ui_app makes the person's own app even when
+// asked for a shared one, and there is no tool to share an existing app.
+// Reading a shared app tells the agent its text may come from others.
+func TestAgentToolsDoNotShare(t *testing.T) {
 	srv, registry := newChecklistServer(t, t.TempDir())
 	alex, sam := ctxFor("alex"), ctxFor("sam")
-	_, err := srv.CreateUIApp(alex, &loomv1.CreateUIAppRequest{Name: "chores", Spec: groceriesSpec(t)})
+	tools := map[string]shuttle.Tool{}
+	compiler, err := apps.NewCompiler()
 	require.NoError(t, err)
+	for _, tl := range UIAppTools(compiler, registry) {
+		tools[tl.Name()] = tl
+	}
+	require.NotContains(t, tools, "share_ui_app")
 
-	tools := UIAppTools(nil, registry)
-	tool := tools[len(tools)-1]
-	require.Equal(t, "share_ui_app", tool.Name())
-
-	res, err := tool.Execute(alex, map[string]interface{}{"name": "chores"})
+	specJSON, err := protojson.Marshal(groceriesSpec(t))
+	require.NoError(t, err)
+	var spec map[string]interface{}
+	require.NoError(t, json.Unmarshal(specJSON, &spec))
+	res, err := tools["create_ui_app"].Execute(alex, map[string]interface{}{"name": "chores", "spec": spec, "shared": true})
 	require.NoError(t, err)
 	require.True(t, res.Success, "%+v", res.Error)
-	assert.Equal(t, true, res.Data.(map[string]interface{})["shared"])
+	assert.Equal(t, false, res.Data.(map[string]interface{})["shared"])
 	_, err = registry.AppHTML("sam", "chores")
-	assert.NoError(t, err, "shared by the tool")
+	assert.Error(t, err, "Sam does not see Alex's app")
 
-	// Reading a shared app tells the agent its text may come from others.
-	var get shuttle.Tool
-	for _, tl := range tools {
-		if tl.Name() == "get_ui_app" {
-			get = tl
-		}
-	}
-	require.NotNil(t, get)
-	res, err = get.Execute(sam, map[string]interface{}{"name": "chores"})
+	// Alex shares it from the phone.
+	_, err = srv.SetUIAppSharing(alex, &loomv1.SetUIAppSharingRequest{Name: "chores", Shared: true})
+	require.NoError(t, err)
+	res, err = tools["get_ui_app"].Execute(sam, map[string]interface{}{"name": "chores"})
 	require.NoError(t, err)
 	require.True(t, res.Success, "%+v", res.Error)
 	data := res.Data.(map[string]interface{})
 	assert.Equal(t, true, data["shared"])
 	assert.Equal(t, "alex", data["shared_by"])
 	assert.Equal(t, sharedAppNote, data["note"])
-
-	res, err = tool.Execute(sam, map[string]interface{}{"name": "chores", "shared": false})
-	require.NoError(t, err)
-	assert.False(t, res.Success)
-	assert.Equal(t, "NOT_SHARER", res.Error.Code)
 }

@@ -597,9 +597,15 @@ spec:
 | `delete_ui_app` | Delete a dynamic app |
 | `list_component_types` | Discover available component types and prop schemas |
 | `get_ui_app` | Return an app's current spec (`{name, spec}`), including checklist ticks. Fails with `NOT_FOUND` for unknown apps or apps without a stored spec |
-| `share_ui_app` | `{name, shared}`: share one of the person's apps with everyone (`shared`, default true) or stop sharing one they shared (`false`). Errors `NAME_IN_USE`, `NOT_SHARER` (see [Shared apps](#shared-apps)) |
 
-`create_ui_app` also takes `shared` (boolean, default false) to create the app as a shared app.
+Agent tools never share an app: `create_ui_app` always creates the person's
+own app, and there is no agent tool to share one. Sharing goes through
+`CreateUIApp` `shared: true` or `SetUIAppSharing`, which a client calls after
+the person agrees (the loom-mobile app asks with its `page_share` device
+tool). Text an agent reads, such as a shared app someone else changed, cannot
+make it share the person's apps. `get_ui_app` on a shared app also returns
+`shared: true`, `shared_by`, and a `note` telling the agent the text may come
+from another person.
 
 Agents should call `list_component_types` first to discover the catalog, then use `create_ui_app` with a spec. Before `update_ui_app` on an app with a checklist, agents should call `get_ui_app` and keep each item's `checked` value; `update_ui_app` replaces the whole spec, so ticks missing from the new spec are lost.
 
@@ -627,8 +633,8 @@ Requests without an identity act as `default-user` (`types.DefaultUserID`).
 A dynamic app can be **shared**: everyone on the server sees it and can
 change it (`UpdateUIApp`, `SetUIAppChecklistItem`, the agent tools), for
 example a household's grocery list on a personal assistant server. Create
-one with `CreateUIApp` `shared: true` (or `create_ui_app` `shared: true`), or
-share an existing app with `SetUIAppSharing` / `share_ui_app`.
+one with `CreateUIApp` `shared: true`, or share an existing app with
+`SetUIAppSharing`. Agents cannot share apps (see [Agent tools](#agent-tools)).
 
 - `UIApp.shared` is true and `UIApp.shared_by` is the user ID of the person
   who shared it. Only that user can delete it (`DeleteUIApp`) or stop sharing
