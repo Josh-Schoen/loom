@@ -80,6 +80,68 @@ func (HouseholdNoteKind) EnumDescriptor() ([]byte, []int) {
 	return file_loom_v1_household_proto_rawDescGZIP(), []int{0}
 }
 
+// HouseholdItemKind is what sort of thing an item is.
+type HouseholdItemKind int32
+
+const (
+	HouseholdItemKind_HOUSEHOLD_ITEM_KIND_UNSPECIFIED HouseholdItemKind = 0
+	// Something to do ("take out the bins"), once or repeating.
+	HouseholdItemKind_HOUSEHOLD_ITEM_KIND_CHORE HouseholdItemKind = 1
+	// Something the assignees take turns at ("dishes"); completing it passes
+	// the turn to the next assignee. Needs at least two assignees.
+	HouseholdItemKind_HOUSEHOLD_ITEM_KIND_TURN HouseholdItemKind = 2
+	// A pickup or drop-off: who, when, where.
+	HouseholdItemKind_HOUSEHOLD_ITEM_KIND_PICKUP HouseholdItemKind = 3
+	// An appointment: who it is for (for_user_id), who is taking them
+	// (assignees), when, where.
+	HouseholdItemKind_HOUSEHOLD_ITEM_KIND_APPOINTMENT HouseholdItemKind = 4
+)
+
+// Enum value maps for HouseholdItemKind.
+var (
+	HouseholdItemKind_name = map[int32]string{
+		0: "HOUSEHOLD_ITEM_KIND_UNSPECIFIED",
+		1: "HOUSEHOLD_ITEM_KIND_CHORE",
+		2: "HOUSEHOLD_ITEM_KIND_TURN",
+		3: "HOUSEHOLD_ITEM_KIND_PICKUP",
+		4: "HOUSEHOLD_ITEM_KIND_APPOINTMENT",
+	}
+	HouseholdItemKind_value = map[string]int32{
+		"HOUSEHOLD_ITEM_KIND_UNSPECIFIED": 0,
+		"HOUSEHOLD_ITEM_KIND_CHORE":       1,
+		"HOUSEHOLD_ITEM_KIND_TURN":        2,
+		"HOUSEHOLD_ITEM_KIND_PICKUP":      3,
+		"HOUSEHOLD_ITEM_KIND_APPOINTMENT": 4,
+	}
+)
+
+func (x HouseholdItemKind) Enum() *HouseholdItemKind {
+	p := new(HouseholdItemKind)
+	*p = x
+	return p
+}
+
+func (x HouseholdItemKind) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (HouseholdItemKind) Descriptor() protoreflect.EnumDescriptor {
+	return file_loom_v1_household_proto_enumTypes[1].Descriptor()
+}
+
+func (HouseholdItemKind) Type() protoreflect.EnumType {
+	return &file_loom_v1_household_proto_enumTypes[1]
+}
+
+func (x HouseholdItemKind) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use HouseholdItemKind.Descriptor instead.
+func (HouseholdItemKind) EnumDescriptor() ([]byte, []int) {
+	return file_loom_v1_household_proto_rawDescGZIP(), []int{1}
+}
+
 // HouseholdMember is one person on the server.
 type HouseholdMember struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
@@ -715,7 +777,9 @@ type HouseholdUpdates struct {
 	// Answers to the caller's asks that they have not seen.
 	NewAnswers int32 `protobuf:"varint,3,opt,name=new_answers,json=newAnswers,proto3" json:"new_answers,omitempty"`
 	// When anything the caller can see last changed; unset when nothing has.
-	UpdatedAt     *timestamppb.Timestamp `protobuf:"bytes,4,opt,name=updated_at,json=updatedAt,proto3" json:"updated_at,omitempty"`
+	UpdatedAt *timestamppb.Timestamp `protobuf:"bytes,4,opt,name=updated_at,json=updatedAt,proto3" json:"updated_at,omitempty"`
+	// The caller's open items due today or overdue (see HouseholdItem.yours).
+	ItemsDue      int32 `protobuf:"varint,5,opt,name=items_due,json=itemsDue,proto3" json:"items_due,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -778,6 +842,620 @@ func (x *HouseholdUpdates) GetUpdatedAt() *timestamppb.Timestamp {
 	return nil
 }
 
+func (x *HouseholdUpdates) GetItemsDue() int32 {
+	if x != nil {
+		return x.ItemsDue
+	}
+	return 0
+}
+
+// HouseholdRepeat says when an item comes back. Unset or empty: once.
+type HouseholdRepeat struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Every day.
+	Daily bool `protobuf:"varint,1,opt,name=daily,proto3" json:"daily,omitempty"`
+	// Days of the week, 1 = Monday ... 7 = Sunday (ISO 8601). Ignored when
+	// daily is set.
+	Weekdays      []int32 `protobuf:"varint,2,rep,packed,name=weekdays,proto3" json:"weekdays,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *HouseholdRepeat) Reset() {
+	*x = HouseholdRepeat{}
+	mi := &file_loom_v1_household_proto_msgTypes[12]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *HouseholdRepeat) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*HouseholdRepeat) ProtoMessage() {}
+
+func (x *HouseholdRepeat) ProtoReflect() protoreflect.Message {
+	mi := &file_loom_v1_household_proto_msgTypes[12]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use HouseholdRepeat.ProtoReflect.Descriptor instead.
+func (*HouseholdRepeat) Descriptor() ([]byte, []int) {
+	return file_loom_v1_household_proto_rawDescGZIP(), []int{12}
+}
+
+func (x *HouseholdRepeat) GetDaily() bool {
+	if x != nil {
+		return x.Daily
+	}
+	return false
+}
+
+func (x *HouseholdRepeat) GetWeekdays() []int32 {
+	if x != nil {
+		return x.Weekdays
+	}
+	return nil
+}
+
+// HouseholdItem is one chore, turn, pickup or appointment.
+type HouseholdItem struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Empty when creating.
+	Id   string            `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
+	Kind HouseholdItemKind `protobuf:"varint,2,opt,name=kind,proto3,enum=loom.v1.HouseholdItemKind" json:"kind,omitempty"`
+	// What it is ("Dishes"), at most 200 characters.
+	Title string `protobuf:"bytes,3,opt,name=title,proto3" json:"title,omitempty"`
+	// Who does it, as user IDs; for a turn, in turn order.
+	Assignees []string `protobuf:"bytes,4,rep,name=assignees,proto3" json:"assignees,omitempty"`
+	// Who the assignees are, by name, in the same order. Output only.
+	AssigneeNames []string `protobuf:"bytes,5,rep,name=assignee_names,json=assigneeNames,proto3" json:"assignee_names,omitempty"`
+	// Who it is for (an appointment's patient); optional.
+	ForUserId string `protobuf:"bytes,6,opt,name=for_user_id,json=forUserId,proto3" json:"for_user_id,omitempty"`
+	// for_user_id's name. Output only.
+	ForName string `protobuf:"bytes,7,opt,name=for_name,json=forName,proto3" json:"for_name,omitempty"`
+	// Visible to everyone in the household, not only the people it involves.
+	Everyone bool `protobuf:"varint,8,opt,name=everyone,proto3" json:"everyone,omitempty"`
+	// When it is due (the next time, for a repeating item). A repeating item
+	// without one starts on its next day, at midnight server time.
+	StartsAt *timestamppb.Timestamp `protobuf:"bytes,9,opt,name=starts_at,json=startsAt,proto3" json:"starts_at,omitempty"`
+	Repeat   *HouseholdRepeat       `protobuf:"bytes,10,opt,name=repeat,proto3" json:"repeat,omitempty"`
+	// Where (at most 200 characters).
+	Place string `protobuf:"bytes,11,opt,name=place,proto3" json:"place,omitempty"`
+	// Anything else (at most 1000 characters).
+	Notes string `protobuf:"bytes,12,opt,name=notes,proto3" json:"notes,omitempty"`
+	// Output only from here on.
+	// Who set it up.
+	CreatedBy     string                 `protobuf:"bytes,13,opt,name=created_by,json=createdBy,proto3" json:"created_by,omitempty"`
+	CreatedByName string                 `protobuf:"bytes,14,opt,name=created_by_name,json=createdByName,proto3" json:"created_by_name,omitempty"`
+	CreatedAt     *timestamppb.Timestamp `protobuf:"bytes,15,opt,name=created_at,json=createdAt,proto3" json:"created_at,omitempty"`
+	UpdatedAt     *timestamppb.Timestamp `protobuf:"bytes,16,opt,name=updated_at,json=updatedAt,proto3" json:"updated_at,omitempty"`
+	// For a turn: whose turn it is now, and whose it is next.
+	TurnUserId     string `protobuf:"bytes,17,opt,name=turn_user_id,json=turnUserId,proto3" json:"turn_user_id,omitempty"`
+	TurnName       string `protobuf:"bytes,18,opt,name=turn_name,json=turnName,proto3" json:"turn_name,omitempty"`
+	NextTurnUserId string `protobuf:"bytes,19,opt,name=next_turn_user_id,json=nextTurnUserId,proto3" json:"next_turn_user_id,omitempty"`
+	NextTurnName   string `protobuf:"bytes,20,opt,name=next_turn_name,json=nextTurnName,proto3" json:"next_turn_name,omitempty"`
+	// Who last marked it done, and when.
+	DoneBy     string                 `protobuf:"bytes,21,opt,name=done_by,json=doneBy,proto3" json:"done_by,omitempty"`
+	DoneByName string                 `protobuf:"bytes,22,opt,name=done_by_name,json=doneByName,proto3" json:"done_by_name,omitempty"`
+	DoneAt     *timestamppb.Timestamp `protobuf:"bytes,23,opt,name=done_at,json=doneAt,proto3" json:"done_at,omitempty"`
+	// True once a one-time item is done; a repeating item never is.
+	Done bool `protobuf:"varint,24,opt,name=done,proto3" json:"done,omitempty"`
+	// True when it is the caller's to do: for a turn, when it is their turn;
+	// otherwise when they are an assignee, or, for an item with no assignees,
+	// when it involves them or is for everyone.
+	Yours bool `protobuf:"varint,25,opt,name=yours,proto3" json:"yours,omitempty"`
+	// True when the caller may change or delete it.
+	CanEdit       bool `protobuf:"varint,26,opt,name=can_edit,json=canEdit,proto3" json:"can_edit,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *HouseholdItem) Reset() {
+	*x = HouseholdItem{}
+	mi := &file_loom_v1_household_proto_msgTypes[13]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *HouseholdItem) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*HouseholdItem) ProtoMessage() {}
+
+func (x *HouseholdItem) ProtoReflect() protoreflect.Message {
+	mi := &file_loom_v1_household_proto_msgTypes[13]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use HouseholdItem.ProtoReflect.Descriptor instead.
+func (*HouseholdItem) Descriptor() ([]byte, []int) {
+	return file_loom_v1_household_proto_rawDescGZIP(), []int{13}
+}
+
+func (x *HouseholdItem) GetId() string {
+	if x != nil {
+		return x.Id
+	}
+	return ""
+}
+
+func (x *HouseholdItem) GetKind() HouseholdItemKind {
+	if x != nil {
+		return x.Kind
+	}
+	return HouseholdItemKind_HOUSEHOLD_ITEM_KIND_UNSPECIFIED
+}
+
+func (x *HouseholdItem) GetTitle() string {
+	if x != nil {
+		return x.Title
+	}
+	return ""
+}
+
+func (x *HouseholdItem) GetAssignees() []string {
+	if x != nil {
+		return x.Assignees
+	}
+	return nil
+}
+
+func (x *HouseholdItem) GetAssigneeNames() []string {
+	if x != nil {
+		return x.AssigneeNames
+	}
+	return nil
+}
+
+func (x *HouseholdItem) GetForUserId() string {
+	if x != nil {
+		return x.ForUserId
+	}
+	return ""
+}
+
+func (x *HouseholdItem) GetForName() string {
+	if x != nil {
+		return x.ForName
+	}
+	return ""
+}
+
+func (x *HouseholdItem) GetEveryone() bool {
+	if x != nil {
+		return x.Everyone
+	}
+	return false
+}
+
+func (x *HouseholdItem) GetStartsAt() *timestamppb.Timestamp {
+	if x != nil {
+		return x.StartsAt
+	}
+	return nil
+}
+
+func (x *HouseholdItem) GetRepeat() *HouseholdRepeat {
+	if x != nil {
+		return x.Repeat
+	}
+	return nil
+}
+
+func (x *HouseholdItem) GetPlace() string {
+	if x != nil {
+		return x.Place
+	}
+	return ""
+}
+
+func (x *HouseholdItem) GetNotes() string {
+	if x != nil {
+		return x.Notes
+	}
+	return ""
+}
+
+func (x *HouseholdItem) GetCreatedBy() string {
+	if x != nil {
+		return x.CreatedBy
+	}
+	return ""
+}
+
+func (x *HouseholdItem) GetCreatedByName() string {
+	if x != nil {
+		return x.CreatedByName
+	}
+	return ""
+}
+
+func (x *HouseholdItem) GetCreatedAt() *timestamppb.Timestamp {
+	if x != nil {
+		return x.CreatedAt
+	}
+	return nil
+}
+
+func (x *HouseholdItem) GetUpdatedAt() *timestamppb.Timestamp {
+	if x != nil {
+		return x.UpdatedAt
+	}
+	return nil
+}
+
+func (x *HouseholdItem) GetTurnUserId() string {
+	if x != nil {
+		return x.TurnUserId
+	}
+	return ""
+}
+
+func (x *HouseholdItem) GetTurnName() string {
+	if x != nil {
+		return x.TurnName
+	}
+	return ""
+}
+
+func (x *HouseholdItem) GetNextTurnUserId() string {
+	if x != nil {
+		return x.NextTurnUserId
+	}
+	return ""
+}
+
+func (x *HouseholdItem) GetNextTurnName() string {
+	if x != nil {
+		return x.NextTurnName
+	}
+	return ""
+}
+
+func (x *HouseholdItem) GetDoneBy() string {
+	if x != nil {
+		return x.DoneBy
+	}
+	return ""
+}
+
+func (x *HouseholdItem) GetDoneByName() string {
+	if x != nil {
+		return x.DoneByName
+	}
+	return ""
+}
+
+func (x *HouseholdItem) GetDoneAt() *timestamppb.Timestamp {
+	if x != nil {
+		return x.DoneAt
+	}
+	return nil
+}
+
+func (x *HouseholdItem) GetDone() bool {
+	if x != nil {
+		return x.Done
+	}
+	return false
+}
+
+func (x *HouseholdItem) GetYours() bool {
+	if x != nil {
+		return x.Yours
+	}
+	return false
+}
+
+func (x *HouseholdItem) GetCanEdit() bool {
+	if x != nil {
+		return x.CanEdit
+	}
+	return false
+}
+
+type ListHouseholdItemsRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Only items that are the caller's to do (HouseholdItem.yours).
+	MineOnly bool `protobuf:"varint,1,opt,name=mine_only,json=mineOnly,proto3" json:"mine_only,omitempty"`
+	// Include one-time items already done.
+	IncludeDone bool `protobuf:"varint,2,opt,name=include_done,json=includeDone,proto3" json:"include_done,omitempty"`
+	// Only items due in [from, to); items with no time are always included.
+	From          *timestamppb.Timestamp `protobuf:"bytes,3,opt,name=from,proto3" json:"from,omitempty"`
+	To            *timestamppb.Timestamp `protobuf:"bytes,4,opt,name=to,proto3" json:"to,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ListHouseholdItemsRequest) Reset() {
+	*x = ListHouseholdItemsRequest{}
+	mi := &file_loom_v1_household_proto_msgTypes[14]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ListHouseholdItemsRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ListHouseholdItemsRequest) ProtoMessage() {}
+
+func (x *ListHouseholdItemsRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_loom_v1_household_proto_msgTypes[14]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ListHouseholdItemsRequest.ProtoReflect.Descriptor instead.
+func (*ListHouseholdItemsRequest) Descriptor() ([]byte, []int) {
+	return file_loom_v1_household_proto_rawDescGZIP(), []int{14}
+}
+
+func (x *ListHouseholdItemsRequest) GetMineOnly() bool {
+	if x != nil {
+		return x.MineOnly
+	}
+	return false
+}
+
+func (x *ListHouseholdItemsRequest) GetIncludeDone() bool {
+	if x != nil {
+		return x.IncludeDone
+	}
+	return false
+}
+
+func (x *ListHouseholdItemsRequest) GetFrom() *timestamppb.Timestamp {
+	if x != nil {
+		return x.From
+	}
+	return nil
+}
+
+func (x *ListHouseholdItemsRequest) GetTo() *timestamppb.Timestamp {
+	if x != nil {
+		return x.To
+	}
+	return nil
+}
+
+type ListHouseholdItemsResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Soonest first; items with no time last.
+	Items         []*HouseholdItem `protobuf:"bytes,1,rep,name=items,proto3" json:"items,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ListHouseholdItemsResponse) Reset() {
+	*x = ListHouseholdItemsResponse{}
+	mi := &file_loom_v1_household_proto_msgTypes[15]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ListHouseholdItemsResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ListHouseholdItemsResponse) ProtoMessage() {}
+
+func (x *ListHouseholdItemsResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_loom_v1_household_proto_msgTypes[15]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ListHouseholdItemsResponse.ProtoReflect.Descriptor instead.
+func (*ListHouseholdItemsResponse) Descriptor() ([]byte, []int) {
+	return file_loom_v1_household_proto_rawDescGZIP(), []int{15}
+}
+
+func (x *ListHouseholdItemsResponse) GetItems() []*HouseholdItem {
+	if x != nil {
+		return x.Items
+	}
+	return nil
+}
+
+type SaveHouseholdItemRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// The item; with an id, replaces that item's kind, title, assignees,
+	// for_user_id, everyone, starts_at, repeat, place and notes.
+	Item          *HouseholdItem `protobuf:"bytes,1,opt,name=item,proto3" json:"item,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SaveHouseholdItemRequest) Reset() {
+	*x = SaveHouseholdItemRequest{}
+	mi := &file_loom_v1_household_proto_msgTypes[16]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SaveHouseholdItemRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SaveHouseholdItemRequest) ProtoMessage() {}
+
+func (x *SaveHouseholdItemRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_loom_v1_household_proto_msgTypes[16]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SaveHouseholdItemRequest.ProtoReflect.Descriptor instead.
+func (*SaveHouseholdItemRequest) Descriptor() ([]byte, []int) {
+	return file_loom_v1_household_proto_rawDescGZIP(), []int{16}
+}
+
+func (x *SaveHouseholdItemRequest) GetItem() *HouseholdItem {
+	if x != nil {
+		return x.Item
+	}
+	return nil
+}
+
+type CompleteHouseholdItemRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	ItemId        string                 `protobuf:"bytes,1,opt,name=item_id,json=itemId,proto3" json:"item_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *CompleteHouseholdItemRequest) Reset() {
+	*x = CompleteHouseholdItemRequest{}
+	mi := &file_loom_v1_household_proto_msgTypes[17]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CompleteHouseholdItemRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CompleteHouseholdItemRequest) ProtoMessage() {}
+
+func (x *CompleteHouseholdItemRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_loom_v1_household_proto_msgTypes[17]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CompleteHouseholdItemRequest.ProtoReflect.Descriptor instead.
+func (*CompleteHouseholdItemRequest) Descriptor() ([]byte, []int) {
+	return file_loom_v1_household_proto_rawDescGZIP(), []int{17}
+}
+
+func (x *CompleteHouseholdItemRequest) GetItemId() string {
+	if x != nil {
+		return x.ItemId
+	}
+	return ""
+}
+
+type DeleteHouseholdItemRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	ItemId        string                 `protobuf:"bytes,1,opt,name=item_id,json=itemId,proto3" json:"item_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *DeleteHouseholdItemRequest) Reset() {
+	*x = DeleteHouseholdItemRequest{}
+	mi := &file_loom_v1_household_proto_msgTypes[18]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *DeleteHouseholdItemRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*DeleteHouseholdItemRequest) ProtoMessage() {}
+
+func (x *DeleteHouseholdItemRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_loom_v1_household_proto_msgTypes[18]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use DeleteHouseholdItemRequest.ProtoReflect.Descriptor instead.
+func (*DeleteHouseholdItemRequest) Descriptor() ([]byte, []int) {
+	return file_loom_v1_household_proto_rawDescGZIP(), []int{18}
+}
+
+func (x *DeleteHouseholdItemRequest) GetItemId() string {
+	if x != nil {
+		return x.ItemId
+	}
+	return ""
+}
+
+type DeleteHouseholdItemResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *DeleteHouseholdItemResponse) Reset() {
+	*x = DeleteHouseholdItemResponse{}
+	mi := &file_loom_v1_household_proto_msgTypes[19]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *DeleteHouseholdItemResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*DeleteHouseholdItemResponse) ProtoMessage() {}
+
+func (x *DeleteHouseholdItemResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_loom_v1_household_proto_msgTypes[19]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use DeleteHouseholdItemResponse.ProtoReflect.Descriptor instead.
+func (*DeleteHouseholdItemResponse) Descriptor() ([]byte, []int) {
+	return file_loom_v1_household_proto_rawDescGZIP(), []int{19}
+}
+
 var File_loom_v1_household_proto protoreflect.FileDescriptor
 
 const file_loom_v1_household_proto_rawDesc = "" +
@@ -825,18 +1503,75 @@ const file_loom_v1_household_proto_rawDesc = "" +
 	"\bnote_ids\x18\x01 \x03(\tR\anoteIds\"8\n" +
 	"\x1eMarkHouseholdNotesReadResponse\x12\x16\n" +
 	"\x06marked\x18\x01 \x01(\x05R\x06marked\"\x1c\n" +
-	"\x1aGetHouseholdUpdatesRequest\"\xba\x01\n" +
+	"\x1aGetHouseholdUpdatesRequest\"\xd7\x01\n" +
 	"\x10HouseholdUpdates\x12!\n" +
 	"\funread_notes\x18\x01 \x01(\x05R\vunreadNotes\x12'\n" +
 	"\x0funanswered_asks\x18\x02 \x01(\x05R\x0eunansweredAsks\x12\x1f\n" +
 	"\vnew_answers\x18\x03 \x01(\x05R\n" +
 	"newAnswers\x129\n" +
 	"\n" +
-	"updated_at\x18\x04 \x01(\v2\x1a.google.protobuf.TimestampR\tupdatedAt*s\n" +
+	"updated_at\x18\x04 \x01(\v2\x1a.google.protobuf.TimestampR\tupdatedAt\x12\x1b\n" +
+	"\titems_due\x18\x05 \x01(\x05R\bitemsDue\"C\n" +
+	"\x0fHouseholdRepeat\x12\x14\n" +
+	"\x05daily\x18\x01 \x01(\bR\x05daily\x12\x1a\n" +
+	"\bweekdays\x18\x02 \x03(\x05R\bweekdays\"\x9a\a\n" +
+	"\rHouseholdItem\x12\x0e\n" +
+	"\x02id\x18\x01 \x01(\tR\x02id\x12.\n" +
+	"\x04kind\x18\x02 \x01(\x0e2\x1a.loom.v1.HouseholdItemKindR\x04kind\x12\x14\n" +
+	"\x05title\x18\x03 \x01(\tR\x05title\x12\x1c\n" +
+	"\tassignees\x18\x04 \x03(\tR\tassignees\x12%\n" +
+	"\x0eassignee_names\x18\x05 \x03(\tR\rassigneeNames\x12\x1e\n" +
+	"\vfor_user_id\x18\x06 \x01(\tR\tforUserId\x12\x19\n" +
+	"\bfor_name\x18\a \x01(\tR\aforName\x12\x1a\n" +
+	"\beveryone\x18\b \x01(\bR\beveryone\x127\n" +
+	"\tstarts_at\x18\t \x01(\v2\x1a.google.protobuf.TimestampR\bstartsAt\x120\n" +
+	"\x06repeat\x18\n" +
+	" \x01(\v2\x18.loom.v1.HouseholdRepeatR\x06repeat\x12\x14\n" +
+	"\x05place\x18\v \x01(\tR\x05place\x12\x14\n" +
+	"\x05notes\x18\f \x01(\tR\x05notes\x12\x1d\n" +
+	"\n" +
+	"created_by\x18\r \x01(\tR\tcreatedBy\x12&\n" +
+	"\x0fcreated_by_name\x18\x0e \x01(\tR\rcreatedByName\x129\n" +
+	"\n" +
+	"created_at\x18\x0f \x01(\v2\x1a.google.protobuf.TimestampR\tcreatedAt\x129\n" +
+	"\n" +
+	"updated_at\x18\x10 \x01(\v2\x1a.google.protobuf.TimestampR\tupdatedAt\x12 \n" +
+	"\fturn_user_id\x18\x11 \x01(\tR\n" +
+	"turnUserId\x12\x1b\n" +
+	"\tturn_name\x18\x12 \x01(\tR\bturnName\x12)\n" +
+	"\x11next_turn_user_id\x18\x13 \x01(\tR\x0enextTurnUserId\x12$\n" +
+	"\x0enext_turn_name\x18\x14 \x01(\tR\fnextTurnName\x12\x17\n" +
+	"\adone_by\x18\x15 \x01(\tR\x06doneBy\x12 \n" +
+	"\fdone_by_name\x18\x16 \x01(\tR\n" +
+	"doneByName\x123\n" +
+	"\adone_at\x18\x17 \x01(\v2\x1a.google.protobuf.TimestampR\x06doneAt\x12\x12\n" +
+	"\x04done\x18\x18 \x01(\bR\x04done\x12\x14\n" +
+	"\x05yours\x18\x19 \x01(\bR\x05yours\x12\x19\n" +
+	"\bcan_edit\x18\x1a \x01(\bR\acanEdit\"\xb7\x01\n" +
+	"\x19ListHouseholdItemsRequest\x12\x1b\n" +
+	"\tmine_only\x18\x01 \x01(\bR\bmineOnly\x12!\n" +
+	"\finclude_done\x18\x02 \x01(\bR\vincludeDone\x12.\n" +
+	"\x04from\x18\x03 \x01(\v2\x1a.google.protobuf.TimestampR\x04from\x12*\n" +
+	"\x02to\x18\x04 \x01(\v2\x1a.google.protobuf.TimestampR\x02to\"J\n" +
+	"\x1aListHouseholdItemsResponse\x12,\n" +
+	"\x05items\x18\x01 \x03(\v2\x16.loom.v1.HouseholdItemR\x05items\"F\n" +
+	"\x18SaveHouseholdItemRequest\x12*\n" +
+	"\x04item\x18\x01 \x01(\v2\x16.loom.v1.HouseholdItemR\x04item\"7\n" +
+	"\x1cCompleteHouseholdItemRequest\x12\x17\n" +
+	"\aitem_id\x18\x01 \x01(\tR\x06itemId\"5\n" +
+	"\x1aDeleteHouseholdItemRequest\x12\x17\n" +
+	"\aitem_id\x18\x01 \x01(\tR\x06itemId\"\x1d\n" +
+	"\x1bDeleteHouseholdItemResponse*s\n" +
 	"\x11HouseholdNoteKind\x12#\n" +
 	"\x1fHOUSEHOLD_NOTE_KIND_UNSPECIFIED\x10\x00\x12\x1c\n" +
 	"\x18HOUSEHOLD_NOTE_KIND_TELL\x10\x01\x12\x1b\n" +
-	"\x17HOUSEHOLD_NOTE_KIND_ASK\x10\x02B5Z3github.com/teradata-labs/loom/gen/go/loom/v1;loomv1b\x06proto3"
+	"\x17HOUSEHOLD_NOTE_KIND_ASK\x10\x02*\xba\x01\n" +
+	"\x11HouseholdItemKind\x12#\n" +
+	"\x1fHOUSEHOLD_ITEM_KIND_UNSPECIFIED\x10\x00\x12\x1d\n" +
+	"\x19HOUSEHOLD_ITEM_KIND_CHORE\x10\x01\x12\x1c\n" +
+	"\x18HOUSEHOLD_ITEM_KIND_TURN\x10\x02\x12\x1e\n" +
+	"\x1aHOUSEHOLD_ITEM_KIND_PICKUP\x10\x03\x12#\n" +
+	"\x1fHOUSEHOLD_ITEM_KIND_APPOINTMENT\x10\x04B5Z3github.com/teradata-labs/loom/gen/go/loom/v1;loomv1b\x06proto3"
 
 var (
 	file_loom_v1_household_proto_rawDescOnce sync.Once
@@ -850,39 +1585,58 @@ func file_loom_v1_household_proto_rawDescGZIP() []byte {
 	return file_loom_v1_household_proto_rawDescData
 }
 
-var file_loom_v1_household_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
-var file_loom_v1_household_proto_msgTypes = make([]protoimpl.MessageInfo, 12)
+var file_loom_v1_household_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
+var file_loom_v1_household_proto_msgTypes = make([]protoimpl.MessageInfo, 20)
 var file_loom_v1_household_proto_goTypes = []any{
 	(HouseholdNoteKind)(0),                 // 0: loom.v1.HouseholdNoteKind
-	(*HouseholdMember)(nil),                // 1: loom.v1.HouseholdMember
-	(*ListHouseholdMembersRequest)(nil),    // 2: loom.v1.ListHouseholdMembersRequest
-	(*ListHouseholdMembersResponse)(nil),   // 3: loom.v1.ListHouseholdMembersResponse
-	(*HouseholdNote)(nil),                  // 4: loom.v1.HouseholdNote
-	(*SendHouseholdNoteRequest)(nil),       // 5: loom.v1.SendHouseholdNoteRequest
-	(*ListHouseholdNotesRequest)(nil),      // 6: loom.v1.ListHouseholdNotesRequest
-	(*ListHouseholdNotesResponse)(nil),     // 7: loom.v1.ListHouseholdNotesResponse
-	(*AnswerHouseholdNoteRequest)(nil),     // 8: loom.v1.AnswerHouseholdNoteRequest
-	(*MarkHouseholdNotesReadRequest)(nil),  // 9: loom.v1.MarkHouseholdNotesReadRequest
-	(*MarkHouseholdNotesReadResponse)(nil), // 10: loom.v1.MarkHouseholdNotesReadResponse
-	(*GetHouseholdUpdatesRequest)(nil),     // 11: loom.v1.GetHouseholdUpdatesRequest
-	(*HouseholdUpdates)(nil),               // 12: loom.v1.HouseholdUpdates
-	(*timestamppb.Timestamp)(nil),          // 13: google.protobuf.Timestamp
+	(HouseholdItemKind)(0),                 // 1: loom.v1.HouseholdItemKind
+	(*HouseholdMember)(nil),                // 2: loom.v1.HouseholdMember
+	(*ListHouseholdMembersRequest)(nil),    // 3: loom.v1.ListHouseholdMembersRequest
+	(*ListHouseholdMembersResponse)(nil),   // 4: loom.v1.ListHouseholdMembersResponse
+	(*HouseholdNote)(nil),                  // 5: loom.v1.HouseholdNote
+	(*SendHouseholdNoteRequest)(nil),       // 6: loom.v1.SendHouseholdNoteRequest
+	(*ListHouseholdNotesRequest)(nil),      // 7: loom.v1.ListHouseholdNotesRequest
+	(*ListHouseholdNotesResponse)(nil),     // 8: loom.v1.ListHouseholdNotesResponse
+	(*AnswerHouseholdNoteRequest)(nil),     // 9: loom.v1.AnswerHouseholdNoteRequest
+	(*MarkHouseholdNotesReadRequest)(nil),  // 10: loom.v1.MarkHouseholdNotesReadRequest
+	(*MarkHouseholdNotesReadResponse)(nil), // 11: loom.v1.MarkHouseholdNotesReadResponse
+	(*GetHouseholdUpdatesRequest)(nil),     // 12: loom.v1.GetHouseholdUpdatesRequest
+	(*HouseholdUpdates)(nil),               // 13: loom.v1.HouseholdUpdates
+	(*HouseholdRepeat)(nil),                // 14: loom.v1.HouseholdRepeat
+	(*HouseholdItem)(nil),                  // 15: loom.v1.HouseholdItem
+	(*ListHouseholdItemsRequest)(nil),      // 16: loom.v1.ListHouseholdItemsRequest
+	(*ListHouseholdItemsResponse)(nil),     // 17: loom.v1.ListHouseholdItemsResponse
+	(*SaveHouseholdItemRequest)(nil),       // 18: loom.v1.SaveHouseholdItemRequest
+	(*CompleteHouseholdItemRequest)(nil),   // 19: loom.v1.CompleteHouseholdItemRequest
+	(*DeleteHouseholdItemRequest)(nil),     // 20: loom.v1.DeleteHouseholdItemRequest
+	(*DeleteHouseholdItemResponse)(nil),    // 21: loom.v1.DeleteHouseholdItemResponse
+	(*timestamppb.Timestamp)(nil),          // 22: google.protobuf.Timestamp
 }
 var file_loom_v1_household_proto_depIdxs = []int32{
-	1,  // 0: loom.v1.ListHouseholdMembersResponse.members:type_name -> loom.v1.HouseholdMember
+	2,  // 0: loom.v1.ListHouseholdMembersResponse.members:type_name -> loom.v1.HouseholdMember
 	0,  // 1: loom.v1.HouseholdNote.kind:type_name -> loom.v1.HouseholdNoteKind
-	13, // 2: loom.v1.HouseholdNote.created_at:type_name -> google.protobuf.Timestamp
-	13, // 3: loom.v1.HouseholdNote.read_at:type_name -> google.protobuf.Timestamp
-	13, // 4: loom.v1.HouseholdNote.answered_at:type_name -> google.protobuf.Timestamp
-	13, // 5: loom.v1.HouseholdNote.answer_seen_at:type_name -> google.protobuf.Timestamp
+	22, // 2: loom.v1.HouseholdNote.created_at:type_name -> google.protobuf.Timestamp
+	22, // 3: loom.v1.HouseholdNote.read_at:type_name -> google.protobuf.Timestamp
+	22, // 4: loom.v1.HouseholdNote.answered_at:type_name -> google.protobuf.Timestamp
+	22, // 5: loom.v1.HouseholdNote.answer_seen_at:type_name -> google.protobuf.Timestamp
 	0,  // 6: loom.v1.SendHouseholdNoteRequest.kind:type_name -> loom.v1.HouseholdNoteKind
-	4,  // 7: loom.v1.ListHouseholdNotesResponse.notes:type_name -> loom.v1.HouseholdNote
-	13, // 8: loom.v1.HouseholdUpdates.updated_at:type_name -> google.protobuf.Timestamp
-	9,  // [9:9] is the sub-list for method output_type
-	9,  // [9:9] is the sub-list for method input_type
-	9,  // [9:9] is the sub-list for extension type_name
-	9,  // [9:9] is the sub-list for extension extendee
-	0,  // [0:9] is the sub-list for field type_name
+	5,  // 7: loom.v1.ListHouseholdNotesResponse.notes:type_name -> loom.v1.HouseholdNote
+	22, // 8: loom.v1.HouseholdUpdates.updated_at:type_name -> google.protobuf.Timestamp
+	1,  // 9: loom.v1.HouseholdItem.kind:type_name -> loom.v1.HouseholdItemKind
+	22, // 10: loom.v1.HouseholdItem.starts_at:type_name -> google.protobuf.Timestamp
+	14, // 11: loom.v1.HouseholdItem.repeat:type_name -> loom.v1.HouseholdRepeat
+	22, // 12: loom.v1.HouseholdItem.created_at:type_name -> google.protobuf.Timestamp
+	22, // 13: loom.v1.HouseholdItem.updated_at:type_name -> google.protobuf.Timestamp
+	22, // 14: loom.v1.HouseholdItem.done_at:type_name -> google.protobuf.Timestamp
+	22, // 15: loom.v1.ListHouseholdItemsRequest.from:type_name -> google.protobuf.Timestamp
+	22, // 16: loom.v1.ListHouseholdItemsRequest.to:type_name -> google.protobuf.Timestamp
+	15, // 17: loom.v1.ListHouseholdItemsResponse.items:type_name -> loom.v1.HouseholdItem
+	15, // 18: loom.v1.SaveHouseholdItemRequest.item:type_name -> loom.v1.HouseholdItem
+	19, // [19:19] is the sub-list for method output_type
+	19, // [19:19] is the sub-list for method input_type
+	19, // [19:19] is the sub-list for extension type_name
+	19, // [19:19] is the sub-list for extension extendee
+	0,  // [0:19] is the sub-list for field type_name
 }
 
 func init() { file_loom_v1_household_proto_init() }
@@ -895,8 +1649,8 @@ func file_loom_v1_household_proto_init() {
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_loom_v1_household_proto_rawDesc), len(file_loom_v1_household_proto_rawDesc)),
-			NumEnums:      1,
-			NumMessages:   12,
+			NumEnums:      2,
+			NumMessages:   20,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

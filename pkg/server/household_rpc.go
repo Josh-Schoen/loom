@@ -17,8 +17,8 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
-// The household (proto/loom/v1/household.proto): people's names and the
-// notes they send each other. Every RPC acts as the caller (appOwner), so a
+// The household (proto/loom/v1/household.proto): people's names, the
+// notes they send each other, and who's doing what (items). Every RPC acts as the caller (appOwner), so a
 // person sees only the notes they sent or received.
 
 const (
@@ -51,12 +51,16 @@ func (s *MultiAgentServer) householdFor() (*household.Household, error) {
 // householdError maps store errors to gRPC codes.
 func householdError(err error) error {
 	switch {
-	case errors.Is(err, household.ErrNotFound):
+	case errors.Is(err, household.ErrNotFound), errors.Is(err, household.ErrItemNotFound):
 		return status.Error(codes.NotFound, err.Error())
 	case errors.Is(err, household.ErrUnknownPerson), errors.Is(err, household.ErrSelf), errors.Is(err, household.ErrInvalidInput):
 		return status.Error(codes.InvalidArgument, err.Error())
 	case errors.Is(err, household.ErrNotAnswerable), errors.Is(err, household.ErrAlreadyAnswered):
 		return status.Error(codes.FailedPrecondition, err.Error())
+	case errors.Is(err, household.ErrNotInvolved), errors.Is(err, household.ErrNotYours):
+		return status.Error(codes.PermissionDenied, err.Error())
+	case errors.Is(err, household.ErrTooManyItems):
+		return status.Error(codes.ResourceExhausted, err.Error())
 	default:
 		return status.Errorf(codes.Internal, "%v", err)
 	}
@@ -176,6 +180,7 @@ func (s *MultiAgentServer) GetHouseholdUpdates(ctx context.Context, _ *loomv1.Ge
 		UnreadNotes:    int32(u.UnreadNotes),    // #nosec G115
 		UnansweredAsks: int32(u.UnansweredAsks), // #nosec G115
 		NewAnswers:     int32(u.NewAnswers),     // #nosec G115
+		ItemsDue:       int32(u.ItemsDue),       // #nosec G115 -- bounded by household.MaxOpenItems
 	}
 	if !u.UpdatedAt.IsZero() {
 		resp.UpdatedAt = timestamppb.New(u.UpdatedAt)
@@ -209,4 +214,166 @@ func householdNoteToProto(h *household.Household, me string, n household.Note) *
 		AnswerSeenAt: ts(n.AnswerSeenAt),
 		FromYou:      n.From == me,
 	}
+}
+
+// ---- Who's doing what ----
+
+// ListHouseholdItems lists the items the caller may see.
+func (s *MultiAgentServer) ListHouseholdItems(ctx context.Context, req *loomv1.ListHouseholdItemsRequest) (*loomv1.ListHouseholdItemsResponse, error) {
+	h, err := s.householdFor()
+	if err != nil {
+		return nil, err
+	}
+	f := household.ItemFilter{MineOnly: req.GetMineOnly(), IncludeDone: req.GetIncludeDone()}
+	if req.GetFrom() != nil {
+		f.From = req.GetFrom().AsTime()
+	}
+	if req.GetTo() != nil {
+		f.To = req.GetTo().AsTime()
+	}
+	me := appOwner(ctx)
+	items, err := h.ListItems(me, f)
+	if err != nil {
+		return nil, householdError(err)
+	}
+	resp := &loomv1.ListHouseholdItemsResponse{}
+	for _, it := range items {
+		resp.Items = append(resp.Items, householdItemToProto(h, me, it))
+	}
+	return resp, nil
+}
+
+// SaveHouseholdItem creates an item or changes one the caller is involved in.
+func (s *MultiAgentServer) SaveHouseholdItem(ctx context.Context, req *loomv1.SaveHouseholdItemRequest) (*loomv1.HouseholdItem, error) {
+	h, err := s.householdFor()
+	if err != nil {
+		return nil, err
+	}
+	in := req.GetItem()
+	if in == nil {
+		return nil, status.Error(codes.InvalidArgument, "item is required")
+	}
+	var kind household.ItemKind
+	switch in.GetKind() {
+	case loomv1.HouseholdItemKind_HOUSEHOLD_ITEM_KIND_CHORE:
+		kind = household.Chore
+	case loomv1.HouseholdItemKind_HOUSEHOLD_ITEM_KIND_TURN:
+		kind = household.Turn
+	case loomv1.HouseholdItemKind_HOUSEHOLD_ITEM_KIND_PICKUP:
+		kind = household.Pickup
+	case loomv1.HouseholdItemKind_HOUSEHOLD_ITEM_KIND_APPOINTMENT:
+		kind = household.Appointment
+	default:
+		return nil, status.Error(codes.InvalidArgument, "kind must be CHORE, TURN, PICKUP or APPOINTMENT")
+	}
+	input := household.ItemInput{
+		Kind:      kind,
+		Title:     in.GetTitle(),
+		Assignees: in.GetAssignees(),
+		ForUser:   in.GetForUserId(),
+		Everyone:  in.GetEveryone(),
+		Place:     in.GetPlace(),
+		Notes:     in.GetNotes(),
+	}
+	if in.GetStartsAt() != nil {
+		t := in.GetStartsAt().AsTime()
+		input.StartsAt = &t
+	}
+	if r := in.GetRepeat(); r != nil {
+		input.Repeat.Daily = r.GetDaily()
+		for _, d := range r.GetWeekdays() {
+			input.Repeat.Weekdays = append(input.Repeat.Weekdays, int(d))
+		}
+	}
+	me := appOwner(ctx)
+	it, err := h.SaveItem(me, in.GetId(), input)
+	if err != nil {
+		return nil, householdError(err)
+	}
+	return householdItemToProto(h, me, it), nil
+}
+
+// CompleteHouseholdItem marks an item done by the caller.
+func (s *MultiAgentServer) CompleteHouseholdItem(ctx context.Context, req *loomv1.CompleteHouseholdItemRequest) (*loomv1.HouseholdItem, error) {
+	h, err := s.householdFor()
+	if err != nil {
+		return nil, err
+	}
+	if req.GetItemId() == "" {
+		return nil, status.Error(codes.InvalidArgument, "item_id is required")
+	}
+	me := appOwner(ctx)
+	it, err := h.CompleteItem(me, req.GetItemId())
+	if err != nil {
+		return nil, householdError(err)
+	}
+	return householdItemToProto(h, me, it), nil
+}
+
+// DeleteHouseholdItem deletes an item the caller is involved in.
+func (s *MultiAgentServer) DeleteHouseholdItem(ctx context.Context, req *loomv1.DeleteHouseholdItemRequest) (*loomv1.DeleteHouseholdItemResponse, error) {
+	h, err := s.householdFor()
+	if err != nil {
+		return nil, err
+	}
+	if req.GetItemId() == "" {
+		return nil, status.Error(codes.InvalidArgument, "item_id is required")
+	}
+	if err := h.DeleteItem(appOwner(ctx), req.GetItemId()); err != nil {
+		return nil, householdError(err)
+	}
+	return &loomv1.DeleteHouseholdItemResponse{}, nil
+}
+
+func householdItemToProto(h *household.Household, me string, it household.Item) *loomv1.HouseholdItem {
+	people := h.People()
+	kinds := map[household.ItemKind]loomv1.HouseholdItemKind{
+		household.Chore:       loomv1.HouseholdItemKind_HOUSEHOLD_ITEM_KIND_CHORE,
+		household.Turn:        loomv1.HouseholdItemKind_HOUSEHOLD_ITEM_KIND_TURN,
+		household.Pickup:      loomv1.HouseholdItemKind_HOUSEHOLD_ITEM_KIND_PICKUP,
+		household.Appointment: loomv1.HouseholdItemKind_HOUSEHOLD_ITEM_KIND_APPOINTMENT,
+	}
+	out := &loomv1.HouseholdItem{
+		Id:            it.ID,
+		Kind:          kinds[it.Kind],
+		Title:         it.Title,
+		Assignees:     append([]string(nil), it.Assignees...),
+		ForUserId:     it.ForUser,
+		Everyone:      it.Everyone,
+		Place:         it.Place,
+		Notes:         it.Notes,
+		CreatedBy:     it.CreatedBy,
+		CreatedByName: people.Name(it.CreatedBy),
+		CreatedAt:     timestamppb.New(it.CreatedAt),
+		UpdatedAt:     timestamppb.New(it.UpdatedAt),
+		DoneBy:        it.DoneBy,
+		Done:          it.Done,
+		Yours:         it.Yours(me),
+		CanEdit:       it.Involves(me),
+	}
+	for _, a := range it.Assignees {
+		out.AssigneeNames = append(out.AssigneeNames, people.Name(a))
+	}
+	if it.ForUser != "" {
+		out.ForName = people.Name(it.ForUser)
+	}
+	if it.StartsAt != nil {
+		out.StartsAt = timestamppb.New(*it.StartsAt)
+	}
+	if it.Repeat.Repeats() {
+		out.Repeat = &loomv1.HouseholdRepeat{Daily: it.Repeat.Daily}
+		for _, d := range it.Repeat.Weekdays {
+			out.Repeat.Weekdays = append(out.Repeat.Weekdays, int32(d)) // #nosec G115 -- 1..7
+		}
+	}
+	if turn := it.TurnOf(); turn != "" {
+		out.TurnUserId, out.TurnName = turn, people.Name(turn)
+		next := it.NextTurnOf()
+		out.NextTurnUserId, out.NextTurnName = next, people.Name(next)
+	}
+	if it.DoneAt != nil {
+		out.DoneAt = timestamppb.New(*it.DoneAt)
+		out.DoneByName = people.Name(it.DoneBy)
+	}
+	return out
 }

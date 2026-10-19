@@ -215,7 +215,7 @@ func (s *DeviceServer) RevokeDevice(_ context.Context, req *loomv1.RevokeDeviceR
 
 // deviceAllowedMethods are the RPCs a paired device may call: the
 // conversation, the person's own pages and memories, their household notes
-// (every household RPC acts as the caller), and reading which
+// and items (every household RPC acts as the caller), and reading which
 // assistants exist. Everything else (managing agents, MCP servers, tools,
 // storage, other services) changes the server for everyone or runs programs
 // on the host, so it needs the admin token.
@@ -252,6 +252,10 @@ var deviceAllowedMethods = map[string]bool{
 	"/loom.v1.LoomService/AnswerHouseholdNote":         true,
 	"/loom.v1.LoomService/MarkHouseholdNotesRead":      true,
 	"/loom.v1.LoomService/GetHouseholdUpdates":         true,
+	"/loom.v1.LoomService/ListHouseholdItems":          true,
+	"/loom.v1.LoomService/SaveHouseholdItem":           true,
+	"/loom.v1.LoomService/CompleteHouseholdItem":       true,
+	"/loom.v1.LoomService/DeleteHouseholdItem":         true,
 }
 
 // UserIDs returns the users of the paired (not revoked) devices: the

@@ -80,7 +80,9 @@ type Updates struct {
 	UnreadNotes    int
 	UnansweredAsks int
 	NewAnswers     int
-	// UpdatedAt is the latest change to a note the person can see; zero
+	// ItemsDue counts the person's open items due today or overdue.
+	ItemsDue int
+	// UpdatedAt is the latest change to a note or item the person can see; zero
 	// when there is none.
 	UpdatedAt time.Time
 }
@@ -98,15 +100,24 @@ type Household struct {
 	members Members
 	now     func() time.Time
 
-	mu     sync.Mutex
-	notes  []Note // oldest first
-	loaded bool
+	// loc is the time zone for days (repeats, "due today"); nil is the
+	// server's local time.
+	loc       *time.Location
+	itemsPath string
+
+	mu          sync.Mutex
+	notes       []Note // oldest first
+	loaded      bool
+	items       []Item
+	itemsLoaded bool
 }
 
-// New keeps notes in notesPath. people names members; members lists who is
-// in the household besides the people named in people (nil for only those).
+// New keeps notes in notesPath and items (chores, turns, pickups,
+// appointments) in items.json beside it. people names members; members
+// lists who is in the household besides the people named in people (nil
+// for only those).
 func New(notesPath string, people *People, members Members) *Household {
-	return &Household{path: notesPath, people: people, members: members, now: time.Now}
+	return &Household{path: notesPath, itemsPath: itemsPathFor(notesPath), people: people, members: members, now: time.Now}
 }
 
 // People returns the names.
@@ -362,6 +373,14 @@ func (h *Household) Updates(userID string) (Updates, error) {
 				u.UpdatedAt = *t
 			}
 		}
+	}
+	due, updated, err := h.itemUpdatesLocked(userID)
+	if err != nil {
+		return Updates{}, err
+	}
+	u.ItemsDue = due
+	if updated.After(u.UpdatedAt) {
+		u.UpdatedAt = updated
 	}
 	return u, nil
 }

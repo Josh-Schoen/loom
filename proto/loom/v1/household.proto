@@ -116,4 +116,118 @@ message HouseholdUpdates {
   int32 new_answers = 3;
   // When anything the caller can see last changed; unset when nothing has.
   google.protobuf.Timestamp updated_at = 4;
+  // The caller's open items due today or overdue (see HouseholdItem.yours).
+  int32 items_due = 5;
 }
+
+// ---- Who's doing what ----
+//
+// Household items are chores, turns, pickups and appointments. An item is
+// visible to the person who set it up, its assignees, the person it is for,
+// and everyone in the household when `everyone` is set. Only the people it
+// involves (creator, assignees, for_user) may change or delete it.
+
+// HouseholdItemKind is what sort of thing an item is.
+enum HouseholdItemKind {
+  HOUSEHOLD_ITEM_KIND_UNSPECIFIED = 0;
+  // Something to do ("take out the bins"), once or repeating.
+  HOUSEHOLD_ITEM_KIND_CHORE = 1;
+  // Something the assignees take turns at ("dishes"); completing it passes
+  // the turn to the next assignee. Needs at least two assignees.
+  HOUSEHOLD_ITEM_KIND_TURN = 2;
+  // A pickup or drop-off: who, when, where.
+  HOUSEHOLD_ITEM_KIND_PICKUP = 3;
+  // An appointment: who it is for (for_user_id), who is taking them
+  // (assignees), when, where.
+  HOUSEHOLD_ITEM_KIND_APPOINTMENT = 4;
+}
+
+// HouseholdRepeat says when an item comes back. Unset or empty: once.
+message HouseholdRepeat {
+  // Every day.
+  bool daily = 1;
+  // Days of the week, 1 = Monday ... 7 = Sunday (ISO 8601). Ignored when
+  // daily is set.
+  repeated int32 weekdays = 2;
+}
+
+// HouseholdItem is one chore, turn, pickup or appointment.
+message HouseholdItem {
+  // Empty when creating.
+  string id = 1;
+  HouseholdItemKind kind = 2;
+  // What it is ("Dishes"), at most 200 characters.
+  string title = 3;
+  // Who does it, as user IDs; for a turn, in turn order.
+  repeated string assignees = 4;
+  // Who the assignees are, by name, in the same order. Output only.
+  repeated string assignee_names = 5;
+  // Who it is for (an appointment's patient); optional.
+  string for_user_id = 6;
+  // for_user_id's name. Output only.
+  string for_name = 7;
+  // Visible to everyone in the household, not only the people it involves.
+  bool everyone = 8;
+  // When it is due (the next time, for a repeating item). A repeating item
+  // without one starts on its next day, at midnight server time.
+  google.protobuf.Timestamp starts_at = 9;
+  HouseholdRepeat repeat = 10;
+  // Where (at most 200 characters).
+  string place = 11;
+  // Anything else (at most 1000 characters).
+  string notes = 12;
+  // Output only from here on.
+  // Who set it up.
+  string created_by = 13;
+  string created_by_name = 14;
+  google.protobuf.Timestamp created_at = 15;
+  google.protobuf.Timestamp updated_at = 16;
+  // For a turn: whose turn it is now, and whose it is next.
+  string turn_user_id = 17;
+  string turn_name = 18;
+  string next_turn_user_id = 19;
+  string next_turn_name = 20;
+  // Who last marked it done, and when.
+  string done_by = 21;
+  string done_by_name = 22;
+  google.protobuf.Timestamp done_at = 23;
+  // True once a one-time item is done; a repeating item never is.
+  bool done = 24;
+  // True when it is the caller's to do: for a turn, when it is their turn;
+  // otherwise when they are an assignee, or, for an item with no assignees,
+  // when it involves them or is for everyone.
+  bool yours = 25;
+  // True when the caller may change or delete it.
+  bool can_edit = 26;
+}
+
+message ListHouseholdItemsRequest {
+  // Only items that are the caller's to do (HouseholdItem.yours).
+  bool mine_only = 1;
+  // Include one-time items already done.
+  bool include_done = 2;
+  // Only items due in [from, to); items with no time are always included.
+  google.protobuf.Timestamp from = 3;
+  google.protobuf.Timestamp to = 4;
+}
+
+message ListHouseholdItemsResponse {
+  // Soonest first; items with no time last.
+  repeated HouseholdItem items = 1;
+}
+
+message SaveHouseholdItemRequest {
+  // The item; with an id, replaces that item's kind, title, assignees,
+  // for_user_id, everyone, starts_at, repeat, place and notes.
+  HouseholdItem item = 1;
+}
+
+message CompleteHouseholdItemRequest {
+  string item_id = 1;
+}
+
+message DeleteHouseholdItemRequest {
+  string item_id = 1;
+}
+
+message DeleteHouseholdItemResponse {}

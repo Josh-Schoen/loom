@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -17,6 +18,7 @@ import (
 	"github.com/teradata-labs/loom/pkg/household"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 // newHouseholdServer is a server with apps and a household of Alex, Sam and
@@ -164,4 +166,120 @@ func TestDeviceServerUserIDsSkipsRevoked(t *testing.T) {
 		}
 	}
 	assert.Equal(t, []string{"alex"}, s.UserIDs())
+}
+
+// Alex sets up dishes taking turns between Sam and Jo, a dentist for Jo,
+// and a chore of Alex's own. Each sees only what involves them; the turn
+// passes on when Sam ticks it.
+func TestHouseholdItemsAcrossPeople(t *testing.T) {
+	srv := newHouseholdServer(t)
+	alex, sam, jo := ctxFor("alex"), ctxFor("sam"), ctxFor("jo")
+	at := timestamppb.New(time.Now().Add(-time.Hour))
+
+	dishes, err := srv.SaveHouseholdItem(alex, &loomv1.SaveHouseholdItemRequest{Item: &loomv1.HouseholdItem{
+		Kind: loomv1.HouseholdItemKind_HOUSEHOLD_ITEM_KIND_TURN, Title: "Dishes",
+		Assignees: []string{"sam", "jo"}, StartsAt: at, Repeat: &loomv1.HouseholdRepeat{Daily: true},
+	}})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"Sam", "jo"}, dishes.GetAssigneeNames())
+	assert.Equal(t, "Sam", dishes.GetTurnName())
+	assert.Equal(t, "jo", dishes.GetNextTurnUserId())
+	assert.Equal(t, "Alex", dishes.GetCreatedByName())
+	assert.False(t, dishes.GetYours(), "Alex is not taking turns")
+	assert.True(t, dishes.GetCanEdit())
+
+	_, err = srv.SaveHouseholdItem(alex, &loomv1.SaveHouseholdItemRequest{Item: &loomv1.HouseholdItem{
+		Kind: loomv1.HouseholdItemKind_HOUSEHOLD_ITEM_KIND_APPOINTMENT, Title: "Dentist", ForUserId: "jo",
+		Assignees: []string{"alex"}, StartsAt: timestamppb.New(time.Now().Add(48 * time.Hour)), Place: "Main St",
+	}})
+	require.NoError(t, err)
+	_, err = srv.SaveHouseholdItem(alex, &loomv1.SaveHouseholdItemRequest{Item: &loomv1.HouseholdItem{
+		Kind: loomv1.HouseholdItemKind_HOUSEHOLD_ITEM_KIND_CHORE, Title: "Call the bank",
+	}})
+	require.NoError(t, err)
+
+	titles := func(ctx context.Context, mine bool) []string {
+		resp, err := srv.ListHouseholdItems(ctx, &loomv1.ListHouseholdItemsRequest{MineOnly: mine})
+		require.NoError(t, err)
+		var out []string
+		for _, it := range resp.GetItems() {
+			out = append(out, it.GetTitle())
+		}
+		return out
+	}
+	assert.ElementsMatch(t, []string{"Dishes", "Dentist", "Call the bank"}, titles(alex, false))
+	assert.ElementsMatch(t, []string{"Dishes"}, titles(sam, false))
+	assert.ElementsMatch(t, []string{"Dishes", "Dentist"}, titles(jo, false), "Jo sees only what involves Jo")
+	assert.Equal(t, []string{"Dishes"}, titles(sam, true))
+	assert.Empty(t, titles(jo, true), "not Jo's turn yet")
+
+	updates, err := srv.GetHouseholdUpdates(sam, &loomv1.GetHouseholdUpdatesRequest{})
+	require.NoError(t, err)
+	assert.EqualValues(t, 1, updates.GetItemsDue())
+
+	_, err = srv.CompleteHouseholdItem(alex, &loomv1.CompleteHouseholdItemRequest{ItemId: dishes.GetId()})
+	assert.Equal(t, codes.PermissionDenied, status.Code(err), "Alex is not taking turns")
+	done, err := srv.CompleteHouseholdItem(sam, &loomv1.CompleteHouseholdItemRequest{ItemId: dishes.GetId()})
+	require.NoError(t, err)
+	assert.Equal(t, "jo", done.GetTurnUserId())
+	assert.Equal(t, "Sam", done.GetDoneByName())
+	assert.True(t, done.GetStartsAt().AsTime().After(time.Now()), "moved to its next date")
+	assert.Equal(t, []string{"Dishes"}, titles(jo, true), "now Jo's turn")
+
+	_, err = srv.DeleteHouseholdItem(sam, &loomv1.DeleteHouseholdItemRequest{ItemId: "item_nope"})
+	assert.Equal(t, codes.NotFound, status.Code(err))
+	_, err = srv.SaveHouseholdItem(sam, &loomv1.SaveHouseholdItemRequest{Item: &loomv1.HouseholdItem{
+		Id: dishes.GetId(), Kind: loomv1.HouseholdItemKind_HOUSEHOLD_ITEM_KIND_TURN, Title: "Dishes", Assignees: []string{"sam", "jo"},
+	}})
+	require.NoError(t, err, "Sam is involved, so may change it")
+	_, err = srv.DeleteHouseholdItem(jo, &loomv1.DeleteHouseholdItemRequest{ItemId: dishes.GetId()})
+	require.NoError(t, err)
+	assert.Empty(t, titles(sam, false))
+}
+
+func TestHouseholdEveryoneItemIsSeenButNotEditable(t *testing.T) {
+	srv := newHouseholdServer(t)
+	bins, err := srv.SaveHouseholdItem(ctxFor("alex"), &loomv1.SaveHouseholdItemRequest{Item: &loomv1.HouseholdItem{
+		Kind: loomv1.HouseholdItemKind_HOUSEHOLD_ITEM_KIND_CHORE, Title: "Bins", Everyone: true,
+		Repeat: &loomv1.HouseholdRepeat{Weekdays: []int32{2}},
+	}})
+	require.NoError(t, err)
+	assert.Equal(t, []int32{2}, bins.GetRepeat().GetWeekdays())
+	assert.NotNil(t, bins.GetStartsAt(), "starts on its next Tuesday")
+
+	resp, err := srv.ListHouseholdItems(ctxFor("jo"), &loomv1.ListHouseholdItemsRequest{})
+	require.NoError(t, err)
+	require.Len(t, resp.GetItems(), 1)
+	assert.True(t, resp.GetItems()[0].GetYours(), "no one assigned: anyone's to do")
+	assert.False(t, resp.GetItems()[0].GetCanEdit())
+	_, err = srv.DeleteHouseholdItem(ctxFor("jo"), &loomv1.DeleteHouseholdItemRequest{ItemId: bins.GetId()})
+	assert.Equal(t, codes.PermissionDenied, status.Code(err))
+	_, err = srv.CompleteHouseholdItem(ctxFor("jo"), &loomv1.CompleteHouseholdItemRequest{ItemId: bins.GetId()})
+	require.NoError(t, err)
+}
+
+func TestSaveHouseholdItemRejects(t *testing.T) {
+	srv := newHouseholdServer(t)
+	alex := ctxFor("alex")
+	chore := loomv1.HouseholdItemKind_HOUSEHOLD_ITEM_KIND_CHORE
+	cases := map[string]*loomv1.SaveHouseholdItemRequest{
+		"no item":     {},
+		"no kind":     {Item: &loomv1.HouseholdItem{Title: "x"}},
+		"no title":    {Item: &loomv1.HouseholdItem{Kind: chore}},
+		"stranger":    {Item: &loomv1.HouseholdItem{Kind: chore, Title: "x", Assignees: []string{"stranger"}}},
+		"turn of one": {Item: &loomv1.HouseholdItem{Kind: loomv1.HouseholdItemKind_HOUSEHOLD_ITEM_KIND_TURN, Title: "x", Assignees: []string{"sam"}}},
+		"bad weekday": {Item: &loomv1.HouseholdItem{Kind: chore, Title: "x", Repeat: &loomv1.HouseholdRepeat{Weekdays: []int32{0}}}},
+	}
+	for name, req := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, err := srv.SaveHouseholdItem(alex, req)
+			assert.Equal(t, codes.InvalidArgument, status.Code(err))
+		})
+	}
+}
+
+func TestHouseholdItemRPCsAreDeviceAllowed(t *testing.T) {
+	for _, m := range []string{"ListHouseholdItems", "SaveHouseholdItem", "CompleteHouseholdItem", "DeleteHouseholdItem"} {
+		assert.True(t, deviceAllowedMethods["/loom.v1.LoomService/"+m], m)
+	}
 }

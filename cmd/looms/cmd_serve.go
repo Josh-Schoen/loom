@@ -228,6 +228,8 @@ func registerYAMLBuiltinTools(
 		script.DeleteSavedName:            "script sandbox (registerSandboxTools; saved scripts)",
 		household.MembersToolName:         "household (registerHouseholdTools; server.household)",
 		household.NotesToolName:           "household (registerHouseholdTools; server.household)",
+		household.ItemsToolName:           "household (registerHouseholdTools; server.household)",
+		household.ItemDoneToolName:        "household (registerHouseholdTools; server.household)",
 	}
 
 	logger.Info(indent+"Registering builtin tools", zap.Int("count", len(cfg.Tools.Builtin)))
@@ -2438,7 +2440,7 @@ func runServe(cmd *cobra.Command, args []string) {
 			household.NewPeople(filepath.Join(dataDir, household.PeopleFileName)),
 			members)
 		loomService.SetHousehold(householdStore)
-		logger.Info("Household enabled: names and notes between people")
+		logger.Info("Household enabled: names, notes between people, and who's doing what")
 	}
 	if config.Server.AllowTimeOverride {
 		logger.Info("Arrival-time override enabled (server.allow_time_override): WeaveRequest.occurred_at will be honored")
@@ -4199,8 +4201,9 @@ func registerSandboxTools(ag *agent.Agent, cfg *loomv1.AgentConfig, name string,
 }
 
 // registerHouseholdTools gives ag the household tools (household_members,
-// household_notes: both read-only) when its YAML lists either and the
-// household is enabled.
+// household_notes, household_items_list: read-only; household_item_done:
+// the person's own items only) when its YAML lists any and the household
+// is enabled.
 func registerHouseholdTools(ag *agent.Agent, cfg *loomv1.AgentConfig, name string, h *household.Household, logger *zap.Logger) {
 	wants := false
 	for _, n := range household.ToolNames {

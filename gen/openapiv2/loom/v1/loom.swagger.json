@@ -1370,6 +1370,161 @@
         ]
       }
     },
+    "/v1/household/items": {
+      "get": {
+        "summary": "ListHouseholdItems lists the chores, turns, pickups and appointments the\ncaller may see.",
+        "operationId": "LoomService_ListHouseholdItems",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/v1ListHouseholdItemsResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "mineOnly",
+            "description": "Only items that are the caller's to do (HouseholdItem.yours).",
+            "in": "query",
+            "required": false,
+            "type": "boolean"
+          },
+          {
+            "name": "includeDone",
+            "description": "Include one-time items already done.",
+            "in": "query",
+            "required": false,
+            "type": "boolean"
+          },
+          {
+            "name": "from",
+            "description": "Only items due in [from, to); items with no time are always included.",
+            "in": "query",
+            "required": false,
+            "type": "string",
+            "format": "date-time"
+          },
+          {
+            "name": "to",
+            "in": "query",
+            "required": false,
+            "type": "string",
+            "format": "date-time"
+          }
+        ],
+        "tags": [
+          "LoomService"
+        ]
+      },
+      "post": {
+        "summary": "SaveHouseholdItem creates an item (no id) or changes one the caller is\ninvolved in. INVALID_ARGUMENT for a missing title or kind, an unknown\nperson, or a turn with fewer than two assignees; NOT_FOUND for an item\nthe caller cannot see; PERMISSION_DENIED for one they can see but are\nnot involved in; RESOURCE_EXHAUSTED past 500 open items.",
+        "operationId": "LoomService_SaveHouseholdItem",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/v1HouseholdItem"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/v1SaveHouseholdItemRequest"
+            }
+          }
+        ],
+        "tags": [
+          "LoomService"
+        ]
+      }
+    },
+    "/v1/household/items/{itemId}": {
+      "delete": {
+        "summary": "DeleteHouseholdItem deletes an item the caller is involved in.",
+        "operationId": "LoomService_DeleteHouseholdItem",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/v1DeleteHouseholdItemResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "itemId",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          }
+        ],
+        "tags": [
+          "LoomService"
+        ]
+      }
+    },
+    "/v1/household/items/{itemId}:complete": {
+      "post": {
+        "summary": "CompleteHouseholdItem marks an item done by the caller: a turn passes\nto the next assignee, a repeating item moves to its next date, and a\none-time item is done. PERMISSION_DENIED unless it is the caller's to\ndo (an assignee, or anyone who sees an item with no assignees).",
+        "operationId": "LoomService_CompleteHouseholdItem",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/v1HouseholdItem"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "itemId",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/LoomServiceCompleteHouseholdItemBody"
+            }
+          }
+        ],
+        "tags": [
+          "LoomService"
+        ]
+      }
+    },
     "/v1/household/members": {
       "get": {
         "summary": "ListHouseholdMembers lists the people in the household, by name.",
@@ -3875,6 +4030,9 @@
         }
       }
     },
+    "LoomServiceCompleteHouseholdItemBody": {
+      "type": "object"
+    },
     "LoomServiceCorrectUserMemoryBody": {
       "type": "object",
       "properties": {
@@ -5616,6 +5774,9 @@
       },
       "description": "DeleteArtifactResponse confirms deletion."
     },
+    "v1DeleteHouseholdItemResponse": {
+      "type": "object"
+    },
     "v1DeleteMCPServerResponse": {
       "type": "object",
       "properties": {
@@ -6231,6 +6392,130 @@
       },
       "description": "HealthStatus returns system health."
     },
+    "v1HouseholdItem": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Empty when creating."
+        },
+        "kind": {
+          "$ref": "#/definitions/v1HouseholdItemKind"
+        },
+        "title": {
+          "type": "string",
+          "description": "What it is (\"Dishes\"), at most 200 characters."
+        },
+        "assignees": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Who does it, as user IDs; for a turn, in turn order."
+        },
+        "assigneeNames": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Who the assignees are, by name, in the same order. Output only.",
+          "readOnly": true
+        },
+        "forUserId": {
+          "type": "string",
+          "description": "Who it is for (an appointment's patient); optional."
+        },
+        "forName": {
+          "type": "string",
+          "description": "for_user_id's name. Output only.",
+          "readOnly": true
+        },
+        "everyone": {
+          "type": "boolean",
+          "description": "Visible to everyone in the household, not only the people it involves."
+        },
+        "startsAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "When it is due (the next time, for a repeating item). A repeating item\nwithout one starts on its next day, at midnight server time."
+        },
+        "repeat": {
+          "$ref": "#/definitions/v1HouseholdRepeat"
+        },
+        "place": {
+          "type": "string",
+          "description": "Where (at most 200 characters)."
+        },
+        "notes": {
+          "type": "string",
+          "description": "Anything else (at most 1000 characters)."
+        },
+        "createdBy": {
+          "type": "string",
+          "description": "Output only from here on.\nWho set it up."
+        },
+        "createdByName": {
+          "type": "string"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "turnUserId": {
+          "type": "string",
+          "description": "For a turn: whose turn it is now, and whose it is next."
+        },
+        "turnName": {
+          "type": "string"
+        },
+        "nextTurnUserId": {
+          "type": "string"
+        },
+        "nextTurnName": {
+          "type": "string"
+        },
+        "doneBy": {
+          "type": "string",
+          "description": "Who last marked it done, and when."
+        },
+        "doneByName": {
+          "type": "string"
+        },
+        "doneAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "done": {
+          "type": "boolean",
+          "description": "True once a one-time item is done; a repeating item never is."
+        },
+        "yours": {
+          "type": "boolean",
+          "description": "True when it is the caller's to do: for a turn, when it is their turn;\notherwise when they are an assignee, or, for an item with no assignees,\nwhen it involves them or is for everyone."
+        },
+        "canEdit": {
+          "type": "boolean",
+          "description": "True when the caller may change or delete it."
+        }
+      },
+      "description": "HouseholdItem is one chore, turn, pickup or appointment."
+    },
+    "v1HouseholdItemKind": {
+      "type": "string",
+      "enum": [
+        "HOUSEHOLD_ITEM_KIND_UNSPECIFIED",
+        "HOUSEHOLD_ITEM_KIND_CHORE",
+        "HOUSEHOLD_ITEM_KIND_TURN",
+        "HOUSEHOLD_ITEM_KIND_PICKUP",
+        "HOUSEHOLD_ITEM_KIND_APPOINTMENT"
+      ],
+      "default": "HOUSEHOLD_ITEM_KIND_UNSPECIFIED",
+      "description": "HouseholdItemKind is what sort of thing an item is.\n\n - HOUSEHOLD_ITEM_KIND_CHORE: Something to do (\"take out the bins\"), once or repeating.\n - HOUSEHOLD_ITEM_KIND_TURN: Something the assignees take turns at (\"dishes\"); completing it passes\nthe turn to the next assignee. Needs at least two assignees.\n - HOUSEHOLD_ITEM_KIND_PICKUP: A pickup or drop-off: who, when, where.\n - HOUSEHOLD_ITEM_KIND_APPOINTMENT: An appointment: who it is for (for_user_id), who is taking them\n(assignees), when, where."
+    },
     "v1HouseholdMember": {
       "type": "object",
       "properties": {
@@ -6315,6 +6600,24 @@
       "default": "HOUSEHOLD_NOTE_KIND_UNSPECIFIED",
       "description": "HouseholdNoteKind says whether a note expects an answer.\n\n - HOUSEHOLD_NOTE_KIND_TELL: Passes something on (\"I'm running late\"); no answer expected.\n - HOUSEHOLD_NOTE_KIND_ASK: Asks something (\"Can you do pickup Thursday?\"); the recipient can answer\nonce with AnswerHouseholdNote."
     },
+    "v1HouseholdRepeat": {
+      "type": "object",
+      "properties": {
+        "daily": {
+          "type": "boolean",
+          "description": "Every day."
+        },
+        "weekdays": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "description": "Days of the week, 1 = Monday ... 7 = Sunday (ISO 8601). Ignored when\ndaily is set."
+        }
+      },
+      "description": "HouseholdRepeat says when an item comes back. Unset or empty: once."
+    },
     "v1HouseholdUpdates": {
       "type": "object",
       "properties": {
@@ -6337,6 +6640,11 @@
           "type": "string",
           "format": "date-time",
           "description": "When anything the caller can see last changed; unset when nothing has."
+        },
+        "itemsDue": {
+          "type": "integer",
+          "format": "int32",
+          "description": "The caller's open items due today or overdue (see HouseholdItem.yours)."
         }
       },
       "description": "HouseholdUpdates is what is new for the caller, for a badge."
@@ -6707,6 +7015,19 @@
         }
       },
       "description": "ListComponentTypesResponse returns the full catalog of component types."
+    },
+    "v1ListHouseholdItemsResponse": {
+      "type": "object",
+      "properties": {
+        "items": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "$ref": "#/definitions/v1HouseholdItem"
+          },
+          "description": "Soonest first; items with no time last."
+        }
+      }
     },
     "v1ListHouseholdMembersResponse": {
       "type": "object",
@@ -8526,6 +8847,15 @@
         }
       },
       "description": "SQLiteStorageConfig configures the SQLite storage backend."
+    },
+    "v1SaveHouseholdItemRequest": {
+      "type": "object",
+      "properties": {
+        "item": {
+          "$ref": "#/definitions/v1HouseholdItem",
+          "description": "The item; with an id, replaces that item's kind, title, assignees,\nfor_user_id, everyone, starts_at, repeat, place and notes."
+        }
+      }
     },
     "v1ScheduleConfig": {
       "type": "object",

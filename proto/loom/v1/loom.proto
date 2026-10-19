@@ -730,6 +730,40 @@ service LoomService {
     option (google.api.http) = {get: "/v1/household/updates"};
   }
 
+  // ListHouseholdItems lists the chores, turns, pickups and appointments the
+  // caller may see.
+  rpc ListHouseholdItems(ListHouseholdItemsRequest) returns (ListHouseholdItemsResponse) {
+    option (google.api.http) = {get: "/v1/household/items"};
+  }
+
+  // SaveHouseholdItem creates an item (no id) or changes one the caller is
+  // involved in. INVALID_ARGUMENT for a missing title or kind, an unknown
+  // person, or a turn with fewer than two assignees; NOT_FOUND for an item
+  // the caller cannot see; PERMISSION_DENIED for one they can see but are
+  // not involved in; RESOURCE_EXHAUSTED past 500 open items.
+  rpc SaveHouseholdItem(SaveHouseholdItemRequest) returns (HouseholdItem) {
+    option (google.api.http) = {
+      post: "/v1/household/items"
+      body: "*"
+    };
+  }
+
+  // CompleteHouseholdItem marks an item done by the caller: a turn passes
+  // to the next assignee, a repeating item moves to its next date, and a
+  // one-time item is done. PERMISSION_DENIED unless it is the caller's to
+  // do (an assignee, or anyone who sees an item with no assignees).
+  rpc CompleteHouseholdItem(CompleteHouseholdItemRequest) returns (HouseholdItem) {
+    option (google.api.http) = {
+      post: "/v1/household/items/{item_id}:complete"
+      body: "*"
+    };
+  }
+
+  // DeleteHouseholdItem deletes an item the caller is involved in.
+  rpc DeleteHouseholdItem(DeleteHouseholdItemRequest) returns (DeleteHouseholdItemResponse) {
+    option (google.api.http) = {delete: "/v1/household/items/{item_id}"};
+  }
+
   // Templates & Presets — the scaffolding registries the weaver uses to
   // create agents and workflows from curated bundles. See
   // proto/loom/v1/templates.proto for the registry shape.

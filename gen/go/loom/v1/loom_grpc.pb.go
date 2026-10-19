@@ -132,6 +132,10 @@ const (
 	LoomService_AnswerHouseholdNote_FullMethodName         = "/loom.v1.LoomService/AnswerHouseholdNote"
 	LoomService_MarkHouseholdNotesRead_FullMethodName      = "/loom.v1.LoomService/MarkHouseholdNotesRead"
 	LoomService_GetHouseholdUpdates_FullMethodName         = "/loom.v1.LoomService/GetHouseholdUpdates"
+	LoomService_ListHouseholdItems_FullMethodName          = "/loom.v1.LoomService/ListHouseholdItems"
+	LoomService_SaveHouseholdItem_FullMethodName           = "/loom.v1.LoomService/SaveHouseholdItem"
+	LoomService_CompleteHouseholdItem_FullMethodName       = "/loom.v1.LoomService/CompleteHouseholdItem"
+	LoomService_DeleteHouseholdItem_FullMethodName         = "/loom.v1.LoomService/DeleteHouseholdItem"
 	LoomService_ListAgentPresets_FullMethodName            = "/loom.v1.LoomService/ListAgentPresets"
 	LoomService_ListWorkflowTemplates_FullMethodName       = "/loom.v1.LoomService/ListWorkflowTemplates"
 	LoomService_CreateWorkflowFromTemplate_FullMethodName  = "/loom.v1.LoomService/CreateWorkflowFromTemplate"
@@ -370,6 +374,22 @@ type LoomServiceClient interface {
 	MarkHouseholdNotesRead(ctx context.Context, in *MarkHouseholdNotesReadRequest, opts ...grpc.CallOption) (*MarkHouseholdNotesReadResponse, error)
 	// GetHouseholdUpdates returns what is new for the caller (badge counts).
 	GetHouseholdUpdates(ctx context.Context, in *GetHouseholdUpdatesRequest, opts ...grpc.CallOption) (*HouseholdUpdates, error)
+	// ListHouseholdItems lists the chores, turns, pickups and appointments the
+	// caller may see.
+	ListHouseholdItems(ctx context.Context, in *ListHouseholdItemsRequest, opts ...grpc.CallOption) (*ListHouseholdItemsResponse, error)
+	// SaveHouseholdItem creates an item (no id) or changes one the caller is
+	// involved in. INVALID_ARGUMENT for a missing title or kind, an unknown
+	// person, or a turn with fewer than two assignees; NOT_FOUND for an item
+	// the caller cannot see; PERMISSION_DENIED for one they can see but are
+	// not involved in; RESOURCE_EXHAUSTED past 500 open items.
+	SaveHouseholdItem(ctx context.Context, in *SaveHouseholdItemRequest, opts ...grpc.CallOption) (*HouseholdItem, error)
+	// CompleteHouseholdItem marks an item done by the caller: a turn passes
+	// to the next assignee, a repeating item moves to its next date, and a
+	// one-time item is done. PERMISSION_DENIED unless it is the caller's to
+	// do (an assignee, or anyone who sees an item with no assignees).
+	CompleteHouseholdItem(ctx context.Context, in *CompleteHouseholdItemRequest, opts ...grpc.CallOption) (*HouseholdItem, error)
+	// DeleteHouseholdItem deletes an item the caller is involved in.
+	DeleteHouseholdItem(ctx context.Context, in *DeleteHouseholdItemRequest, opts ...grpc.CallOption) (*DeleteHouseholdItemResponse, error)
 	// ListAgentPresets returns the set of preconfigured single-agent presets.
 	ListAgentPresets(ctx context.Context, in *ListAgentPresetsRequest, opts ...grpc.CallOption) (*ListAgentPresetsResponse, error)
 	// ListWorkflowTemplates returns the set of preconfigured workflow templates.
@@ -1431,6 +1451,46 @@ func (c *loomServiceClient) GetHouseholdUpdates(ctx context.Context, in *GetHous
 	return out, nil
 }
 
+func (c *loomServiceClient) ListHouseholdItems(ctx context.Context, in *ListHouseholdItemsRequest, opts ...grpc.CallOption) (*ListHouseholdItemsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ListHouseholdItemsResponse)
+	err := c.cc.Invoke(ctx, LoomService_ListHouseholdItems_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *loomServiceClient) SaveHouseholdItem(ctx context.Context, in *SaveHouseholdItemRequest, opts ...grpc.CallOption) (*HouseholdItem, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(HouseholdItem)
+	err := c.cc.Invoke(ctx, LoomService_SaveHouseholdItem_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *loomServiceClient) CompleteHouseholdItem(ctx context.Context, in *CompleteHouseholdItemRequest, opts ...grpc.CallOption) (*HouseholdItem, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(HouseholdItem)
+	err := c.cc.Invoke(ctx, LoomService_CompleteHouseholdItem_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *loomServiceClient) DeleteHouseholdItem(ctx context.Context, in *DeleteHouseholdItemRequest, opts ...grpc.CallOption) (*DeleteHouseholdItemResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(DeleteHouseholdItemResponse)
+	err := c.cc.Invoke(ctx, LoomService_DeleteHouseholdItem_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *loomServiceClient) ListAgentPresets(ctx context.Context, in *ListAgentPresetsRequest, opts ...grpc.CallOption) (*ListAgentPresetsResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ListAgentPresetsResponse)
@@ -1694,6 +1754,22 @@ type LoomServiceServer interface {
 	MarkHouseholdNotesRead(context.Context, *MarkHouseholdNotesReadRequest) (*MarkHouseholdNotesReadResponse, error)
 	// GetHouseholdUpdates returns what is new for the caller (badge counts).
 	GetHouseholdUpdates(context.Context, *GetHouseholdUpdatesRequest) (*HouseholdUpdates, error)
+	// ListHouseholdItems lists the chores, turns, pickups and appointments the
+	// caller may see.
+	ListHouseholdItems(context.Context, *ListHouseholdItemsRequest) (*ListHouseholdItemsResponse, error)
+	// SaveHouseholdItem creates an item (no id) or changes one the caller is
+	// involved in. INVALID_ARGUMENT for a missing title or kind, an unknown
+	// person, or a turn with fewer than two assignees; NOT_FOUND for an item
+	// the caller cannot see; PERMISSION_DENIED for one they can see but are
+	// not involved in; RESOURCE_EXHAUSTED past 500 open items.
+	SaveHouseholdItem(context.Context, *SaveHouseholdItemRequest) (*HouseholdItem, error)
+	// CompleteHouseholdItem marks an item done by the caller: a turn passes
+	// to the next assignee, a repeating item moves to its next date, and a
+	// one-time item is done. PERMISSION_DENIED unless it is the caller's to
+	// do (an assignee, or anyone who sees an item with no assignees).
+	CompleteHouseholdItem(context.Context, *CompleteHouseholdItemRequest) (*HouseholdItem, error)
+	// DeleteHouseholdItem deletes an item the caller is involved in.
+	DeleteHouseholdItem(context.Context, *DeleteHouseholdItemRequest) (*DeleteHouseholdItemResponse, error)
 	// ListAgentPresets returns the set of preconfigured single-agent presets.
 	ListAgentPresets(context.Context, *ListAgentPresetsRequest) (*ListAgentPresetsResponse, error)
 	// ListWorkflowTemplates returns the set of preconfigured workflow templates.
@@ -2005,6 +2081,18 @@ func (UnimplementedLoomServiceServer) MarkHouseholdNotesRead(context.Context, *M
 }
 func (UnimplementedLoomServiceServer) GetHouseholdUpdates(context.Context, *GetHouseholdUpdatesRequest) (*HouseholdUpdates, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetHouseholdUpdates not implemented")
+}
+func (UnimplementedLoomServiceServer) ListHouseholdItems(context.Context, *ListHouseholdItemsRequest) (*ListHouseholdItemsResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ListHouseholdItems not implemented")
+}
+func (UnimplementedLoomServiceServer) SaveHouseholdItem(context.Context, *SaveHouseholdItemRequest) (*HouseholdItem, error) {
+	return nil, status.Error(codes.Unimplemented, "method SaveHouseholdItem not implemented")
+}
+func (UnimplementedLoomServiceServer) CompleteHouseholdItem(context.Context, *CompleteHouseholdItemRequest) (*HouseholdItem, error) {
+	return nil, status.Error(codes.Unimplemented, "method CompleteHouseholdItem not implemented")
+}
+func (UnimplementedLoomServiceServer) DeleteHouseholdItem(context.Context, *DeleteHouseholdItemRequest) (*DeleteHouseholdItemResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method DeleteHouseholdItem not implemented")
 }
 func (UnimplementedLoomServiceServer) ListAgentPresets(context.Context, *ListAgentPresetsRequest) (*ListAgentPresetsResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ListAgentPresets not implemented")
@@ -3751,6 +3839,78 @@ func _LoomService_GetHouseholdUpdates_Handler(srv interface{}, ctx context.Conte
 	return interceptor(ctx, in, info, handler)
 }
 
+func _LoomService_ListHouseholdItems_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListHouseholdItemsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LoomServiceServer).ListHouseholdItems(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LoomService_ListHouseholdItems_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LoomServiceServer).ListHouseholdItems(ctx, req.(*ListHouseholdItemsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LoomService_SaveHouseholdItem_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SaveHouseholdItemRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LoomServiceServer).SaveHouseholdItem(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LoomService_SaveHouseholdItem_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LoomServiceServer).SaveHouseholdItem(ctx, req.(*SaveHouseholdItemRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LoomService_CompleteHouseholdItem_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CompleteHouseholdItemRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LoomServiceServer).CompleteHouseholdItem(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LoomService_CompleteHouseholdItem_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LoomServiceServer).CompleteHouseholdItem(ctx, req.(*CompleteHouseholdItemRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LoomService_DeleteHouseholdItem_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DeleteHouseholdItemRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LoomServiceServer).DeleteHouseholdItem(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LoomService_DeleteHouseholdItem_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LoomServiceServer).DeleteHouseholdItem(ctx, req.(*DeleteHouseholdItemRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _LoomService_ListAgentPresets_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(ListAgentPresetsRequest)
 	if err := dec(in); err != nil {
@@ -4175,6 +4335,22 @@ var LoomService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetHouseholdUpdates",
 			Handler:    _LoomService_GetHouseholdUpdates_Handler,
+		},
+		{
+			MethodName: "ListHouseholdItems",
+			Handler:    _LoomService_ListHouseholdItems_Handler,
+		},
+		{
+			MethodName: "SaveHouseholdItem",
+			Handler:    _LoomService_SaveHouseholdItem_Handler,
+		},
+		{
+			MethodName: "CompleteHouseholdItem",
+			Handler:    _LoomService_CompleteHouseholdItem_Handler,
+		},
+		{
+			MethodName: "DeleteHouseholdItem",
+			Handler:    _LoomService_DeleteHouseholdItem_Handler,
 		},
 		{
 			MethodName: "ListAgentPresets",
