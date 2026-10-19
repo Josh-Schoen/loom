@@ -261,3 +261,26 @@ rules:
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "arguments.spec.items[0]")
 }
+
+func TestRespond_FindPicksAnIDOutOfAToolResult(t *testing.T) {
+	s := mustParse(t, `
+rules:
+  - name: done
+    when:
+      after_tool: household_items_list
+      user_message: '(?i)I did the (\w+)'
+    call_tool:
+      name: household_item_done
+      arguments:
+        item_id: '{{find (printf "\"id\":\"(item_[0-9a-f]+)\"[^{}]*\"title\":\"(?i:%s)\"" (quote (.Group 1))) .ToolResult}}'
+        missing: '{{find "nothing(here)" .ToolResult}}|{{find "(" .ToolResult}}'
+`)
+	resp := s.Respond([]types.Message{
+		user("I did the dishes"),
+		{Role: "assistant", ToolCalls: []types.ToolCall{{ID: "c1", Name: "household_items_list"}}},
+		{Role: "tool", ToolUseID: "c1", Content: `{"items":[{"id":"item_aa","title":"Bins"},{"id":"item_bb","title":"Dishes"}]}`},
+	}, offer("household_item_done"))
+	require.Len(t, resp.ToolCalls, 1)
+	assert.Equal(t, "item_bb", resp.ToolCalls[0].Input["item_id"])
+	assert.Equal(t, "|", resp.ToolCalls[0].Input["missing"], "no match and a bad pattern render empty")
+}
