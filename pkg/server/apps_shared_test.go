@@ -11,6 +11,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	loomv1 "github.com/teradata-labs/loom/gen/go/loom/v1"
+	"github.com/teradata-labs/loom/pkg/shuttle"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -101,6 +102,22 @@ func TestShareUIAppTool(t *testing.T) {
 	assert.Equal(t, true, res.Data.(map[string]interface{})["shared"])
 	_, err = registry.AppHTML("sam", "chores")
 	assert.NoError(t, err, "shared by the tool")
+
+	// Reading a shared app tells the agent its text may come from others.
+	var get shuttle.Tool
+	for _, tl := range tools {
+		if tl.Name() == "get_ui_app" {
+			get = tl
+		}
+	}
+	require.NotNil(t, get)
+	res, err = get.Execute(sam, map[string]interface{}{"name": "chores"})
+	require.NoError(t, err)
+	require.True(t, res.Success, "%+v", res.Error)
+	data := res.Data.(map[string]interface{})
+	assert.Equal(t, true, data["shared"])
+	assert.Equal(t, "alex", data["shared_by"])
+	assert.Equal(t, sharedAppNote, data["note"])
 
 	res, err = tool.Execute(sam, map[string]interface{}{"name": "chores", "shared": false})
 	require.NoError(t, err)
