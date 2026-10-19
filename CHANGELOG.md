@@ -55,6 +55,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Saved scripts** — `save_script`, `run_saved_script`, `list_saved_scripts` and `delete_saved_script` keep a person's calculation scripts to run again by name, in the same sandbox as `run_script`. A script is saved only after a test run with example inputs succeeds; scripts are per user (50 each), in `$LOOM_DATA_DIR/scripts/`. Reference: `docs/reference/run-script.md#saved-scripts`.
+
 - **`run_script` tool** — agents that list `run_script` in `tools.builtin` can run a short Starlark calculation script and get its exact result (`pkg/sandbox/script`). Each script runs in a child `looms sandbox-run` process with an empty environment, no file, network, process, module, clock or random access, and limits of 10M steps, 5 s, 256 MB heap and 64 KiB output; a script that exhausts memory ends the child, not the server. Reference: `docs/reference/run-script.md`; design and Lua-vs-Starlark measurements: `docs/plans/sandboxed-script-execution.md`.
 
 - **Monthly spending limit** — `server.spending.monthly_limit_usd` refuses new turns with `RESOURCE_EXHAUSTED` (HTTP 429; ErrorInfo reason `SPENDING_LIMIT_REACHED`) once the month's estimated LLM cost reaches it. Every provider `looms serve` builds is counted (`pkg/llm/spending`); the month's total is kept in `$LOOM_DATA_DIR/spending.json` even without a limit. A turn admitted under the limit finishes. `/v1/weave:stream` error frames now also carry `code` and, when present, `reason`. Reference: `docs/reference/spending-limit.md`.

@@ -153,10 +153,34 @@ loading any configuration or keys.
 Start-up costs about 57 ms per call (measured as `looms --help`), plus the
 script's own time.
 
+## Saved scripts
+
+Four more tools keep a person's scripts to run again by name. An agent that
+lists any of them in `tools.builtin` gets all four.
+
+| Tool | Parameters | Returns |
+|------|------------|---------|
+| `save_script` | `name` (lowercase letters, digits, hyphens; ≤ 63), `description` (≤ 300 characters), `script`, `example_inputs` (all required) | `{name, saved: true, test_result}` |
+| `run_saved_script` | `name` (required), `inputs` | `{name, result, output}` |
+| `list_saved_scripts` | none | `{scripts: [{name, description, updated_at}]}` |
+| `delete_saved_script` | `name` (required) | `{name, deleted: true}` |
+
+- `save_script` parses the script, runs it once with `example_inputs` in the
+  sandbox, and saves it only if both succeed; saving under an existing name
+  replaces that script.
+- Scripts belong to the user of the turn (`types.UserIDFromContext`, or
+  `default-user`); other users cannot list, run, or delete them.
+- At most 50 scripts per user; each at most 20,000 characters.
+- Stored in `$LOOM_DATA_DIR/scripts/<first 32 hex characters of SHA-256 of the user ID>.json`, mode 0600, one file per user.
+- Errors: `INVALID_PARAMS`, `SCRIPT_FAILED` (syntax, or the test run or a
+  run failed), `SAVE_FAILED` (bad name or description, limit reached),
+  `NOT_FOUND` (no script by that name for this user), `INTERNAL` (the file
+  could not be read or written).
+
 ## Limitations
 
-- Calculations only: scripts cannot call other tools, read the person's
-  data, or be saved and reused.
+- Calculations only: scripts cannot call other tools or read the person's
+  data.
 - Limits are fixed (`script.DefaultLimits`), not configurable per agent.
 - No CPU-time accounting beyond the step and wall-clock limits.
 

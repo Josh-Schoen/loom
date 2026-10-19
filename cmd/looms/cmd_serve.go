@@ -220,7 +220,11 @@ func registerYAMLBuiltinTools(
 		"delete_ui_app":                   "UI app subsystem (AppCompiler/AppProvider)",
 		"get_ui_app":                      "UI app subsystem (AppCompiler/AppProvider)",
 		"contact_human":                   "HITL store (registerContactHumanFromYAML)",
-		script.ToolName:                   "script sandbox (registerScriptTool; runs in a child looms process)",
+		script.ToolName:                   "script sandbox (registerSandboxTools; runs in a child looms process)",
+		script.SaveToolName:               "script sandbox (registerSandboxTools; saved scripts)",
+		script.RunSavedName:               "script sandbox (registerSandboxTools; saved scripts)",
+		script.ListSavedName:              "script sandbox (registerSandboxTools; saved scripts)",
+		script.DeleteSavedName:            "script sandbox (registerSandboxTools; saved scripts)",
 	}
 
 	logger.Info(indent+"Registering builtin tools", zap.Int("count", len(cfg.Tools.Builtin)))
@@ -1667,8 +1671,11 @@ func runServe(cmd *cobra.Command, args []string) {
 	// Agents whose YAML lists a UI app tool in tools.builtin are always
 	// offered the UI app tools (see registerUIAppTools); keyed like agents.
 	uiAppToolsDeclared := make(map[string]bool)
-	// Agents whose YAML lists run_script get the sandboxed script tool.
-	runScriptDeclared := make(map[string]bool)
+	// Agents' YAML, keyed like agents, for the sandboxed script tools
+	// (registerSandboxTools).
+	sandboxToolConfigs := make(map[string]*loomv1.AgentConfig)
+	// Each person's saved calculation scripts, shared by every agent.
+	savedScripts := script.NewStore(filepath.Join(loomconfig.GetLoomDataDir(), "scripts"), script.DefaultLimits)
 	logger.Info("Agents will be loaded from $LOOM_DATA_DIR/agents/ directory via registry system")
 
 	// Also load agents from $LOOM_DATA_DIR/agents/ directory (created by meta-agent)
@@ -2088,7 +2095,7 @@ func runServe(cmd *cobra.Command, args []string) {
 				// Store agent with GUID as key for stable references
 				agents[agentGUID] = ag
 				uiAppToolsDeclared[agentGUID] = declaresUIAppTools(cfg)
-				runScriptDeclared[agentGUID] = declaresBuiltinTool(cfg, script.ToolName)
+				sandboxToolConfigs[agentGUID] = cfg
 			}
 		}
 		// DO NOT close registry - keep it alive for hot-reload
@@ -3042,9 +3049,7 @@ func runServe(cmd *cobra.Command, args []string) {
 	}
 
 	for agentID, ag := range agents {
-		if runScriptDeclared[agentID] {
-			registerScriptTool(ag, agentID, logger)
-		}
+		registerSandboxTools(ag, sandboxToolConfigs[agentID], agentID, savedScripts, logger)
 	}
 
 	// Enable reflection if configured
@@ -3374,9 +3379,7 @@ func runServe(cmd *cobra.Command, args []string) {
 				logger.Info("  UI app tools registered", zap.String("mode", mode), zap.Int("num_tools", len(uiAppTools)))
 			}
 
-			if declaresBuiltinTool(agentConfig, script.ToolName) {
-				registerScriptTool(newAgent, agentConfig.GetName(), logger)
-			}
+			registerSandboxTools(newAgent, agentConfig, agentConfig.GetName(), savedScripts, logger)
 
 			// Check if agent already exists in server (by GUID)
 			existingAgents := loomService.GetAgentIDs()
@@ -4144,20 +4147,33 @@ func declaresBuiltinTool(cfg *loomv1.AgentConfig, name string) bool {
 	return false
 }
 
-// registerScriptTool gives ag the run_script tool. Each script runs in a
-// child of this binary (`looms sandbox-run`, see main), so a script that
-// exhausts memory ends the child, not the server.
-func registerScriptTool(ag *agent.Agent, name string, logger *zap.Logger) {
-	exe, err := os.Executable()
-	if err != nil {
-		logger.Warn("run_script not available: cannot find this program's path", zap.String("agent", name), zap.Error(err))
+// registerSandboxTools gives ag the sandboxed script tools its YAML lists:
+// run_script, and the saved-script tools (all four when any is listed),
+// keeping scripts in store. Each script runs in a child of this binary
+// (`looms sandbox-run`, see main), so a script that exhausts memory ends
+// the child, not the server.
+func registerSandboxTools(ag *agent.Agent, cfg *loomv1.AgentConfig, name string, store *script.Store, logger *zap.Logger) {
+	wantsRun := declaresBuiltinTool(cfg, script.ToolName)
+	wantsSaved := false
+	for _, n := range script.SavedToolNames {
+		wantsSaved = wantsSaved || declaresBuiltinTool(cfg, n)
+	}
+	if !wantsRun && !wantsSaved {
 		return
 	}
-	ag.RegisterTools(script.NewTool(script.ChildRunner{
-		Command: []string{exe, script.ChildCommand},
-		Limits:  script.DefaultLimits,
-	}))
-	logger.Info("  Script tool registered", zap.String("agent", name), zap.String("tool", script.ToolName))
+	exe, err := os.Executable()
+	if err != nil {
+		logger.Warn("script tools not available: cannot find this program's path", zap.String("agent", name), zap.Error(err))
+		return
+	}
+	runner := script.ChildRunner{Command: []string{exe, script.ChildCommand}, Limits: script.DefaultLimits}
+	if wantsRun {
+		ag.RegisterTools(script.NewTool(runner))
+	}
+	if wantsSaved {
+		ag.RegisterTools(script.SavedTools(store, runner)...)
+	}
+	logger.Info("  Script tools registered", zap.String("agent", name), zap.Bool("run_script", wantsRun), zap.Bool("saved_scripts", wantsSaved))
 }
 
 // declaresUIAppTools reports whether cfg lists any UI app tool in tools.builtin.

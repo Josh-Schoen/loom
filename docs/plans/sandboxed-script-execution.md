@@ -3,8 +3,9 @@
 **Status**: ⚠️ Partial. The spike below was run on 2026-10-19 (results in
 [Spike results](#spike-results)). The first slice, a calculation-only
 `run_script` tool, is implemented (`pkg/sandbox/script`,
-[reference](../reference/run-script.md)); scripts that call tools or are
-saved for reuse are not.
+[reference](../reference/run-script.md)), and so are per-person saved
+scripts (`save_script`, `run_saved_script`). Scripts that call tools or read
+the person's data are not.
 
 ## Need
 
