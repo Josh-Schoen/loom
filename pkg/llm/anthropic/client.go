@@ -269,8 +269,12 @@ func (c *Client) thinkingParam(ctx context.Context) map[string]interface{} {
 
 // temperatureParam returns the request temperature, or 1 when thinking is on.
 // Anthropic rejects any other temperature alongside thinking, so a configured
-// 0.2 would fail every request at any level above off.
+// 0.2 would fail every request at any level above off. Models that reject
+// sampling parameters get 0, which omits the field (omitempty).
 func (c *Client) temperatureParam(ctx context.Context) float64 {
+	if !llm.AcceptsSamplingParams(c.model) {
+		return 0
+	}
 	if c.thinkingParam(ctx) != nil || c.outputConfigParam(ctx) != nil {
 		return 1.0
 	}

@@ -312,9 +312,9 @@ func (c *SDKClient) thinkingEnabled(ctx context.Context) bool {
 // thinking is on. Anthropic rejects any temperature other than 1 alongside
 // thinking, so a configured 0.2 would fail every request at any level above
 // off. Omitting the field takes the API default, which is the only value
-// thinking accepts.
+// thinking accepts. Models that reject sampling parameters never get one.
 func (c *SDKClient) temperatureParam(ctx context.Context) param.Opt[float64] {
-	if c.thinkingEnabled(ctx) {
+	if c.thinkingEnabled(ctx) || !llm.AcceptsSamplingParams(c.modelID) {
 		return param.Opt[float64]{}
 	}
 	return anthropic.Float(c.temperature)

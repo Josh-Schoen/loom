@@ -166,7 +166,7 @@ Solutions:
 
 1. **Use Keyring**: Always store API keys in the system keyring, never in config files
 2. **Model Selection**: Use Claude Sonnet 4.5 for most tasks (best balance of quality/cost)
-3. **Temperature**: Use 1.0 for creative tasks, 0.7 for deterministic tasks
+3. **Temperature**: Use 1.0 for creative tasks, 0.7 for deterministic tasks. Claude Opus 4.7 and later Opus, Fable, Mythos, Sonnet 5.x and Haiku 5.x reject sampling parameters, so loom leaves `temperature` out of their requests and the configured value has no effect (`llm.AcceptsSamplingParams`). The same rule applies on Bedrock and to Claude models reached through the OpenAI-compatible client.
 4. **Token Limits**: Set appropriate `max_tokens` based on your use case
 5. **Monitoring**: Enable observability to track token usage and costs
 
