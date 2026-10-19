@@ -345,3 +345,32 @@ func TestAppsPagesOpenWithoutInterceptors(t *testing.T) {
 	h.handleApps(rr, httptest.NewRequest(http.MethodGet, "/apps/data-chart", nil))
 	assert.Equal(t, http.StatusOK, rr.Code)
 }
+
+// With pinned TLS, links are https and carry the pin, for this machine's
+// own address and for a public_url that forwards to it.
+func TestPairingLinkCarriesThePin(t *testing.T) {
+	s := newTestDeviceServerWith(t, DevicePairingConfig{CertPin: "pin-abc", HTTPPort: 5016})
+	s.cfg.PublicURL = ""
+	s.interfaceAddrs = func() ([]net.Addr, error) {
+		return []net.Addr{&net.IPNet{IP: net.ParseIP("192.168.1.20"), Mask: net.CIDRMask(24, 32)}}, nil
+	}
+	resp, err := s.CreatePairingCode(context.Background(), &loomv1.CreatePairingCodeRequest{})
+	require.NoError(t, err)
+	assert.Equal(t, "https://192.168.1.20:5016", resp.GetServerUrl())
+	assert.Equal(t, "pin-abc", resp.GetCertPin())
+	link, err := url.Parse(resp.GetPairingLink())
+	require.NoError(t, err)
+	assert.Equal(t, "pin-abc", link.Query().Get("pin"))
+
+	s.cfg.PublicURL = "https://mac.tail1234.ts.net"
+	resp, err = s.CreatePairingCode(context.Background(), &loomv1.CreatePairingCodeRequest{})
+	require.NoError(t, err)
+	assert.Equal(t, "pin-abc", resp.GetCertPin())
+
+	// Without pinned TLS, no pin.
+	s.cfg.CertPin = ""
+	resp, err = s.CreatePairingCode(context.Background(), &loomv1.CreatePairingCodeRequest{})
+	require.NoError(t, err)
+	assert.Empty(t, resp.GetCertPin())
+	assert.NotContains(t, resp.GetPairingLink(), "pin=")
+}

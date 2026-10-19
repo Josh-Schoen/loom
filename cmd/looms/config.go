@@ -310,6 +310,14 @@ type DevicePairingConfig struct {
 
 	// CodeTTLSeconds is how long a pairing code works (default: 600, max: 3600)
 	CodeTTLSeconds int `mapstructure:"code_ttl_seconds"`
+
+	// PinnedTLS serves the HTTP gateway over HTTPS with a self-signed
+	// certificate kept in the data directory (gateway-tls.crt/.key), and
+	// puts its SHA-256 in pairing links so devices trust exactly that
+	// certificate. Encrypts device traffic on a home network without a
+	// certificate authority. A public_url must then be https and reach this
+	// gateway's TLS unchanged, e.g. Tailscale forwarding TCP (default: false)
+	PinnedTLS bool `mapstructure:"pinned_tls"`
 }
 
 // TLSConfig holds TLS/HTTPS configuration for the server.
@@ -1186,6 +1194,7 @@ func setDefaults() {
 	viper.SetDefault("server.device_pairing.link_scheme", "loompair")
 	viper.SetDefault("server.device_pairing.link_base", "")
 	viper.SetDefault("server.device_pairing.code_ttl_seconds", 600)
+	viper.SetDefault("server.device_pairing.pinned_tls", false)
 
 	// CORS defaults (permissive for development, MUST be configured for production)
 	// SECURITY WARNING: Defaults to wildcard origins for best DX - change in production!
@@ -1549,6 +1558,9 @@ func (c *Config) validateDevicePairing() error {
 		u, err := url.Parse(d.PublicURL)
 		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 			return fmt.Errorf("server.device_pairing.public_url must be an http(s) URL with a host, got %q", d.PublicURL)
+		}
+		if d.PinnedTLS && u.Scheme != "https" {
+			return fmt.Errorf("server.device_pairing.public_url must be https when pinned_tls is on (the gateway no longer serves plain HTTP), got %q", d.PublicURL)
 		}
 	}
 	if d.PublicURL == "" && c.Server.HTTPPort <= 0 {

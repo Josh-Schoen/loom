@@ -255,7 +255,7 @@ sees a pairing QR code, or one who obtains a phone.
 | Photographed QR code | Single use, expires in ≤ 1 h (default 10 min); a redeemed code is useless |
 | Stolen or lost device | `looms devices revoke`; other devices unaffected |
 | Server file disclosure | Device tokens stored only as SHA-256 hashes; codes not stored |
-| Network eavesdropping | **Not mitigated by loom**: the gateway is plain HTTP. Tokens on a LAN are readable by others on it. The server logs a warning unless `public_url` is `https://`; use an HTTPS reverse proxy or a VPN |
+| Network eavesdropping or impersonation on a LAN | With `pinned_tls`: the gateway serves HTTPS with a certificate made once by the server, and pairing links carry its SHA-256; devices trust only that certificate, so no certificate authority is involved and another machine cannot present one. Without it the gateway is plain HTTP, tokens are readable by others on the network, and the server logs a warning unless `public_url` is `https://` |
 | Timing attacks on the admin token | Constant-time comparison |
 | A paired phone (or its owner) calling admin RPCs | Device tokens are limited to an allowlist of RPCs; the rest need the admin token |
 | An unverified bearer with an `x-user-id` header | Rejected when pairing is required, unless a JWT authenticator follows |

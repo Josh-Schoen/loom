@@ -45,16 +45,47 @@ All keys are under `server.device_pairing`.
 |-----|------|---------|-------------|
 | `enabled` | bool | `false` | Register `DeviceService` and accept device tokens. |
 | `required` | bool | `false` | Reject requests that carry no credential (`UNAUTHENTICATED`). Enables session ownership enforcement. Keep `false` while unpaired clients (CLI, TUI) connect. |
-| `public_url` | string | `""` | Gateway URL put in pairing links. Empty: `http://<first private IPv4>:<http_port>`, usable only on the same network and unencrypted. Must be `http` or `https` with a host. |
+| `public_url` | string | `""` | Gateway URL put in pairing links. Empty: `http://<first private IPv4>:<http_port>` (`https://` with `pinned_tls`), usable only on the same network. Must be `http` or `https` with a host; `https` when `pinned_tls` is on. |
+| `pinned_tls` | bool | `false` | Serve the HTTP gateway over HTTPS with a self-signed certificate made once and kept in the data directory, and put its pin in pairing links (see [Pinned TLS](#pinned-tls)). |
 | `link_base` | string | empty | An `https` URL (host, optional path; no query or fragment) to build pairing links on instead of `link_scheme`, e.g. `https://setup.example.com/pair`. Use it with a client that claims that domain (iOS associated domains), so one QR code opens the app if installed and a download page if not. |
 | `link_scheme` | string | `loompair` | URL scheme of pairing links (RFC 3986 scheme syntax). Must match the scheme the client app registers. The default avoids `loom`, which other apps may already claim on a phone. |
 | `code_ttl_seconds` | int | `600` | Code lifetime and the maximum a request may ask for. Range 60–3600. |
 
 Validation (`looms serve` refuses to start): TTL outside 60–3600, invalid
-scheme, malformed `public_url`, or `http_port: 0` with no `public_url`.
+scheme, malformed `public_url`, `http_port: 0` with no `public_url`, or
+`pinned_tls` with an `http://` `public_url`.
 
-Startup warning: when `public_url` is not `https://`, the server logs that
-device tokens travel unencrypted.
+Startup warning: when neither `pinned_tls` is on nor `public_url` is
+`https://`, the server logs that device tokens travel unencrypted.
+
+## Pinned TLS
+
+With `pinned_tls: true` the HTTP gateway (REST, SSE, `/apps/`) serves only
+HTTPS. The certificate is ECDSA P-256, signed with SHA-256, valid for 20
+years, made at the first start and kept in `gateway-tls.crt` and
+`gateway-tls.key`. It lists `localhost`, `127.0.0.1`, `::1`, the host name
+(and `<name>.local`) and the machine's addresses at that time; pinning
+clients ignore these.
+
+Every pairing link then carries `pin`, the SHA-256 of the certificate's DER
+bytes as unpadded base64url (43 characters), and `CreatePairingCodeResponse`
+returns it as `cert_pin`. A client trusts exactly the certificate with that
+pin for the link's server, with no certificate authority and no host name
+check:
+
+- Traffic between paired devices and the server is encrypted on any
+  network, and a machine on the same network cannot pose as the server.
+- A `public_url` must reach the gateway's TLS unchanged, for example
+  Tailscale forwarding TCP (`tailscale serve --tcp=443
+  tcp://127.0.0.1:<http_port>`). A proxy that terminates TLS with another
+  certificate breaks the pin.
+- Deleting either file makes a new certificate at the next start; every
+  device must then be paired again. If only one of the two files exists,
+  the server refuses to start.
+- gRPC (`port`) is unchanged; `looms pair` and other local tools use it.
+
+Local clients that do not pin can trust `gateway-tls.crt` as a root and
+connect to `https://127.0.0.1:<http_port>`.
 
 ## CLI
 
@@ -127,6 +158,9 @@ negative = `INVALID_ARGUMENT`). Response: `code`, `expires_at`, `server_url`,
 
 Example: `loompair://pair?code=DSE5KEC3ZQZD2SEQSAKQ5QF5GCL4BRVY&server=http%3A%2F%2F192.168.1.20%3A5006`
 
+With `pinned_tls`, `&pin=<cert_pin>` is added and the server URL is `https`:
+`loompair://pair?code=DSE5KEC3ZQZD2SEQSAKQ5QF5GCL4BRVY&pin=47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU&server=https%3A%2F%2F192.168.1.20%3A5006`
+
 With `link_base` set, the same values go in the fragment:
 
 ```
@@ -140,7 +174,9 @@ never receives the code; a page that wants to hand the link to the app reads
 it from `location.hash` in the browser.
 
 Clients should accept only `http`/`https` server URLs and treat the code as a
-secret until redeemed.
+secret until redeemed. A client given a `pin` should send the code only to a
+server presenting the certificate with that pin, and refuse links whose pin
+is malformed or whose server is not `https`.
 
 ## Errors
 
@@ -161,6 +197,8 @@ secret until redeemed.
 |------|------|----------|
 | `$LOOM_DATA_DIR/device-admin.token` | 0600 | Admin token (created at first start with pairing enabled). |
 | `$LOOM_DATA_DIR/devices.json` | 0600 | Paired devices with SHA-256 token hashes. |
+| `$LOOM_DATA_DIR/gateway-tls.crt` | 0600 | Pinned TLS certificate (PEM), with `pinned_tls`. |
+| `$LOOM_DATA_DIR/gateway-tls.key` | 0600 | Its private key (PEM), with `pinned_tls`. |
 
 Deleting `device-admin.token` and restarting creates a new admin token.
 Deleting `devices.json` unpairs every device.
@@ -170,5 +208,7 @@ Deleting `devices.json` unpairs every device.
 - One server process per device store (JSON file).
 - Unredeemed codes do not survive a restart.
 - Revocation does not close a stream that is already open.
-- The gateway serves plain HTTP; use an HTTPS reverse proxy or a VPN for
-  `public_url` outside a trusted network.
+- Without `pinned_tls` the gateway serves plain HTTP; use `pinned_tls`, an
+  HTTPS reverse proxy, or a VPN.
+- With `pinned_tls`, replacing the certificate means pairing every device
+  again; there is no rotation that keeps existing pins.

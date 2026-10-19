@@ -66,6 +66,12 @@ type DevicePairingConfig struct {
 	CodeTTL time.Duration
 	// DefaultUserID is the user a device acts as when the code names none.
 	DefaultUserID string
+	// CertPin, when set, is the pin of the certificate the HTTP gateway
+	// serves itself (devices.LoadOrCreatePinnedCert): pairing links carry
+	// it, and the derived address is https. A PublicURL must then reach
+	// this gateway's TLS unchanged (for example Tailscale forwarding TCP),
+	// since devices trust only the pinned certificate.
+	CertPin string
 	// AdminToken authorizes CreatePairingCode, ListDevices, and RevokeDevice,
 	// and every RPC a device token may not call (see deviceAllowedMethods).
 	AdminToken string
@@ -84,7 +90,10 @@ type DeviceServer struct {
 
 	manager *devices.Manager
 	cfg     DevicePairingConfig
-	logger  *zap.Logger
+	// interfaceAddrs lists this machine's addresses (net.InterfaceAddrs;
+	// replaced in tests).
+	interfaceAddrs func() ([]net.Addr, error)
+	logger         *zap.Logger
 }
 
 // NewDeviceServer builds a DeviceServer over manager.
@@ -108,7 +117,7 @@ func NewDeviceServer(manager *devices.Manager, cfg DevicePairingConfig) (*Device
 	if logger == nil {
 		logger = zap.NewNop()
 	}
-	return &DeviceServer{manager: manager, cfg: cfg, logger: logger}, nil
+	return &DeviceServer{manager: manager, cfg: cfg, logger: logger, interfaceAddrs: net.InterfaceAddrs}, nil
 }
 
 // CreatePairingCode issues a pairing code. The admin token is checked by the
@@ -129,7 +138,7 @@ func (s *DeviceServer) CreatePairingCode(_ context.Context, req *loomv1.CreatePa
 		ttl = requested
 	}
 
-	serverURL, err := s.publicURL()
+	serverURL, pin, err := s.publicURL()
 	if err != nil {
 		return nil, status.Errorf(codes.FailedPrecondition, "no address to put in the pairing link: %v (set server.device_pairing.public_url)", err)
 	}
@@ -137,7 +146,11 @@ func (s *DeviceServer) CreatePairingCode(_ context.Context, req *loomv1.CreatePa
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "create pairing code: %v", err)
 	}
-	params := url.Values{"server": {serverURL}, "code": {code}}.Encode()
+	values := url.Values{"server": {serverURL}, "code": {code}}
+	if pin != "" {
+		values.Set("pin", pin)
+	}
+	params := values.Encode()
 	link := url.URL{Scheme: s.cfg.LinkScheme, Host: "pair", RawQuery: params}
 	if s.cfg.LinkBase != "" {
 		base, err := url.Parse(s.cfg.LinkBase)
@@ -154,6 +167,7 @@ func (s *DeviceServer) CreatePairingCode(_ context.Context, req *loomv1.CreatePa
 		ExpiresAt:   timestamppb.New(expires),
 		ServerUrl:   serverURL,
 		PairingLink: link.String(),
+		CertPin:     pin,
 	}, nil
 }
 
@@ -309,23 +323,28 @@ func (s *DeviceServer) StreamServerInterceptor() grpc.StreamServerInterceptor {
 }
 
 // publicURL returns the configured gateway URL, or one built from the first
-// private IPv4 address of this machine.
-func (s *DeviceServer) publicURL() (string, error) {
+// private IPv4 address of this machine (https with the certificate pin when
+// the gateway serves pinned TLS).
+func (s *DeviceServer) publicURL() (serverURL, pin string, err error) {
 	if s.cfg.PublicURL != "" {
-		return strings.TrimRight(s.cfg.PublicURL, "/"), nil
+		return strings.TrimRight(s.cfg.PublicURL, "/"), s.cfg.CertPin, nil
 	}
 	if s.cfg.HTTPPort <= 0 {
-		return "", errors.New("the HTTP gateway is disabled")
+		return "", "", errors.New("the HTTP gateway is disabled")
 	}
-	addrs, err := net.InterfaceAddrs()
+	addrs, err := s.interfaceAddrs()
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	ip := firstPrivateIPv4(addrs)
 	if ip == "" {
-		return "", errors.New("no private IPv4 address found")
+		return "", "", errors.New("no private IPv4 address found")
 	}
-	return "http://" + net.JoinHostPort(ip, strconv.Itoa(s.cfg.HTTPPort)), nil
+	scheme := "http"
+	if s.cfg.CertPin != "" {
+		scheme = "https"
+	}
+	return scheme + "://" + net.JoinHostPort(ip, strconv.Itoa(s.cfg.HTTPPort)), s.cfg.CertPin, nil
 }
 
 func firstPrivateIPv4(addrs []net.Addr) string {

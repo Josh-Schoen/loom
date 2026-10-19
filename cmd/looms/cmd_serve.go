@@ -2222,8 +2222,14 @@ func runServe(cmd *cobra.Command, args []string) {
 	// pairing RPCs carry their own credentials, and any other bearer falls
 	// through to the Supabase authenticator below.
 	var deviceServer *server.DeviceServer
+	// The gateway's pinned certificate (server.device_pairing.pinned_tls);
+	// its pin goes into pairing links.
+	var pinnedCert *devices.PinnedCert
 	if config.Server.DevicePairing.Enabled {
-		deviceServer = buildDeviceServer(config, userIDCfg.DefaultUserID, logger)
+		if config.Server.DevicePairing.PinnedTLS {
+			pinnedCert = loadPinnedCert(logger)
+		}
+		deviceServer = buildDeviceServer(config, userIDCfg.DefaultUserID, pinnedCert, logger)
 		unaryInterceptors = append(unaryInterceptors, deviceServer.UnaryServerInterceptor())
 		streamInterceptors = append(streamInterceptors, deviceServer.StreamServerInterceptor())
 	}
@@ -3510,6 +3516,9 @@ func runServe(cmd *cobra.Command, args []string) {
 		// The SSE StreamWeave endpoint calls the service in-process, so it runs
 		// the same stream interceptors (authentication, user identity) itself.
 		httpSrv.SetStreamInterceptors(streamInterceptors...)
+		if pinnedCert != nil {
+			httpSrv.SetTLSCertificate(pinnedCert.Certificate)
+		}
 
 		// Wire UI apps to HTTP endpoint for browser access
 		if uiRegistry != nil && uiRegistry.Count() > 0 {
@@ -3960,7 +3969,42 @@ func copyFile(src, dst string) error {
 
 // buildDeviceServer opens the paired-device store and admin token in the
 // data directory. Startup fails if either cannot be read or created.
-func buildDeviceServer(config *Config, defaultUserID string, logger *zap.Logger) *server.DeviceServer {
+// loadPinnedCert loads (or makes, the first time) the gateway's pinned
+// certificate in the data directory, listing this machine's names and
+// addresses for clients that do not pin.
+func loadPinnedCert(logger *zap.Logger) *devices.PinnedCert {
+	hosts := []string{"localhost", "127.0.0.1", "::1"}
+	if name, err := os.Hostname(); err == nil && name != "" {
+		hosts = append(hosts, name)
+		if !strings.Contains(name, ".") {
+			hosts = append(hosts, name+".local")
+		}
+	}
+	if addrs, err := net.InterfaceAddrs(); err == nil {
+		for _, a := range addrs {
+			if ipNet, ok := a.(*net.IPNet); ok && !ipNet.IP.IsLoopback() && !ipNet.IP.IsLinkLocalUnicast() {
+				hosts = append(hosts, ipNet.IP.String())
+			}
+		}
+	}
+	pc, err := devices.LoadOrCreatePinnedCert(loomconfig.GetLoomDataDir(), hosts)
+	if err != nil {
+		logger.Fatal("failed to load the gateway's pinned certificate", zap.Error(err))
+	}
+	logger.Info("HTTP gateway serves HTTPS with a pinned certificate; pairing links carry its pin",
+		zap.String("cert_file", pc.CertFile), zap.String("pin", pc.Pin))
+	return pc
+}
+
+// pinnedPin is the pin of pc, or "" without pinned TLS.
+func pinnedPin(pc *devices.PinnedCert) string {
+	if pc == nil {
+		return ""
+	}
+	return pc.Pin
+}
+
+func buildDeviceServer(config *Config, defaultUserID string, pinned *devices.PinnedCert, logger *zap.Logger) *server.DeviceServer {
 	dataDir := loomconfig.GetLoomDataDir()
 	manager, err := devices.Open(filepath.Join(dataDir, devicesFileName))
 	if err != nil {
@@ -3983,13 +4027,14 @@ func buildDeviceServer(config *Config, defaultUserID string, logger *zap.Logger)
 		// A bearer that is not a device or admin token is only acceptable
 		// when the Supabase-JWT authenticator runs next to verify it.
 		OtherBearersAllowed: config.Server.Auth.Enabled,
+		CertPin:             pinnedPin(pinned),
 		Logger:              logger,
 	})
 	if err != nil {
 		logger.Fatal("failed to start device pairing", zap.Error(err))
 	}
-	if !strings.HasPrefix(dp.PublicURL, "https://") {
-		logger.Warn("Paired devices will reach this server over plain HTTP: device tokens are readable by others on the same network. Set server.device_pairing.public_url to an https address (reverse proxy, Tailscale) for use outside a trusted network.",
+	if pinned == nil && !strings.HasPrefix(dp.PublicURL, "https://") {
+		logger.Warn("Paired devices will reach this server over plain HTTP: device tokens are readable by others on the same network. Set server.device_pairing.pinned_tls (encrypted with a pinned certificate) or public_url to an https address (reverse proxy, Tailscale).",
 			zap.String("public_url", dp.PublicURL))
 	}
 	logger.Info("Device pairing enabled; run `looms pair` to connect a phone",

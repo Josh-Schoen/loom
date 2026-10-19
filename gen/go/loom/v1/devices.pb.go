@@ -95,8 +95,14 @@ type CreatePairingCodeResponse struct {
 	// (server.device_pairing.public_url, or a detected local-network address).
 	ServerUrl string `protobuf:"bytes,3,opt,name=server_url,json=serverUrl,proto3" json:"server_url,omitempty"`
 	// Link that carries server_url and code, for QR codes:
-	// "<link_scheme>://pair?server=<server_url>&code=<code>".
-	PairingLink   string `protobuf:"bytes,4,opt,name=pairing_link,json=pairingLink,proto3" json:"pairing_link,omitempty"`
+	// "<link_scheme>://pair?server=<server_url>&code=<code>", plus
+	// "&pin=<cert_pin>" when cert_pin is set.
+	PairingLink string `protobuf:"bytes,4,opt,name=pairing_link,json=pairingLink,proto3" json:"pairing_link,omitempty"`
+	// SHA-256 of the gateway's TLS certificate (DER), unpadded base64url, when
+	// the gateway serves its own pinned certificate
+	// (server.device_pairing.pinned_tls). A device trusts exactly this
+	// certificate for server_url. Empty otherwise.
+	CertPin       string `protobuf:"bytes,5,opt,name=cert_pin,json=certPin,proto3" json:"cert_pin,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -155,6 +161,13 @@ func (x *CreatePairingCodeResponse) GetServerUrl() string {
 func (x *CreatePairingCodeResponse) GetPairingLink() string {
 	if x != nil {
 		return x.PairingLink
+	}
+	return ""
+}
+
+func (x *CreatePairingCodeResponse) GetCertPin() string {
+	if x != nil {
+		return x.CertPin
 	}
 	return ""
 }
@@ -563,14 +576,15 @@ const file_loom_v1_devices_proto_rawDesc = "" +
 	"\x18CreatePairingCodeRequest\x12\x17\n" +
 	"\auser_id\x18\x01 \x01(\tR\x06userId\x12\x1f\n" +
 	"\vttl_seconds\x18\x02 \x01(\x05R\n" +
-	"ttlSeconds\"\xac\x01\n" +
+	"ttlSeconds\"\xc7\x01\n" +
 	"\x19CreatePairingCodeResponse\x12\x12\n" +
 	"\x04code\x18\x01 \x01(\tR\x04code\x129\n" +
 	"\n" +
 	"expires_at\x18\x02 \x01(\v2\x1a.google.protobuf.TimestampR\texpiresAt\x12\x1d\n" +
 	"\n" +
 	"server_url\x18\x03 \x01(\tR\tserverUrl\x12!\n" +
-	"\fpairing_link\x18\x04 \x01(\tR\vpairingLink\"k\n" +
+	"\fpairing_link\x18\x04 \x01(\tR\vpairingLink\x12\x19\n" +
+	"\bcert_pin\x18\x05 \x01(\tR\acertPin\"k\n" +
 	"\x18RedeemPairingCodeRequest\x12\x12\n" +
 	"\x04code\x18\x01 \x01(\tR\x04code\x12\x1f\n" +
 	"\vdevice_name\x18\x02 \x01(\tR\n" +

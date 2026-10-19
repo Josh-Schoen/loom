@@ -70,8 +70,15 @@ message CreatePairingCodeResponse {
   string server_url = 3;
 
   // Link that carries server_url and code, for QR codes:
-  // "<link_scheme>://pair?server=<server_url>&code=<code>".
+  // "<link_scheme>://pair?server=<server_url>&code=<code>", plus
+  // "&pin=<cert_pin>" when cert_pin is set.
   string pairing_link = 4;
+
+  // SHA-256 of the gateway's TLS certificate (DER), unpadded base64url, when
+  // the gateway serves its own pinned certificate
+  // (server.device_pairing.pinned_tls). A device trusts exactly this
+  // certificate for server_url. Empty otherwise.
+  string cert_pin = 5;
 }
 
 // RedeemPairingCodeRequest is sent by the device being paired.

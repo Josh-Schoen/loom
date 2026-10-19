@@ -7,6 +7,7 @@ package server
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"html"
@@ -107,6 +108,16 @@ func NewHTTPServerWithCORS(grpcServer *MultiAgentServer, httpAddr, grpcAddr stri
 	}
 }
 
+// SetTLSCertificate makes the server serve HTTPS with cert (for example the
+// pinned certificate of device pairing, devices.LoadOrCreatePinnedCert).
+// Must be called before Start().
+func (h *HTTPServer) SetTLSCertificate(cert tls.Certificate) {
+	h.httpServer.TLSConfig = &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		MinVersion:   tls.VersionTLS12,
+	}
+}
+
 // SetAppHTMLProvider sets the provider used to serve UI apps over HTTP.
 // Must be called before Start(); not safe for concurrent use.
 func (h *HTTPServer) SetAppHTMLProvider(p AppHTMLProvider) {
@@ -197,8 +208,13 @@ func (h *HTTPServer) Start(ctx context.Context) error {
 	h.httpServer.Handler = handler
 
 	// Start server
-	h.logger.Info("Starting HTTP server", zap.String("addr", h.httpServer.Addr))
-	if err := h.httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+	h.logger.Info("Starting HTTP server", zap.String("addr", h.httpServer.Addr), zap.Bool("tls", h.httpServer.TLSConfig != nil))
+	if h.httpServer.TLSConfig != nil {
+		err = h.httpServer.ListenAndServeTLS("", "")
+	} else {
+		err = h.httpServer.ListenAndServe()
+	}
+	if err != nil && err != http.ErrServerClosed {
 		return fmt.Errorf("HTTP server failed: %w", err)
 	}
 
