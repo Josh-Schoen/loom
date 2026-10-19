@@ -55,6 +55,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`run_script` and saved scripts moved out of loom** — the Starlark calculator now runs in loom-mobile's `server/scripts`, reached over MCP with `forward_caller_identity`; `pkg/sandbox/script`, `looms sandbox-run` and the five tools are removed. The two entries below record what was here.
 - **Saved scripts** — `save_script`, `run_saved_script`, `list_saved_scripts` and `delete_saved_script` keep a person's calculation scripts to run again by name, in the same sandbox as `run_script`. A script is saved only after a test run with example inputs succeeds; scripts are per user (50 each), in `$LOOM_DATA_DIR/scripts/`. Reference: `docs/reference/run-script.md#saved-scripts`.
 
 - **`run_script` tool** — agents that list `run_script` in `tools.builtin` can run a short Starlark calculation script and get its exact result (`pkg/sandbox/script`). Each script runs in a child `looms sandbox-run` process with an empty environment, no file, network, process, module, clock or random access, and limits of 10M steps, 5 s, 256 MB heap and 64 KiB output; a script that exhausts memory ends the child, not the server. Reference: `docs/reference/run-script.md`; design and Lua-vs-Starlark measurements: `docs/plans/sandboxed-script-execution.md`.

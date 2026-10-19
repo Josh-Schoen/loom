@@ -1,11 +1,12 @@
 # Sandboxed Execution of Agent-Written Code
 
-**Status**: ⚠️ Partial. The spike below was run on 2026-10-19 (results in
-[Spike results](#spike-results)). The first slice, a calculation-only
-`run_script` tool, is implemented (`pkg/sandbox/script`,
-[reference](../reference/run-script.md)), and so are per-person saved
-scripts (`save_script`, `run_saved_script`). Scripts that call tools or read
-the person's data are not.
+**Status**: Moved out of loom (2026-10-19). The spike below was run here,
+and its first slice (a calculation-only `run_script` and per-person saved
+scripts) shipped in this fork. Both now live in loom-mobile's
+`server/scripts`, served to agents over MCP with the caller's identity
+(`forward_caller_identity`). loom keeps no sandbox of its own; upstream's Lua
+series (#425–#432) is the general option. This document stays as the record
+of the Lua-vs-Starlark measurements.
 
 ## Need
 
