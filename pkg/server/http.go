@@ -78,10 +78,6 @@ type HTTPServer struct {
 	// in-process rather than over gRPC, so it runs the chain itself. Nil
 	// means no interceptors (embedders and tests that configure none).
 	streamInterceptor grpc.StreamServerInterceptor
-
-	// extensions are routes forwarded to services on this machine after
-	// authentication (AddExtensionRoute).
-	extensions []ExtensionRoute
 }
 
 // NewHTTPServer creates an HTTP server that proxies to gRPC
@@ -195,11 +191,6 @@ func (h *HTTPServer) Start(ctx context.Context) error {
 		rootMux.HandleFunc("/apps", func(w http.ResponseWriter, r *http.Request) {
 			http.Redirect(w, r, "/apps/", http.StatusMovedPermanently)
 		})
-	}
-
-	// Extension routes: services next to loom, behind its authentication.
-	for _, route := range h.extensions {
-		rootMux.Handle(route.PathPrefix, h.extensionHandler(route))
 	}
 
 	// All other endpoints use grpc-gateway

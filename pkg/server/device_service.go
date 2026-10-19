@@ -94,9 +94,6 @@ type DeviceServer struct {
 	// replaced in tests).
 	interfaceAddrs func() ([]net.Addr, error)
 	logger         *zap.Logger
-	// extraAllowed are methods devices may call beyond deviceAllowedMethods
-	// (AllowMethod; extension routes).
-	extraAllowed map[string]bool
 }
 
 // NewDeviceServer builds a DeviceServer over manager.
@@ -282,7 +279,7 @@ func (s *DeviceServer) authenticate(ctx context.Context, fullMethod string) (con
 		if !ok {
 			return nil, status.Error(codes.Unauthenticated, "unknown or revoked device token")
 		}
-		if !deviceAllowedMethods[fullMethod] && !s.extraAllowed[fullMethod] {
+		if !deviceAllowedMethods[fullMethod] {
 			return nil, status.Error(codes.PermissionDenied, "paired devices cannot call this operation; it needs the server admin token")
 		}
 		ctx = postgres.ContextWithUserID(ctx, d.UserID)
