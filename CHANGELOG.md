@@ -16,6 +16,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Hot-reloaded agents keep their own models.** The agent hot-reload path in `looms serve` built the reloaded agent on the server's default provider, dropping its `llm`, `compressor_llm` and `classifier_llm`, and wrapped the shared default provider in another `InstrumentedProvider` on every reload (written from the watcher goroutine). Startup and reload now share `buildAgentLLMs`, and the shared provider is no longer changed.
+
 - **Scripted provider: `after_tool` rules match with system notes present** — the provider treated the newest message as the newest turn, so a trailing system note (the new request context, a soft reminder) hid a tool result: `after_tool` rules stopped matching and tool-calling rules fired again in a loop. Trailing system messages are now skipped.
 
 - **`get_ui_app` in agent YAML no longer logged as an unknown builtin tool** — declaring it under `tools` logged "Unknown builtin tool" although the UI app subsystem provides it.

@@ -1926,75 +1926,12 @@ func runServe(cmd *cobra.Command, args []string) {
 				agentOpts = append(agentOpts, agent.WithAdmissionHooks(admissionChain))
 				agentOpts = append(agentOpts, agent.WithIdentityResolver(postgres.UserIDFromContext))
 
-				// Determine LLM provider for this agent
-				// If agent has specific LLM config, use it; otherwise use server default
-				agentLLMProvider := llmProvider
-				if cfg.Llm != nil && cfg.Llm.Provider != "" {
-					logger.Info("    Agent has custom LLM configuration",
-						zap.String("provider", cfg.Llm.Provider),
-						zap.String("model", cfg.Llm.Model))
-					customLLM, err := createLLMProviderFromProtoConfig(cfg.Llm, config, logger)
-					if err != nil {
-						logger.Warn("    Failed to create custom LLM provider, using server default",
-							zap.Error(err))
-						// Fall back to server default LLM
-					} else {
-						agentLLMProvider = guardLLM(customLLM)
-						logger.Info("    Using custom LLM",
-							zap.String("provider", cfg.Llm.Provider),
-							zap.String("model", cfg.Llm.Model))
-					}
-				} else {
-					logger.Info("    Using server default LLM")
-				}
-
-				// Wrap LLM provider with instrumentation for observability
-				if tracer != nil {
-					agentLLMProvider = llm.NewInstrumentedProvider(agentLLMProvider, tracer)
-				}
-
-				// Wire per-role LLMs if declared in YAML. These route auxiliary
-				// work (memory extraction, classification) to a separate provider
-				// — critical when the primary is a single-slot local model.
-				// Mirrors the registry path at pkg/agent/registry.go ~600.
-				var staticClassifierLLM agent.LLMProvider
-				if cfg.CompressorLlm != nil && cfg.CompressorLlm.Provider != "" {
-					compLLM, err := createLLMProviderFromProtoConfig(cfg.CompressorLlm, config, logger)
-					if err != nil {
-						logger.Warn("    Failed to create compressor LLM, extractor will use primary",
-							zap.Error(err),
-							zap.String("provider", cfg.CompressorLlm.Provider),
-							zap.String("model", cfg.CompressorLlm.Model))
-					} else {
-						if tracer != nil {
-							compLLM = llm.NewInstrumentedProvider(compLLM, tracer)
-						}
-						compLLM = guardLLM(compLLM)
-						agentOpts = append(agentOpts, agent.WithCompressorLLM(compLLM))
-						logger.Info("    Compressor LLM configured",
-							zap.String("provider", cfg.CompressorLlm.Provider),
-							zap.String("model", cfg.CompressorLlm.Model))
-					}
-				}
-				if cfg.ClassifierLlm != nil && cfg.ClassifierLlm.Provider != "" {
-					classLLM, err := createLLMProviderFromProtoConfig(cfg.ClassifierLlm, config, logger)
-					if err != nil {
-						logger.Warn("    Failed to create classifier LLM, router will use primary",
-							zap.Error(err),
-							zap.String("provider", cfg.ClassifierLlm.Provider),
-							zap.String("model", cfg.ClassifierLlm.Model))
-					} else {
-						if tracer != nil {
-							classLLM = llm.NewInstrumentedProvider(classLLM, tracer)
-						}
-						classLLM = guardLLM(classLLM)
-						staticClassifierLLM = classLLM
-						agentOpts = append(agentOpts, agent.WithClassifierLLM(classLLM))
-						logger.Info("    Classifier LLM configured",
-							zap.String("provider", cfg.ClassifierLlm.Provider),
-							zap.String("model", cfg.ClassifierLlm.Model))
-					}
-				}
+				// The agent's own models from its YAML (llm, compressor_llm,
+				// classifier_llm), or the server default.
+				roles := buildAgentLLMs(cfg, llmProvider, config, tracer, guardLLM, logger)
+				agentLLMProvider := roles.primary
+				staticClassifierLLM := roles.classifier
+				agentOpts = append(agentOpts, roles.opts...)
 
 				// Wire skills (orchestrator + Discovery + hierarchical router)
 				// via the shared agent.BuildSkillsOptions helper. This is the
@@ -3296,13 +3233,15 @@ func runServe(cmd *cobra.Command, args []string) {
 			agentOpts = append(agentOpts, agent.WithAdmissionHooks(admissionChain))
 			agentOpts = append(agentOpts, agent.WithIdentityResolver(postgres.UserIDFromContext))
 
-			// Wrap LLM provider with instrumentation for observability
-			if tracer != nil {
-				llmProvider = llm.NewInstrumentedProvider(llmProvider, tracer)
-			}
+			// The agent's own models from its YAML, as at startup. (This used
+			// to wrap the shared server provider in place, adding a layer of
+			// instrumentation on every reload and dropping the agent's own
+			// llm and compressor_llm.)
+			roles := buildAgentLLMs(agentConfig, llmProvider, config, tracer, guardLLM, logger)
+			agentOpts = append(agentOpts, roles.opts...)
 
 			// Create new agent
-			newAgent := agent.NewAgent(backend, llmProvider, agentOpts...)
+			newAgent := agent.NewAgent(backend, roles.primary, agentOpts...)
 
 			// Wire pattern effectiveness tracker for metrics collection
 			if patternTracker != nil {
@@ -4057,6 +3996,84 @@ func buildDeviceServer(config *Config, defaultUserID string, logger *zap.Logger)
 		zap.Bool("required", dp.Required),
 		zap.Int("paired_devices", len(manager.List())))
 	return ds
+}
+
+// agentLLMs are the providers an agent uses, built from its YAML.
+type agentLLMs struct {
+	// primary answers the agent's turns: llm, or the server default.
+	primary agent.LLMProvider
+	// classifier is classifier_llm, or nil.
+	classifier agent.LLMProvider
+	// opts wire compressor_llm and classifier_llm into the agent.
+	opts []agent.Option
+}
+
+// buildAgentLLMs builds an agent's providers from cfg: its llm (else
+// serverDefault), compressor_llm (memory extraction) and classifier_llm.
+// Each is instrumented when tracer is set and put behind the spending
+// ledger with guard. A provider that cannot be built is logged and left to
+// the default, as before. Used at startup and on hot reload, so a reloaded
+// agent keeps its own models.
+func buildAgentLLMs(cfg *loomv1.AgentConfig, serverDefault agent.LLMProvider, config *Config, tracer observability.Tracer, guard func(agent.LLMProvider) agent.LLMProvider, logger *zap.Logger) agentLLMs {
+	observe := func(p agent.LLMProvider) agent.LLMProvider {
+		if tracer != nil {
+			p = llm.NewInstrumentedProvider(p, tracer)
+		}
+		return guard(p)
+	}
+	out := agentLLMs{primary: serverDefault}
+	if cfg.Llm != nil && cfg.Llm.Provider != "" {
+		logger.Info("    Agent has custom LLM configuration",
+			zap.String("provider", cfg.Llm.Provider),
+			zap.String("model", cfg.Llm.Model))
+		customLLM, err := createLLMProviderFromProtoConfig(cfg.Llm, config, logger)
+		if err != nil {
+			logger.Warn("    Failed to create custom LLM provider, using server default",
+				zap.Error(err))
+		} else {
+			out.primary = customLLM
+			logger.Info("    Using custom LLM",
+				zap.String("provider", cfg.Llm.Provider),
+				zap.String("model", cfg.Llm.Model))
+		}
+	} else {
+		logger.Info("    Using server default LLM")
+	}
+	out.primary = observe(out.primary)
+
+	// Per-role LLMs route auxiliary work (memory extraction,
+	// classification) to a separate provider — critical when the primary is
+	// a single-slot local model. Mirrors pkg/agent/registry.go buildAgent.
+	if cfg.CompressorLlm != nil && cfg.CompressorLlm.Provider != "" {
+		compLLM, err := createLLMProviderFromProtoConfig(cfg.CompressorLlm, config, logger)
+		if err != nil {
+			logger.Warn("    Failed to create compressor LLM, extractor will use primary",
+				zap.Error(err),
+				zap.String("provider", cfg.CompressorLlm.Provider),
+				zap.String("model", cfg.CompressorLlm.Model))
+		} else {
+			out.opts = append(out.opts, agent.WithCompressorLLM(observe(compLLM)))
+			logger.Info("    Compressor LLM configured",
+				zap.String("provider", cfg.CompressorLlm.Provider),
+				zap.String("model", cfg.CompressorLlm.Model))
+		}
+	}
+	if cfg.ClassifierLlm != nil && cfg.ClassifierLlm.Provider != "" {
+		classLLM, err := createLLMProviderFromProtoConfig(cfg.ClassifierLlm, config, logger)
+		if err != nil {
+			logger.Warn("    Failed to create classifier LLM, router will use primary",
+				zap.Error(err),
+				zap.String("provider", cfg.ClassifierLlm.Provider),
+				zap.String("model", cfg.ClassifierLlm.Model))
+		} else {
+			out.classifier = observe(classLLM)
+			out.opts = append(out.opts, agent.WithClassifierLLM(out.classifier))
+			logger.Info("    Classifier LLM configured",
+				zap.String("provider", cfg.ClassifierLlm.Provider),
+				zap.String("model", cfg.ClassifierLlm.Model))
+		}
+	}
+	return out
 }
 
 // spendingFileName is the spending ledger in the data directory
