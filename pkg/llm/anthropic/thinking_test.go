@@ -204,7 +204,11 @@ func TestNativeThinking_BudgetAndTemperatureStayValid(t *testing.T) {
 		{older, "", 0.2},
 		{older, "none", 0.2},
 		{older, "low", 1.0},
-		{"claude-sonnet-5", "high", 1.0},
+		{"claude-sonnet-4-6", "high", 1.0},
+		// Models that reject sampling parameters never carry one, with or
+		// without thinking (llm.AcceptsSamplingParams).
+		{"claude-sonnet-5", "high", 0},
+		{"claude-opus-5-5", "", 0},
 	} {
 		c = NewClient(Config{APIKey: "k", Model: tc.model, MaxTokens: 64000, ThinkingLevel: tc.level, Temperature: 0.2})
 		if got := c.temperatureParam(context.Background()); got != tc.want {

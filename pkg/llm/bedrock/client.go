@@ -247,9 +247,9 @@ func (c *Client) Chat(ctx context.Context, messages []llmtypes.Message, tools []
 	request := map[string]interface{}{
 		"anthropic_version": "bedrock-2023-05-31",
 		"max_tokens":        c.maxTokens,
-		"temperature":       c.temperature,
 		"messages":          apiMessages,
 	}
+	c.setTemperature(request)
 
 	// Add system prompt if present (Anthropic Messages API requires separate system field)
 	if systemPrompt != "" {
@@ -349,9 +349,9 @@ func (c *Client) chatStreamDisabled(ctx context.Context, messages []llmtypes.Mes
 	request := map[string]interface{}{
 		"anthropic_version": "bedrock-2023-05-31",
 		"max_tokens":        c.maxTokens,
-		"temperature":       c.temperature,
 		"messages":          apiMessages,
 	}
+	c.setTemperature(request)
 
 	// Add system prompt if present (Anthropic Messages API requires separate system field)
 	if systemPrompt != "" {
@@ -921,3 +921,12 @@ type bedrockStreamChunk struct {
 var _ llmtypes.LLMProvider = (*Client)(nil)
 
 // var _ llmtypes.StreamingLLMProvider = (*Client)(nil)  // DISABLED
+
+// setTemperature adds the configured temperature to an InvokeModel request,
+// unless the model rejects sampling parameters (llm.AcceptsSamplingParams):
+// those take the API default when the field is absent.
+func (c *Client) setTemperature(request map[string]interface{}) {
+	if llm.AcceptsSamplingParams(c.modelID) {
+		request["temperature"] = c.temperature
+	}
+}

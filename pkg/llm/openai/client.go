@@ -655,8 +655,13 @@ func (c *Client) thinkingParam(ctx context.Context) map[string]interface{} {
 // The gateway forwards these requests to Anthropic, which rejects any
 // temperature other than 1 alongside thinking — a configured 0.2 would fail
 // every request at any level above off. The enabled form's budget is clamped
-// in thinkingParam, so no clamp is needed here.
+// in thinkingParam, so no clamp is needed here. A Claude model behind the
+// gateway that rejects sampling parameters gets 0, which omits the field
+// (omitempty).
 func (c *Client) temperatureParam(ctx context.Context) float64 {
+	if !llm.AcceptsSamplingParams(c.model) {
+		return 0
+	}
 	if c.thinkingParam(ctx) != nil {
 		return 1.0
 	}
