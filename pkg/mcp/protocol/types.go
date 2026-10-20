@@ -116,7 +116,15 @@ type ToolListResult struct {
 type CallToolParams struct {
 	Name      string                 `json:"name"`
 	Arguments map[string]interface{} `json:"arguments,omitempty"`
+	// Meta is the request _meta. loom sets MetaCallerUserID in it for
+	// servers configured with forward_caller_identity.
+	Meta map[string]interface{} `json:"_meta,omitempty"`
 }
+
+// MetaCallerUserID is the tools/call request _meta key carrying the user ID
+// of the person the agent is acting for, sent only to servers configured
+// with forward_caller_identity. The value is a string.
+const MetaCallerUserID = "com.teradata.loom/callerUserId"
 
 // CallToolResult is the response from tools/call
 type CallToolResult struct {

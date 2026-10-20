@@ -772,6 +772,13 @@ type MCPServerConfig struct {
 
 	// WorkingDir is the working directory for the MCP server process (optional)
 	WorkingDir string `mapstructure:"working_dir"`
+
+	// ForwardCallerIdentity sends the user ID of the person the agent is
+	// acting for in each tool call's _meta ("com.teradata.loom/callerUserId"), for
+	// servers that keep data per person. Only for servers loom trusts with
+	// that identity: a stdio child, or an HTTP server only loom can reach
+	// (default: false)
+	ForwardCallerIdentity bool `mapstructure:"forward_caller_identity"`
 }
 
 // PromptsConfig holds configuration for PromptRegistry integration.

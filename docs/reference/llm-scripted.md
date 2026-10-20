@@ -98,6 +98,8 @@ Templates use Go `text/template`.
 | `.ToolResult` | string | That result's content as a model would read it. |
 | `.ToolSucceeded` | bool | Whether that tool call succeeded. |
 | `dateAt days hour` | function | RFC 3339 UTC timestamp `days` from today at `hour`:00. |
+| `find pattern text` | function | First capture group (or the whole match) of the regular expression `pattern` in `text`; `""` when it does not match or is invalid. Picks an id out of `.ToolResult`. |
+| `quote text` | function | `text` with regular-expression characters escaped, for use in a `find` pattern. |
 
 A template that fails at run time renders as
 `[scripted provider template error: …]` in the reply.

@@ -81,6 +81,13 @@ type ServerConfig struct {
 
 	// Timeout for server operations (e.g., "30s", "1m")
 	Timeout string `yaml:"timeout" json:"timeout"`
+
+	// ForwardCallerIdentity sends the user ID of the person the agent is
+	// acting for in each tool call's _meta ("com.teradata.loom/callerUserId"), for
+	// servers that keep data per person. Enable it only for servers loom
+	// trusts with that identity: a stdio child, or an HTTP server only loom
+	// can reach (default: false)
+	ForwardCallerIdentity bool `yaml:"forward_caller_identity" json:"forward_caller_identity"`
 }
 
 // ToolFilter controls which tools are registered from a server.

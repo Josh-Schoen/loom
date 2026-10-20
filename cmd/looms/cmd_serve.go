@@ -3863,6 +3863,8 @@ func initializeMCPManager(config *Config, logger *zap.Logger) (*mcpManager, erro
 			EnableSessions:   serverConfig.EnableSessions,
 			EnableResumption: serverConfig.EnableResumption,
 			Enabled:          enabled,
+			// Per-person servers learn who the agent is acting for.
+			ForwardCallerIdentity: serverConfig.ForwardCallerIdentity,
 			ToolFilter: manager.ToolFilter{
 				All: true, // Register all tools from this server
 			},
