@@ -14,6 +14,7 @@
 package agent
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strings"
@@ -239,8 +240,35 @@ func (a *Agent) chatWithStreaming(ctx Context, messages []Message, tools []shutt
 		}
 	}
 
+	// A tool call's input can take minutes to write (a whole program): say
+	// which tool is coming as soon as it starts, with the words so far, and
+	// keep saying it while the input grows, so a client isn't left silent.
+	toolInputCallback := func(toolName string, inputBytes int) {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		progressCallback(ProgressEvent{
+			Stage:          StageLLMGeneration,
+			Progress:       50,
+			Message:        fmt.Sprintf("Preparing tool call (%d bytes)", inputBytes),
+			ToolName:       toolName,
+			Timestamp:      time.Now(),
+			PartialContent: buffer.String(),
+			IsTokenStream:  true,
+			TokenCount:     tokenCount,
+			TTFT:           ttft,
+		})
+		lastFlushTime = time.Now()
+	}
+	var streamCtx context.Context = ctx
+	if progressCallback != nil {
+		streamCtx = llmtypes.WithToolInputCallback(ctx, toolInputCallback)
+	}
+
 	// Call streaming provider
-	resp, err := streamingProvider.ChatStream(ctx, messages, tools, tokenCallback)
+	resp, err := streamingProvider.ChatStream(streamCtx, messages, tools, tokenCallback)
 	if err != nil {
 		return nil, err
 	}

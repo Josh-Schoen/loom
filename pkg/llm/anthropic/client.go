@@ -612,6 +612,10 @@ func (c *Client) ChatStream(ctx context.Context, messages []llmtypes.Message,
 	toolInputBuffers := make(map[int]*strings.Builder)
 	// Map content block index → toolCalls slice index for tool_use blocks
 	toolCallIndex := make(map[int]int)
+	// Tells the caller which tool is coming while its input streams.
+	toolInputCallback := llmtypes.ToolInputCallbackFrom(ctx)
+	toolInputReported := make(map[int]int)
+	const toolInputReportEvery = 2048
 
 	scanner := bufio.NewScanner(idle.reader(httpResp.Body))
 	for scanner.Scan() {
@@ -656,6 +660,12 @@ func (c *Client) ChatStream(ctx context.Context, messages []llmtypes.Message,
 					// Accumulate tool input JSON fragments
 					if buf, exists := toolInputBuffers[event.Index]; exists {
 						buf.WriteString(event.Delta.PartialJSON)
+						if toolInputCallback != nil && buf.Len()-toolInputReported[event.Index] >= toolInputReportEvery {
+							toolInputReported[event.Index] = buf.Len()
+							if idx, ok := toolCallIndex[event.Index]; ok && idx < len(toolCalls) {
+								toolInputCallback(toolCalls[idx].Name, buf.Len())
+							}
+						}
 					}
 				}
 
@@ -671,6 +681,9 @@ func (c *Client) ChatStream(ctx context.Context, messages []llmtypes.Message,
 					// Initialize buffer for this tool's input JSON
 					toolInputBuffers[event.Index] = &strings.Builder{}
 					toolCallIndex[event.Index] = idx
+					if toolInputCallback != nil {
+						toolInputCallback(toolCalls[idx].Name, 0)
+					}
 				}
 
 			case "content_block_stop":

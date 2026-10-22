@@ -19,6 +19,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/teradata-labs/loom/pkg/observability"
@@ -805,5 +806,58 @@ func TestClient_Chat_CacheTokensInResponse(t *testing.T) {
 	expectedCost := 50.0*3.0/1_000_000 + 10.0*15.0/1_000_000 + 800.0*0.30/1_000_000
 	if resp.Usage.CostUSD != expectedCost {
 		t.Errorf("expected cost $%.8f, got $%.8f", expectedCost, resp.Usage.CostUSD)
+	}
+}
+
+func TestClient_ChatStream_ReportsToolInputAsItStreams(t *testing.T) {
+	// A long tool input (a whole program) arrives over minutes; the caller
+	// hears which tool is coming when it starts and as its input grows.
+	big := strings.Repeat("x", 5000)
+	ssePayload := `event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_big","name":"miniapps_save"}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"code\": \"` + big + `\"}"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":42}}
+
+event: message_stop
+data: {"type":"message_stop"}
+
+`
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(ssePayload))
+	}))
+	defer server.Close()
+
+	client := NewClient(Config{APIKey: "test-key", Endpoint: server.URL})
+	type report struct {
+		name  string
+		bytes int
+	}
+	var reports []report
+	ctx := types.WithToolInputCallback(context.Background(), func(name string, n int) {
+		reports = append(reports, report{name, n})
+	})
+	_, err := client.ChatStream(ctx, []types.Message{{Role: "user", Content: "Build it"}}, nil, func(string) {})
+	if err != nil {
+		t.Fatalf("ChatStream failed: %v", err)
+	}
+	if len(reports) != 2 {
+		t.Fatalf("expected a start report and a growth report, got %+v", reports)
+	}
+	if reports[0].bytes != 0 || reports[1].bytes < 5000 {
+		t.Errorf("unexpected sizes: %+v", reports)
+	}
+	for _, r := range reports {
+		if r.name != "miniapps_save" {
+			t.Errorf("expected tool name miniapps_save, got %q", r.name)
+		}
 	}
 }

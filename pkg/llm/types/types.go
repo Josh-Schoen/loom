@@ -21,4 +21,11 @@ type LLMResponse = types.LLMResponse
 type LLMProvider = types.LLMProvider
 type HealthChecker = types.HealthChecker
 type TokenCallback = types.TokenCallback
+type ToolInputCallback = types.ToolInputCallback
 type StreamingLLMProvider = types.StreamingLLMProvider
+
+// WithToolInputCallback and ToolInputCallbackFrom: see pkg/types.
+var (
+	WithToolInputCallback = types.WithToolInputCallback
+	ToolInputCallbackFrom = types.ToolInputCallbackFrom
+)

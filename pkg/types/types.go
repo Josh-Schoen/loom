@@ -223,6 +223,25 @@ type HealthChecker interface {
 // Implementations should be lightweight and non-blocking.
 type TokenCallback func(token string)
 
+// ToolInputCallback is called while a streaming provider receives a tool
+// call: once when the call starts (inputBytes 0) and again as its input
+// grows. It lets a client show which tool is coming while a long input (a
+// file, a program) is still being written. Lightweight and non-blocking.
+type ToolInputCallback func(toolName string, inputBytes int)
+
+type toolInputCallbackKey struct{}
+
+// WithToolInputCallback returns ctx carrying cb for ChatStream to call.
+func WithToolInputCallback(ctx context.Context, cb ToolInputCallback) context.Context {
+	return context.WithValue(ctx, toolInputCallbackKey{}, cb)
+}
+
+// ToolInputCallbackFrom returns the callback in ctx, or nil.
+func ToolInputCallbackFrom(ctx context.Context) ToolInputCallback {
+	cb, _ := ctx.Value(toolInputCallbackKey{}).(ToolInputCallback)
+	return cb
+}
+
 // StreamingLLMProvider extends LLMProvider with token streaming support.
 // Providers implement this interface if they support real-time token streaming.
 // Use the SupportsStreaming helper to check if a provider implements this interface.
