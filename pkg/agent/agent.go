@@ -3434,9 +3434,11 @@ func (a *Agent) injectGraphMemoryContext(ctx context.Context, session *types.Ses
 	outcome := "unknown"
 	defer func() { span.SetAttribute("recall.outcome", outcome) }()
 
-	// Wait for any in-flight extractions to finish before querying.
-	// This ensures recently ingested content is available for recall.
-	a.graphExtractionWG.Wait()
+	// Don't wait for in-flight extractions: they run on the compressor LLM,
+	// which may be a slow local model, and the reply must not wait on it.
+	// What this message says is in the conversation already; what earlier
+	// turns taught is recalled once their extraction lands. Tests and
+	// benchmarks that need it settled call FlushGraphMemoryExtraction.
 
 	budget := a.graphMemoryTokenBudget()
 	if budget <= 0 {
@@ -3683,10 +3685,9 @@ func (a *Agent) rerankMemories(ctx context.Context, userMessage string, candidat
 	sb.WriteString("comma-separated. Example: 1,3,7\n")
 	sb.WriteString("If none are relevant, return: none")
 
+	// The main LLM, not the compressor: this runs before the reply, and a
+	// compressor may be a slow local model.
 	llmProvider := a.llm
-	if a.compressorLLM != nil {
-		llmProvider = a.compressorLLM
-	}
 
 	resp, err := llmProvider.Chat(rerankCtx, []types.Message{
 		{Role: "user", Content: sb.String()},
@@ -3738,11 +3739,9 @@ func (a *Agent) extractSearchQuery(ctx context.Context, userMessage string) (que
 			"framing, and filler — just the core topic the user is asking about.\n\n"+
 			"Message: %s\n\nSearch query:", userMessage)
 
-	// Use compressor LLM if available (cheaper/faster), otherwise main LLM.
+	// The main LLM, not the compressor: this runs before the reply, and a
+	// compressor may be a slow local model.
 	llmProvider := a.llm
-	if a.compressorLLM != nil {
-		llmProvider = a.compressorLLM
-	}
 
 	resp, err := llmProvider.Chat(extractCtx, []types.Message{
 		{Role: "user", Content: prompt},
