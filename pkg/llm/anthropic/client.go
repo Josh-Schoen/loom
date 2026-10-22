@@ -42,8 +42,15 @@ const (
 	DefaultMaxTokens = 4096
 	// DefaultTemperature is the default LLM temperature
 	DefaultTemperature = 1.0
-	// DefaultTimeout is the default HTTP timeout
+	// DefaultTimeout is the default HTTP timeout. For a streamed reply it
+	// bounds the wait for the response to start; the reply itself may then
+	// run as long as events keep arriving (StreamIdleTimeout).
 	DefaultTimeout = 60 * time.Second
+	// StreamIdleTimeout is how long a streamed reply may go without any
+	// event (Anthropic sends ping events while the model works) before it is
+	// given up on. A long reply, like a whole app written as one tool call,
+	// can take minutes; only silence ends it.
+	StreamIdleTimeout = 2 * time.Minute
 )
 
 // DefaultAnthropicRateLimiterConfig returns safe defaults for Anthropic's API.
@@ -70,14 +77,18 @@ func DefaultAnthropicRateLimiterConfig() llm.RateLimiterConfig {
 
 // Client implements the LLMProvider interface for Anthropic's Claude API.
 type Client struct {
-	apiKey      string
-	model       string
-	endpoint    string
-	httpClient  *http.Client
-	maxTokens   int
-	temperature float64
-	rateLimiter *llm.RateLimiter
-	toolNameMap map[string]string // sanitized name → original name
+	apiKey     string
+	model      string
+	endpoint   string
+	httpClient *http.Client
+	// streamClient has no overall timeout: a streamed reply is bounded by
+	// the time to its first byte and by StreamIdleTimeout between events.
+	streamClient *http.Client
+	streamIdle   time.Duration
+	maxTokens    int
+	temperature  float64
+	rateLimiter  *llm.RateLimiter
+	toolNameMap  map[string]string // sanitized name → original name
 	// noFallbacks is set when the API rejected the server-side fallback
 	// option; later requests from this client leave it out.
 	noFallbacks atomic.Bool
@@ -138,6 +149,8 @@ func NewClient(config Config) *Client {
 		httpClient: &http.Client{
 			Timeout: config.Timeout,
 		},
+		streamClient: &http.Client{Transport: streamTransport(config.Timeout)},
+		streamIdle:   StreamIdleTimeout,
 	}
 }
 
@@ -566,6 +579,12 @@ func (c *Client) ChatStream(ctx context.Context, messages []llmtypes.Message,
 	}
 
 	// 2. Send the request (rate limited, with the model's request rules).
+	// The reply may run as long as events keep coming; silence for
+	// streamIdle ends it.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	idle := newIdleWatch(c.streamIdle, cancel)
+	defer idle.stop()
 	httpResp, err := c.send(ctx, req)
 	if err != nil {
 		return nil, err
@@ -594,7 +613,7 @@ func (c *Client) ChatStream(ctx context.Context, messages []llmtypes.Message,
 	// Map content block index → toolCalls slice index for tool_use blocks
 	toolCallIndex := make(map[int]int)
 
-	scanner := bufio.NewScanner(httpResp.Body)
+	scanner := bufio.NewScanner(idle.reader(httpResp.Body))
 	for scanner.Scan() {
 		line := scanner.Text()
 
@@ -705,6 +724,9 @@ func (c *Client) ChatStream(ctx context.Context, messages []llmtypes.Message,
 			// Check context cancellation
 			select {
 			case <-ctx.Done():
+				if idle.fired() {
+					return nil, fmt.Errorf("error reading stream: the model sent nothing for %s", c.streamIdle)
+				}
 				return nil, ctx.Err()
 			default:
 			}
@@ -712,6 +734,9 @@ func (c *Client) ChatStream(ctx context.Context, messages []llmtypes.Message,
 	}
 
 	if err := scanner.Err(); err != nil {
+		if idle.fired() {
+			return nil, fmt.Errorf("error reading stream: the model sent nothing for %s", c.streamIdle)
+		}
 		return nil, fmt.Errorf("error reading stream: %w", err)
 	}
 
@@ -856,7 +881,7 @@ func (c *Client) post(ctx context.Context, req *MessagesRequest, betaHeader stri
 		if err != nil {
 			return nil, err
 		}
-		resp, err := c.httpClient.Do(r)
+		resp, err := c.clientFor(req).Do(r)
 		if err != nil {
 			return nil, fmt.Errorf("HTTP request failed: %w", err)
 		}
@@ -867,7 +892,7 @@ func (c *Client) post(ctx context.Context, req *MessagesRequest, betaHeader stri
 		if err != nil {
 			return nil, err
 		}
-		resp, err := c.httpClient.Do(r)
+		resp, err := c.clientFor(req).Do(r)
 		if err != nil {
 			return nil, err
 		}
@@ -884,4 +909,55 @@ func (c *Client) post(ctx context.Context, req *MessagesRequest, betaHeader stri
 		return nil, fmt.Errorf("HTTP request failed: %w", err)
 	}
 	return result.(*http.Response), nil
+}
+
+// clientFor picks the HTTP client for a request: a streamed one has no
+// overall timeout (see streamClient).
+func (c *Client) clientFor(req *MessagesRequest) *http.Client {
+	if req.Stream && c.streamClient != nil {
+		return c.streamClient
+	}
+	return c.httpClient
+}
+
+// streamTransport waits at most firstByte for a reply to start.
+func streamTransport(firstByte time.Duration) http.RoundTripper {
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	t.ResponseHeaderTimeout = firstByte
+	return t
+}
+
+// idleWatch cancels a streamed reply that has sent nothing for a while.
+type idleWatch struct {
+	timer   *time.Timer
+	after   time.Duration
+	tripped atomic.Bool
+}
+
+func newIdleWatch(after time.Duration, cancel context.CancelFunc) *idleWatch {
+	w := &idleWatch{after: after}
+	w.timer = time.AfterFunc(after, func() {
+		w.tripped.Store(true)
+		cancel()
+	})
+	return w
+}
+
+// reader resets the watch whenever r gives bytes.
+func (w *idleWatch) reader(r io.Reader) io.Reader { return idleReader{r: r, w: w} }
+
+func (w *idleWatch) stop()       { w.timer.Stop() }
+func (w *idleWatch) fired() bool { return w.tripped.Load() }
+
+type idleReader struct {
+	r io.Reader
+	w *idleWatch
+}
+
+func (r idleReader) Read(p []byte) (int, error) {
+	n, err := r.r.Read(p)
+	if n > 0 {
+		r.w.timer.Reset(r.w.after)
+	}
+	return n, err
 }
