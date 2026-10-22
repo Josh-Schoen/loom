@@ -832,3 +832,37 @@ func TestPressureMarks_PenaltyNeverGoesNegative(t *testing.T) {
 	assert.LessOrEqual(t, sm.releaseMarkLocked(pressureRecoveryPenalty), sm.startMarkLocked(pressureRecoveryPenalty),
 		"the band must not invert under the penalty")
 }
+
+// CompactNow ("make room") folds every turn older than the protected recent
+// ones into the summary, with no pressure needed, and keeps the recent turns.
+func TestCompactNow_FoldsOlderTurns(t *testing.T) {
+	store, err := NewSessionStore(filepath.Join(t.TempDir(), "s.db"), observability.NewNoOpTracer())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = store.Close() })
+
+	ctx := context.Background()
+	const sessionID = "sess-compact"
+	require.NoError(t, store.SaveSession(ctx, &Session{ID: sessionID, Context: map[string]interface{}{}}))
+
+	sm := NewSegmentedMemory("ROM", 200000, 20000)
+	sm.SetSessionStore(store, sessionID)
+	sm.SetCompressor(&foldCompressor{out: "covers msg:1-4\\nsummary of the old turns"})
+	for turn := 1; turn <= 8; turn++ {
+		for _, m := range []Message{{Role: "user", Content: fmt.Sprintf("question %d", turn)}, {Role: "assistant", Content: fmt.Sprintf("answer %d", turn)}} {
+			m := m
+			require.NoError(t, store.SaveMessage(ctx, sessionID, &m, m.Role == "user"))
+			sm.AddMessage(ctx, m)
+		}
+	}
+	before := len(sm.GetMessages())
+
+	assert.True(t, sm.CompactNow(ctx), "older turns are folded with no pressure")
+	assert.Contains(t, sm.GetL2Summary(), "summary of the old turns")
+	after := sm.GetMessages()
+	assert.Less(t, len(after), before, "folded turns leave the window")
+	latest := after[len(after)-1]
+	assert.Equal(t, "answer 8", latest.Content, "the latest turn is kept as it was")
+
+	// Nothing old enough left: no change.
+	assert.False(t, sm.CompactNow(ctx))
+}

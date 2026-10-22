@@ -1118,6 +1118,21 @@ func (a *Agent) ResetSessionContext(sessionID string) bool {
 	return false
 }
 
+// CompactSessionContext folds a session's older turns into its summary,
+// keeping the recent ones. Returns true if anything was folded.
+func (a *Agent) CompactSessionContext(ctx context.Context, sessionID string) bool {
+	// Loaded from storage as the next message would be, so a conversation
+	// from before a restart can be compacted too.
+	sess := a.memory.GetOrCreateSessionWithAgent(ctx, sessionID, a.config.Name, "")
+	if sess == nil {
+		return false
+	}
+	if segMem, ok := sess.SegmentedMem.(*SegmentedMemory); ok && segMem != nil {
+		return segMem.CompactNow(ctx)
+	}
+	return false
+}
+
 // getSystemPrompt loads the system prompt from config or PromptRegistry.
 // Priority: ROM + Config.SystemPrompt (if explicitly set) > ROM + PromptRegistry > Default
 // ROM (Read-Only Memory) provides domain-specific knowledge loaded based on config.Rom

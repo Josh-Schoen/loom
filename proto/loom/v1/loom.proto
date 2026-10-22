@@ -799,6 +799,12 @@ message WeaveRequest {
   // returned to the agent as a failed tool result with error code
   // CLIENT_TOOL_TIMEOUT.
   int32 client_tool_timeout_seconds = 13;
+
+  // Fold the conversation so far into its summary before processing this
+  // message, keeping the most recent turns as they are ("make room").
+  // Unlike reset_context, nothing is forgotten: older turns live on in the
+  // summary. No effect when there is nothing old enough to fold.
+  bool compact_context = 14;
 }
 
 // WeaveResponse contains the execution result.

@@ -98,7 +98,11 @@
         },
         "pairingLink": {
           "type": "string",
-          "description": "Link that carries server_url and code, for QR codes:\n\"\u003clink_scheme\u003e://pair?server=\u003cserver_url\u003e\u0026code=\u003ccode\u003e\"."
+          "description": "Link that carries server_url and code, for QR codes:\n\"\u003clink_scheme\u003e://pair?server=\u003cserver_url\u003e\u0026code=\u003ccode\u003e\", plus\n\"\u0026pin=\u003ccert_pin\u003e\" when cert_pin is set."
+        },
+        "certPin": {
+          "type": "string",
+          "description": "SHA-256 of the gateway's TLS certificate (DER), unpadded base64url, when\nthe gateway serves its own pinned certificate\n(server.device_pairing.pinned_tls). A device trusts exactly this\ncertificate for server_url. Empty otherwise."
         }
       },
       "description": "CreatePairingCodeResponse carries the code and a ready-to-share link."

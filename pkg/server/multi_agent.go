@@ -1044,6 +1044,10 @@ func (s *MultiAgentServer) Weave(ctx context.Context, req *loomv1.WeaveRequest) 
 	}
 
 	// Reset context window if requested (before processing the message)
+	// Fold older turns into the summary if asked ("make room").
+	if req.CompactContext {
+		ag.CompactSessionContext(ctx, sessionID)
+	}
 	if req.ResetContext {
 		ag.ResetSessionContext(sessionID)
 		if s.logger != nil {
@@ -1271,6 +1275,10 @@ func (s *MultiAgentServer) StreamWeave(req *loomv1.WeaveRequest, stream loomv1.L
 	// even after the coordinator has returned an initial response to the user.
 
 	// Reset context window if requested (before processing the message)
+	// Fold older turns into the summary if asked ("make room").
+	if req.CompactContext {
+		ag.CompactSessionContext(ctx, sessionID)
+	}
 	if req.ResetContext {
 		ag.ResetSessionContext(sessionID)
 		if s.logger != nil {
