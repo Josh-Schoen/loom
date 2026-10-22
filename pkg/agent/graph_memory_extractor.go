@@ -253,7 +253,10 @@ func (a *Agent) extractGraphMemoryAsync(ctx context.Context, sessionID string) {
 	if a.graphMemoryConfig != nil && a.graphMemoryConfig.ExtractionTimeoutSeconds > 0 {
 		timeout = time.Duration(a.graphMemoryConfig.ExtractionTimeoutSeconds) * time.Second
 	}
-	extractCtx, cancel := context.WithTimeout(ctx, timeout)
+	// Detached from the turn: the reply no longer waits for extraction, so
+	// the turn's context ends first and would cancel it. Keep its values
+	// (who this is, tracing), not its cancellation.
+	extractCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), timeout)
 	defer cancel()
 
 	session, ok := a.memory.GetSession(sessionID)
