@@ -337,8 +337,13 @@ type WeaveRequest struct {
 	// returned to the agent as a failed tool result with error code
 	// CLIENT_TOOL_TIMEOUT.
 	ClientToolTimeoutSeconds int32 `protobuf:"varint,13,opt,name=client_tool_timeout_seconds,json=clientToolTimeoutSeconds,proto3" json:"client_tool_timeout_seconds,omitempty"`
-	unknownFields            protoimpl.UnknownFields
-	sizeCache                protoimpl.SizeCache
+	// Fold the conversation so far into its summary before processing this
+	// message, keeping the most recent turns as they are ("make room").
+	// Unlike reset_context, nothing is forgotten: older turns live on in the
+	// summary. No effect when there is nothing old enough to fold.
+	CompactContext bool `protobuf:"varint,14,opt,name=compact_context,json=compactContext,proto3" json:"compact_context,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *WeaveRequest) Reset() {
@@ -460,6 +465,13 @@ func (x *WeaveRequest) GetClientToolTimeoutSeconds() int32 {
 		return x.ClientToolTimeoutSeconds
 	}
 	return 0
+}
+
+func (x *WeaveRequest) GetCompactContext() bool {
+	if x != nil {
+		return x.CompactContext
+	}
+	return false
 }
 
 // WeaveResponse contains the execution result.
@@ -11026,7 +11038,7 @@ var File_loom_v1_loom_proto protoreflect.FileDescriptor
 
 const file_loom_v1_loom_proto_rawDesc = "" +
 	"\n" +
-	"\x12loom/v1/loom.proto\x12\aloom.v1\x1a\x1cgoogle/api/annotations.proto\x1a\x1bgoogle/protobuf/empty.proto\x1a\x1cgoogle/protobuf/struct.proto\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\x1aloom/v1/agent_config.proto\x1a\x12loom/v1/apps.proto\x1a\x11loom/v1/bus.proto\x1a\x1bloom/v1/communication.proto\x1a\x1bloom/v1/orchestration.proto\x1a\x14loom/v1/server.proto\x1a\x1bloom/v1/shared_memory.proto\x1a\x15loom/v1/storage.proto\x1a\x17loom/v1/templates.proto\x1a\x13loom/v1/tools.proto\x1a\x19loom/v1/user_memory.proto\"\xd8\x05\n" +
+	"\x12loom/v1/loom.proto\x12\aloom.v1\x1a\x1cgoogle/api/annotations.proto\x1a\x1bgoogle/protobuf/empty.proto\x1a\x1cgoogle/protobuf/struct.proto\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\x1aloom/v1/agent_config.proto\x1a\x12loom/v1/apps.proto\x1a\x11loom/v1/bus.proto\x1a\x1bloom/v1/communication.proto\x1a\x1bloom/v1/orchestration.proto\x1a\x14loom/v1/server.proto\x1a\x1bloom/v1/shared_memory.proto\x1a\x15loom/v1/storage.proto\x1a\x17loom/v1/templates.proto\x1a\x13loom/v1/tools.proto\x1a\x19loom/v1/user_memory.proto\"\x81\x06\n" +
 	"\fWeaveRequest\x12\x14\n" +
 	"\x05query\x18\x01 \x01(\tR\x05query\x12\x1d\n" +
 	"\n" +
@@ -11044,7 +11056,8 @@ const file_loom_v1_loom_proto_rawDesc = "" +
 	"\voccurred_at\x18\v \x01(\v2\x1a.google.protobuf.TimestampR\n" +
 	"occurredAt\x12:\n" +
 	"\fclient_tools\x18\f \x03(\v2\x17.loom.v1.ToolDefinitionR\vclientTools\x12=\n" +
-	"\x1bclient_tool_timeout_seconds\x18\r \x01(\x05R\x18clientToolTimeoutSeconds\x1a@\n" +
+	"\x1bclient_tool_timeout_seconds\x18\r \x01(\x05R\x18clientToolTimeoutSeconds\x12'\n" +
+	"\x0fcompact_context\x18\x0e \x01(\bR\x0ecompactContext\x1a@\n" +
 	"\x12BackendConfigEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\x1a:\n" +

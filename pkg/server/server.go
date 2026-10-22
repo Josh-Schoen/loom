@@ -156,6 +156,10 @@ func (s *Server) Weave(ctx context.Context, req *loomv1.WeaveRequest) (*loomv1.W
 	defer releaseDoor()
 
 	// Reset context window if requested (before processing the message)
+	// Fold older turns into the summary if asked ("make room").
+	if req.CompactContext {
+		s.agent.CompactSessionContext(ctx, sessionID)
+	}
 	if req.ResetContext {
 		s.agent.ResetSessionContext(sessionID)
 	}
@@ -239,6 +243,10 @@ func (s *Server) StreamWeave(req *loomv1.WeaveRequest, stream loomv1.LoomService
 	defer releaseDoor()
 
 	// Reset context window if requested (before processing the message)
+	// Fold older turns into the summary if asked ("make room").
+	if req.CompactContext {
+		s.agent.CompactSessionContext(ctx, sessionID)
+	}
 	if req.ResetContext {
 		s.agent.ResetSessionContext(sessionID)
 	}

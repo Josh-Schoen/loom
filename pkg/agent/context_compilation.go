@@ -942,3 +942,27 @@ func (sm *SegmentedMemory) setSummary(n int, text string) {
 	sm.updateTokenCount()
 	sm.tokenCountDirty = false
 }
+
+// CompactNow folds every turn but the last makeRoomKeptTurns into the
+// summary, whatever the pressure: a person asking to make room in a long
+// conversation. Returns whether anything changed.
+func (sm *SegmentedMemory) CompactNow(ctx context.Context) bool {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	if sm.reliefInFlight {
+		return false
+	}
+	sm.reliefInFlight = true
+	defer func() { sm.reliefInFlight = false }()
+
+	b := sm.currentTurnLocked() - makeRoomKeptTurns
+	if b < 1 {
+		return false
+	}
+	return sm.foldLocked(ctx, b)
+}
+
+// makeRoomKeptTurns are the recent turns CompactNow keeps as they are: the
+// person asked for room, so only what they're in the middle of stays whole
+// (pressure relief protects more, defaultProtectedRecentTurns).
+const makeRoomKeptTurns = 2
