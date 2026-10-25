@@ -110,6 +110,13 @@ func (m *Migrator) MigrateUp(ctx context.Context) error {
 		return err
 	}
 
+	// Move migrations recorded under a version they no longer have (see
+	// renumberedMigrations). Also before the skipped-version check.
+	if err := m.repairRenumbered(ctx); err != nil {
+		span.RecordError(err)
+		return err
+	}
+
 	// Refuse to proceed if any embedded migration at or below the current
 	// version is missing from schema_migrations. Silently skipping such
 	// migrations is what produced the v3 drift in the first place.
@@ -401,6 +408,98 @@ func (m *Migrator) repairKnownDrift(ctx context.Context) error {
 	}
 
 	return m.applyMigration(ctx, *mig3)
+}
+
+// renumberedMigrations lists migrations that databases have recorded under
+// an earlier version than the one they have now, because another migration
+// took that version. Each entry is matched by the description recorded in
+// schema_migrations, so a database that ran the other migration at From is
+// left alone.
+var renumberedMigrations = []struct {
+	Description string
+	From, To    int
+}{
+	// graph_entities_per_user shipped as 9 in the josh-schoen/loom fork;
+	// upstream's 9 is task_created_via.
+	{Description: "graph_entities_per_user", From: 9, To: 10},
+}
+
+// repairRenumbered moves each renumbered migration's record from its old
+// version to its new one (its SQL already ran, so it is not run again), then
+// applies the migration that now owns the old version, which this database
+// has never run. Both happen in one transaction: on any error the database
+// is unchanged and MigrateUp fails.
+func (m *Migrator) repairRenumbered(ctx context.Context) error {
+	for _, r := range renumberedMigrations {
+		var desc sql.NullString
+		err := m.db.QueryRowContext(ctx,
+			"SELECT description FROM schema_migrations WHERE version = ?", r.From,
+		).Scan(&desc)
+		if err == sql.ErrNoRows || (err == nil && desc.String != r.Description) {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("failed to read migration %d: %w", r.From, err)
+		}
+
+		var moved, displaced *Migration
+		for i := range m.migrations {
+			switch m.migrations[i].Version {
+			case r.To:
+				moved = &m.migrations[i]
+			case r.From:
+				displaced = &m.migrations[i]
+			}
+		}
+		if moved == nil || moved.Description != r.Description {
+			return fmt.Errorf("renumbered migration %q has no embedded migration %d", r.Description, r.To)
+		}
+
+		var taken int
+		if err := m.db.QueryRowContext(ctx,
+			"SELECT COUNT(*) FROM schema_migrations WHERE version = ?", r.To,
+		).Scan(&taken); err != nil {
+			return fmt.Errorf("failed to read migration %d: %w", r.To, err)
+		}
+		if taken > 0 {
+			return fmt.Errorf("schema_migrations records %q at %d and version %d is also applied; manual repair required", r.Description, r.From, r.To)
+		}
+
+		if err := m.moveMigration(ctx, r.From, r.To, displaced); err != nil {
+			return fmt.Errorf("failed to move migration %q from %d to %d: %w", r.Description, r.From, r.To, err)
+		}
+	}
+	return nil
+}
+
+// moveMigration re-records version from as to, then applies displaced (the
+// migration that now has version from), if any, in the same transaction.
+func (m *Migrator) moveMigration(ctx context.Context, from, to int, displaced *Migration) error {
+	tx, err := m.db.BeginTx(ctx, &sql.TxOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	if _, err := tx.ExecContext(ctx,
+		"UPDATE schema_migrations SET version = ? WHERE version = ?", to, from,
+	); err != nil {
+		return fmt.Errorf("failed to re-record migration: %w", err)
+	}
+
+	if displaced != nil {
+		if _, err := tx.ExecContext(ctx, displaced.UpSQL); err != nil {
+			return fmt.Errorf("failed to execute migration %d SQL: %w", displaced.Version, err)
+		}
+		if _, err := tx.ExecContext(ctx,
+			"INSERT INTO schema_migrations (version, description) VALUES (?, ?)",
+			displaced.Version, displaced.Description,
+		); err != nil {
+			return fmt.Errorf("failed to record migration %d: %w", displaced.Version, err)
+		}
+	}
+
+	return tx.Commit()
 }
 
 // validateAppliedMigrations errors if any embedded migration with version <=
