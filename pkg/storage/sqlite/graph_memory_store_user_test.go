@@ -579,11 +579,11 @@ func migrateTo(t *testing.T, m *Migrator, version int) {
 	}
 }
 
-// TestMigration000009_PreservesGraphData upgrades a version-8 database that
+// TestMigration000010_PreservesGraphData upgrades a version-8 database that
 // already holds graph data and checks that entities, edges, memory links, the
 // entity FTS index and its triggers all survive the graph_entities rebuild,
 // with and without foreign keys enabled.
-func TestMigration000009_PreservesGraphData(t *testing.T) {
+func TestMigration000010_PreservesGraphData(t *testing.T) {
 	for _, fk := range []bool{true, false} {
 		name := "foreign_keys_off"
 		if fk {
@@ -617,7 +617,7 @@ func TestMigration000009_PreservesGraphData(t *testing.T) {
 			require.NoError(t, migrator.MigrateUp(ctx))
 			version, err := migrator.CurrentVersion(ctx)
 			require.NoError(t, err)
-			require.GreaterOrEqual(t, version, 9)
+			require.GreaterOrEqual(t, version, 10)
 
 			store := NewGraphMemoryStore(db, &mockTokenCounter{}, observability.NewNoOpTracer())
 			def := context.Background()
@@ -711,15 +711,15 @@ func TestMigration000009_PreservesGraphData(t *testing.T) {
 	}
 }
 
-// TestMigration000009_Down checks the rollback: it restores the old
+// TestMigration000010_Down checks the rollback: it restores the old
 // constraint while keeping data, and refuses (leaving the database
 // unchanged) when two users share an entity name under one agent.
-func TestMigration000009_Down(t *testing.T) {
+func TestMigration000010_Down(t *testing.T) {
 	ctx := context.Background()
 	db := openMigrationTestDB(t, true)
 	migrator, err := NewMigrator(db, observability.NewNoOpTracer())
 	require.NoError(t, err)
-	migrateTo(t, migrator, 9)
+	migrateTo(t, migrator, 10)
 
 	store := NewGraphMemoryStore(db, &mockTokenCounter{}, observability.NewNoOpTracer())
 	alice := seedUser(t, store, "alice", "Mom birthday is in May")
@@ -729,7 +729,7 @@ func TestMigration000009_Down(t *testing.T) {
 	require.Error(t, migrator.MigrateDown(ctx, 1))
 	version, err := migrator.CurrentVersion(ctx)
 	require.NoError(t, err)
-	assert.Equal(t, 9, version)
+	assert.Equal(t, 10, version)
 	_, err = store.GetEntity(bob.ctx, isoAgent, "mom")
 	require.NoError(t, err)
 	edges, err := store.ListEdgesFrom(bob.ctx, bob.mom.ID)
@@ -742,7 +742,7 @@ func TestMigration000009_Down(t *testing.T) {
 	require.NoError(t, migrator.MigrateDown(ctx, 1))
 	version, err = migrator.CurrentVersion(ctx)
 	require.NoError(t, err)
-	assert.Equal(t, 8, version)
+	assert.Equal(t, 9, version)
 
 	edges, err = store.ListEdgesFrom(alice.ctx, alice.mom.ID)
 	require.NoError(t, err)

@@ -12,7 +12,9 @@
 -- See the License for the specific language governing permissions and
 -- limitations under the License.
 
--- 000009_graph_entities_per_user.up.sql
+-- 000010_graph_entities_per_user.up.sql
+-- (Shipped first as 000009; upstream took 9 for task_created_via. The
+-- migrator's renumberedMigrations moves databases that recorded it as 9.)
 -- Graph memory is scoped per user: several people can share one agent, and
 -- each may have their own entity with the same name (e.g. "mom"). Entity
 -- uniqueness changes from UNIQUE(agent_id, name) to

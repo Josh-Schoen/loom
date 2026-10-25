@@ -16,6 +16,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **SQLite migration 9 matches upstream.** The per-user graph memory migration shipped as `000009_graph_entities_per_user`; upstream's 9 is `000009_task_created_via`. The graph migration is now `000010`, `task_created_via` is added as 9, and on startup the migrator moves a database that recorded the graph migration as 9 to 10 (without running it again) and applies `task_created_via`, in one transaction (`renumberedMigrations` in `pkg/storage/sqlite/migrator.go`). Earlier builds still open a database after the move. PostgreSQL has the same clash (`000024`) and is not changed here.
+
 - **Token counting no longer downloads its encoding.** `pkg/agent`'s token counter fetched `cl100k_base` from `openaipublic.blob.core.windows.net` on first use; without network access it fell back to a characters/4 estimate for the life of the process (and the `TestBaseline_*` token tests failed). It now loads the encoding bundled by `github.com/pkoukk/tiktoken-go-loader` (MIT; its `cl100k_base.tiktoken` has the SHA-256 OpenAI's tiktoken verifies). The binary grows by about 7 MB.
 
 - **Hot-reloaded agents keep their own models.** The agent hot-reload path in `looms serve` built the reloaded agent on the server's default provider, dropping its `llm`, `compressor_llm` and `classifier_llm`, and wrapped the shared default provider in another `InstrumentedProvider` on every reload (written from the watcher goroutine). Startup and reload now share `buildAgentLLMs`, and the shared provider is no longer changed.
