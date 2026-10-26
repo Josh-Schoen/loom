@@ -345,6 +345,13 @@ type LLMConfig struct {
 	// rejected with RESOURCE_EXHAUSTED. 0 = unbounded queueing.
 	MaxDoorQueue int `mapstructure:"max_door_queue"`
 
+	// ChatGPT-specific (provider "chatgpt": a ChatGPT plan, signed in with
+	// 'looms chatgpt login'; see docs/reference/llm-chatgpt.md)
+	ChatGPTModel           string `mapstructure:"chatgpt_model"`            // a slug from 'looms chatgpt models'
+	ChatGPTCredentialsFile string `mapstructure:"chatgpt_credentials_file"` // default $LOOM_DATA_DIR/chatgpt.json
+	ChatGPTUserID          string `mapstructure:"chatgpt_user_id"`          // the loom user the plan belongs to
+	ChatGPTReasoningEffort string `mapstructure:"chatgpt_reasoning_effort"` // reasoning.effort; "" leaves it out
+
 	// Ollama-specific
 	OllamaEndpoint string `mapstructure:"ollama_endpoint"`
 	OllamaModel    string `mapstructure:"ollama_model"`
@@ -1177,6 +1184,10 @@ func setDefaults() {
 	viper.SetDefault("llm.bedrock_model_id", "us.anthropic.claude-sonnet-4-5-20250929-v1:0") // Cross-region inference profile
 	viper.SetDefault("llm.ollama_endpoint", "http://localhost:11434")
 	viper.SetDefault("llm.ollama_model", "llama3.1:8b")
+	viper.SetDefault("llm.chatgpt_model", "")
+	viper.SetDefault("llm.chatgpt_credentials_file", "")
+	viper.SetDefault("llm.chatgpt_user_id", "")
+	viper.SetDefault("llm.chatgpt_reasoning_effort", "")
 	viper.SetDefault("llm.openai_model", "gpt-4.1")
 	viper.SetDefault("llm.azure_openai_endpoint", "")
 	viper.SetDefault("llm.azure_openai_deployment_id", "")
@@ -1700,8 +1711,13 @@ func (c *Config) Validate() error {
 	case "litellm":
 		// endpoint and API key are optional — defaults apply
 
+	case "chatgpt":
+		if c.LLM.ChatGPTModel == "" {
+			return fmt.Errorf("chatgpt model is required (set llm.chatgpt_model to a slug from 'looms chatgpt models')")
+		}
+
 	default:
-		return fmt.Errorf("unsupported LLM provider: %s (must be anthropic, bedrock, ollama, openai, azure-openai, mistral, gemini, huggingface, or litellm)", c.LLM.Provider)
+		return fmt.Errorf("unsupported LLM provider: %s (must be anthropic, bedrock, ollama, openai, azure-openai, mistral, gemini, huggingface, litellm, or chatgpt)", c.LLM.Provider)
 	}
 
 	// Door admission knobs: a negative value is a configuration error, not a

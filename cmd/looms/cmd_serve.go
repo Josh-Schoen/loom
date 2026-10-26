@@ -719,6 +719,9 @@ func createProviderWithRateLimit(cfg LLMConfig, logger *zap.Logger) (agent.LLMPr
 			RateLimiterConfig: rlCfg,
 		}), nil
 
+	case "chatgpt":
+		return newChatGPTProvider(cfg, "")
+
 	case "huggingface":
 		key := apiKey(cfg.HuggingFaceToken, "HUGGINGFACE_API_KEY")
 		if key == "" {
@@ -819,6 +822,8 @@ func getDefaultModelForProvider(cfg *Config) string {
 			return cfg.LLM.GeminiModel
 		}
 		return "gemini-3-flash-preview"
+	case "chatgpt":
+		return cfg.LLM.ChatGPTModel
 	case "huggingface":
 		if cfg.LLM.HuggingFaceModel != "" {
 			return cfg.LLM.HuggingFaceModel
@@ -999,6 +1004,9 @@ func createLLMProviderFromProtoConfig(protoConfig *loomv1.LLMConfig, serverConfi
 			Timeout:           timeout,
 			RateLimiterConfig: rlCfg,
 		}), nil
+
+	case "chatgpt":
+		return newChatGPTProvider(serverConfig.LLM, protoConfig.Model)
 
 	case "huggingface":
 		model := protoConfig.Model
