@@ -2757,28 +2757,13 @@ func (a *Agent) runConversationLoop(ctx Context) (*Response, error) {
 			}
 		}
 
-		// withReminder appends the transient tail — the turn's soft reminder —
-		// as one trailing message on a copy: transient, past every cache
-		// breakpoint, never stored, carried by both the normal send and the
-		// recovery resend. The request context (WeaveRequest.context, e.g. the
-		// caller's local time) is applied first, transient on every call of the
-		// turn as well.
+		// withReminder appends the transient tail, the request context
+		// (WeaveRequest.context) and the turn's soft reminder, as one trailing
+		// <system-reminder> user message on a copy (withTransientTail):
+		// transient, past every cache breakpoint, never stored, carried by
+		// both the normal send and the recovery resend.
 		withReminder := func(msgs []Message) []Message {
-			msgs = withRequestContext(ctx, msgs)
-			tail := strings.TrimSpace(softReminder)
-			if tail == "" {
-				return msgs
-			}
-			out := make([]Message, len(msgs), len(msgs)+1)
-			copy(out, msgs)
-			// USER role, never system: gateways fold trailing system-role
-			// messages into the Anthropic system parameter at the HEAD of the
-			// request, where this mutating block would invalidate every cache
-			// segment on every call. A trailing user message stays in place —
-			// after the till-NOW breakpoint, outside every cached segment.
-			// The reminder tag marks it as harness state, not a user ask.
-			return append(out, Message{Role: "user",
-				Content: "<system-reminder>\n" + tail + "\n</system-reminder>"})
+			return withTransientTail(ctx, msgs, softReminder)
 		}
 
 		// Call LLM. Relief is proactive (above) — loom keeps the context under its
@@ -3538,14 +3523,14 @@ func (a *Agent) synthesizeFinalResponse(ctx Context, session *Session, turnCount
 				zap.Int("target_tokens", target))
 		}
 	}
-	finalResp, err := a.chatWithRetry(ctx, withRequestContext(ctx, session.GetMessages()), nil)
+	finalResp, err := a.chatWithRetry(ctx, withTransientTail(ctx, session.GetMessages(), ""), nil)
 	if err != nil && errors.Is(err, llm.ErrContextTooLong) && segMem != nil {
 		_, estimate, target := segMem.ReleasePressure(ctx, pressureRecoveryPenalty)
 		zap.L().Info("context too long at synthesis: relief pass complete, resending once",
 			zap.String("session_id", session.ID),
 			zap.Int("estimate_tokens", estimate),
 			zap.Int("target_tokens", target))
-		finalResp, err = a.chatWithRetry(ctx, withRequestContext(ctx, session.GetMessages()), nil)
+		finalResp, err = a.chatWithRetry(ctx, withTransientTail(ctx, session.GetMessages(), ""), nil)
 	}
 	if err == nil {
 		a.observePromptUsage(session, finalResp.Usage)

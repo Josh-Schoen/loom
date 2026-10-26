@@ -19,6 +19,8 @@ import (
 	"sort"
 	"strings"
 	"unicode/utf8"
+
+	"github.com/teradata-labs/loom/pkg/types"
 )
 
 // Request context: facts the caller sends with one request that the model
@@ -90,15 +92,31 @@ func oneLine(s string, max int) string {
 	return s
 }
 
-// withRequestContext returns msgs with the request context note from ctx
-// appended as a trailing system message (a copy; msgs is not changed), or
-// msgs itself when there is none.
-func withRequestContext(ctx context.Context, msgs []Message) []Message {
-	note := requestContextNoteFromContext(ctx)
-	if note == "" {
+// withTransientTail returns msgs with this call's transient notes, the
+// request context (WeaveRequest.context, e.g. the caller's local time) and
+// the turn's soft reminder, appended as one trailing user message wrapped in
+// <system-reminder> tags (a copy; msgs is not changed), or msgs itself when
+// there are none.
+//
+// USER role, never system: providers fold system-role messages into the
+// system prompt at the HEAD of the request (Anthropic's "system" field),
+// where a note that changes with every request would invalidate every
+// cached segment after it. A trailing user message stays in place, after
+// the last cache breakpoint. The tag marks it as harness state, not a user
+// ask.
+func withTransientTail(ctx context.Context, msgs []Message, softReminder string) []Message {
+	var parts []string
+	if note := requestContextNoteFromContext(ctx); note != "" {
+		parts = append(parts, note)
+	}
+	if r := strings.TrimSpace(softReminder); r != "" {
+		parts = append(parts, r)
+	}
+	if len(parts) == 0 {
 		return msgs
 	}
 	out := make([]Message, len(msgs), len(msgs)+1)
 	copy(out, msgs)
-	return append(out, Message{Role: "system", Content: note})
+	return append(out, Message{Role: "user",
+		Content: types.SystemReminderOpen + "\n" + strings.Join(parts, "\n\n") + "\n" + types.SystemReminderClose})
 }

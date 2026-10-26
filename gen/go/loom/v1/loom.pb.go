@@ -290,7 +290,9 @@ type WeaveRequest struct {
 	TimeoutSeconds int32 `protobuf:"varint,5,opt,name=timeout_seconds,json=timeoutSeconds,proto3" json:"timeout_seconds,omitempty"`
 	// Facts the agent should know for this request only, such as the
 	// client's local time and time zone (e.g. local_time, time_zone). Shown
-	// to the model as a system note on every LLM call of this turn; never
+	// to the model as a trailing <system-reminder> note, after the
+	// conversation so the prompt cache stays valid, on every LLM call of
+	// this turn; never
 	// stored in the session or returned in conversation history. At most 16
 	// entries are used (in key order); keys are cut to 64 and values to 256
 	// characters, each on one line.

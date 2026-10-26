@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`WeaveRequest.context` keeps the prompt cache valid.** The request-context note (e.g. the caller's local time) was a trailing system message; the Anthropic client moves system messages into the system prompt at the head of the request, so a note that changed with every request kept the conversation from being read from the prompt cache. It is now part of the turn's trailing `<system-reminder>` user message (with the soft reminder), after every cache breakpoint. `types.IsSystemReminder` recognizes such notes; the scripted provider skips them when finding the newest turn.
+
 ### Added
 
 #### HITL park: tools other than `contact_human` can park as questions

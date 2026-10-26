@@ -565,15 +565,17 @@ message WeaveRequest {
 **`context` (per-request facts):** key/value facts the model should know for
 this request only, such as a phone app's `local_time`
 (`2026-10-18T07:05:00-05:00`) and `time_zone` (`America/Chicago`), so "tomorrow
-at 5pm" resolves in the person's time zone. The agent adds them as a system
-note ("Context sent with this message ...") to every LLM call of the turn,
-after the conversation; they are never added to the session, persisted, or
-returned by `GetConversationHistory`. At most 16 entries are used (in key
-order); keys are cut to 64 and values to 256 characters, line breaks become
-spaces. On Anthropic the note becomes the last system block: the tools and
-system prompt before it stay cacheable, but conversation messages after it are
-not read from the prompt cache on calls that carry a different note (the
-graph memory recall note behaves the same way).
+at 5pm" resolves in the person's time zone. The agent adds them as a note
+("Context sent with this message ...") to every LLM call of the turn, after
+the conversation: one trailing user-role message wrapped in
+`<system-reminder>` tags, shared with the turn's soft reminder when there is
+one. They are never added to the session, persisted, or returned by
+`GetConversationHistory`. At most 16 entries are used (in key order); keys are
+cut to 64 and values to 256 characters, line breaks become spaces. Because the
+note is the last thing in the request, after every cache breakpoint, a note
+that changes on every request (the local time does) leaves the tools, system
+prompt and conversation readable from the prompt cache. (The graph memory
+recall note is still a system message and does not have this property.)
 
 **`occurred_at` (replay/import only):** when set, every message persisted
 during the call — user turn, assistant reply, tool rows — carries this

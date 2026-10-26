@@ -35,3 +35,7 @@ var (
 	WithToolInputProgress   = types.WithToolInputProgress
 	NotifyToolInputProgress = types.NotifyToolInputProgress
 )
+
+// IsSystemReminder reports whether a message is a transient
+// <system-reminder> note rather than a turn. See types.IsSystemReminder.
+var IsSystemReminder = types.IsSystemReminder

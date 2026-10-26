@@ -361,7 +361,7 @@ message WeaveRequest {
   map<string, string> backend_config = 3; // Optional: backend configuration overrides
   int32 max_rounds = 4;                // Optional: maximum execution rounds (default: 3)
   int32 timeout_seconds = 5;           // Optional: timeout in seconds (default: 300)
-  map<string, string> context = 6;     // Optional: facts for this request only (e.g. local_time, time_zone), shown to the model as a system note
+  map<string, string> context = 6;     // Optional: facts for this request only (e.g. local_time, time_zone), shown to the model as a trailing note
   string force_pattern = 7;            // Optional: force specific pattern (bypass selection)
   bool enable_trace = 8;               // Optional: enable tracing for this request
   string agent_id = 9;                 // Optional: agent to route to (default agent if empty)
