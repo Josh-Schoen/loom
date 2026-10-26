@@ -568,14 +568,15 @@ this request only, such as a phone app's `local_time`
 at 5pm" resolves in the person's time zone. The agent adds them as a note
 ("Context sent with this message ...") to every LLM call of the turn, after
 the conversation: one trailing user-role message wrapped in
-`<system-reminder>` tags, shared with the turn's soft reminder when there is
-one. They are never added to the session, persisted, or returned by
+`<system-reminder>` tags, shared with the turn's graph memory recall note and
+soft reminder when there are any. They are never added to the session, persisted, or returned by
 `GetConversationHistory`. At most 16 entries are used (in key order); keys are
 cut to 64 and values to 256 characters, line breaks become spaces. Because the
 note is the last thing in the request, after every cache breakpoint, a note
 that changes on every request (the local time does) leaves the tools, system
-prompt and conversation readable from the prompt cache. (The graph memory
-recall note is still a system message and does not have this property.)
+prompt and conversation readable from the prompt cache. The graph memory
+recall note (`[Graph Memory Context]`), which follows each user message, rides
+the same note for the same reason and is likewise never stored.
 
 **`occurred_at` (replay/import only):** when set, every message persisted
 during the call — user turn, assistant reply, tool rows — carries this
