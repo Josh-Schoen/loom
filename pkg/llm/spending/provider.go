@@ -22,11 +22,38 @@ import (
 )
 
 // Provider puts an LLM provider behind a Ledger: each call is refused with a
-// *LimitError when the limit is reached (unless its turn was admitted), and
-// the cost of each call that returns a response is recorded.
+// *LimitError when the limit is reached (unless its turn was admitted, or the
+// provider costs nothing), and the cost of each call that returns a response
+// is recorded.
 type Provider struct {
 	inner  llmtypes.LLMProvider
 	ledger *Ledger
+	// free is IsFree(inner): its calls run whatever the month's total.
+	free bool
+}
+
+// costFree is implemented by providers whose calls cost nothing, such as a
+// model on the server's own computer (ollama.Client).
+type costFree interface {
+	CostsNothing() bool
+}
+
+// IsFree reports whether p, or a provider in its wrapper chain, costs
+// nothing to call. The monthly limit does not apply to such a provider: it
+// adds nothing to the total, so refusing it would stop work that costs
+// nothing.
+func IsFree(p llmtypes.LLMProvider) bool {
+	for cur := p; cur != nil; {
+		if f, ok := cur.(costFree); ok {
+			return f.CostsNothing()
+		}
+		u, ok := cur.(unwrapper)
+		if !ok {
+			return false
+		}
+		cur = u.Unwrap()
+	}
+	return false
 }
 
 // unwrapper is implemented by provider wrappers (llm.InstrumentedProvider,
@@ -52,7 +79,7 @@ func Wrap(p llmtypes.LLMProvider, ledger *Ledger) llmtypes.LLMProvider {
 		}
 		cur = u.Unwrap()
 	}
-	return &Provider{inner: p, ledger: ledger}
+	return &Provider{inner: p, ledger: ledger, free: IsFree(p)}
 }
 
 // Name returns the wrapped provider's name.
@@ -64,9 +91,13 @@ func (p *Provider) Model() string { return p.inner.Model() }
 // Unwrap returns the wrapped provider.
 func (p *Provider) Unwrap() llmtypes.LLMProvider { return p.inner }
 
-// Chat runs one call when the ledger allows it and records its cost.
+// Chat runs one call when the ledger allows it and records its cost. A call
+// the limit refuses goes to the ledger's fallback, when it has one.
 func (p *Provider) Chat(ctx context.Context, messages []llmtypes.Message, tools []shuttle.Tool) (*llmtypes.LLMResponse, error) {
-	if err := p.ledger.allow(ctx); err != nil {
+	if err := p.allow(ctx); err != nil {
+		if fb := p.ledger.fallbackProvider(); fb != nil {
+			return fb.Chat(ctx, messages, tools)
+		}
 		return nil, err
 	}
 	resp, err := p.inner.Chat(ctx, messages, tools)
@@ -75,21 +106,29 @@ func (p *Provider) Chat(ctx context.Context, messages []llmtypes.Message, tools 
 }
 
 // ChatStream streams when the wrapped provider can, and otherwise answers
-// with Chat; either way the ledger is checked first and the cost recorded.
+// with Chat; either way the ledger is checked first and the cost recorded. A
+// call the limit refuses goes to the ledger's fallback, when it has one.
 func (p *Provider) ChatStream(ctx context.Context, messages []llmtypes.Message, tools []shuttle.Tool, tokenCallback llmtypes.TokenCallback) (*llmtypes.LLMResponse, error) {
-	if err := p.ledger.allow(ctx); err != nil {
-		return nil, err
+	target := p.inner
+	if err := p.allow(ctx); err != nil {
+		fb := p.ledger.fallbackProvider()
+		if fb == nil {
+			return nil, err
+		}
+		target = fb
 	}
 	var (
 		resp *llmtypes.LLMResponse
 		err  error
 	)
-	if sp, ok := p.inner.(llmtypes.StreamingLLMProvider); ok {
+	if sp, ok := target.(llmtypes.StreamingLLMProvider); ok {
 		resp, err = sp.ChatStream(ctx, messages, tools, tokenCallback)
 	} else {
-		resp, err = p.inner.Chat(ctx, messages, tools)
+		resp, err = target.Chat(ctx, messages, tools)
 	}
-	p.record(resp)
+	if target == p.inner {
+		p.record(resp)
+	}
 	return resp, err
 }
 
@@ -111,6 +150,15 @@ func (p *Provider) SchedulerScope() string {
 		return sp.SchedulerScope()
 	}
 	return ""
+}
+
+// allow reports whether a call with ctx may run: always for a provider that
+// costs nothing, otherwise as the ledger says.
+func (p *Provider) allow(ctx context.Context) error {
+	if p.free {
+		return nil
+	}
+	return p.ledger.allow(ctx)
 }
 
 func (p *Provider) record(resp *llmtypes.LLMResponse) {

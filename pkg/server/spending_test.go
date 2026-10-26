@@ -26,20 +26,24 @@ import (
 	"github.com/teradata-labs/loom/pkg/llm/spending"
 )
 
-// Over the monthly limit, a new turn is refused before any agent runs, with
+// Over the monthly limit, a new turn is refused before its agent runs, with
 // RESOURCE_EXHAUSTED and the limit in words.
 func TestWeaveRefusedOverSpendingLimit(t *testing.T) {
 	ledger, err := spending.Open(filepath.Join(t.TempDir(), "spending.json"), 1.0)
 	require.NoError(t, err)
-	srv := NewMultiAgentServer(map[string]*agent.Agent{}, nil)
+	llm := &mockLLMProvider{responses: []string{"hello"}}
+	ag := agent.NewAgent(&mockBackend{}, spending.Wrap(llm, ledger))
+	srv := NewMultiAgentServer(map[string]*agent.Agent{"agent1": ag}, nil)
 	srv.SetSpendingLedger(ledger)
 
-	// Under the limit the turn is admitted (it then fails for want of an
-	// agent, which is not a spending refusal).
+	// Under the limit the turn runs.
 	_, err = srv.Weave(context.Background(), &loomv1.WeaveRequest{Query: "hi"})
-	assert.NotEqual(t, codes.ResourceExhausted, status.Code(err))
+	require.NoError(t, err)
 
 	require.NoError(t, ledger.Record(1.25))
+	llm.mu.Lock()
+	llm.currentIdx = 0
+	llm.mu.Unlock()
 	_, err = srv.Weave(context.Background(), &loomv1.WeaveRequest{Query: "hi"})
 	require.Equal(t, codes.ResourceExhausted, status.Code(err), "err: %v", err)
 	assert.Contains(t, status.Convert(err).Message(), "limit of $1.00")
@@ -49,6 +53,28 @@ func TestWeaveRefusedOverSpendingLimit(t *testing.T) {
 	srv.SetSpendingLedger(nil)
 	_, err = srv.Weave(context.Background(), &loomv1.WeaveRequest{Query: "hi"})
 	assert.NotEqual(t, codes.ResourceExhausted, status.Code(err))
+}
+
+// freeLLM is a provider that costs nothing to call, like a local Ollama
+// model.
+type freeLLM struct{ *mockLLMProvider }
+
+func (freeLLM) CostsNothing() bool { return true }
+
+// Over the monthly limit, an agent that answers with a provider that costs
+// nothing still answers: the limit is for what the AI account charges.
+func TestWeaveFreeProviderRunsOverSpendingLimit(t *testing.T) {
+	ledger, err := spending.Open(filepath.Join(t.TempDir(), "spending.json"), 1.0)
+	require.NoError(t, err)
+	require.NoError(t, ledger.Record(1.25))
+	llm := freeLLM{&mockLLMProvider{responses: []string{"hello from this computer"}}}
+	ag := agent.NewAgent(&mockBackend{}, spending.Wrap(llm, ledger))
+	srv := NewMultiAgentServer(map[string]*agent.Agent{"agent1": ag}, nil)
+	srv.SetSpendingLedger(ledger)
+
+	resp, err := srv.Weave(context.Background(), &loomv1.WeaveRequest{Query: "hi"})
+	require.NoError(t, err)
+	assert.Contains(t, resp.GetText(), "hello from this computer")
 }
 
 // Over the limit, /v1/weave:stream answers with an error frame that names

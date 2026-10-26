@@ -1490,6 +1490,23 @@ func runServe(cmd *cobra.Command, args []string) {
 		logger.Fatal("Failed to open the spending ledger", zap.Error(err))
 	}
 	guardLLM := func(p agent.LLMProvider) agent.LLMProvider { return spending.Wrap(p, spendingLedger) }
+	// server.spending.fallback_ollama_model: over the limit, the model on
+	// this computer answers instead of turns being refused.
+	if model := config.Server.Spending.FallbackOllamaModel; model != "" {
+		fbConfig := config.LLM
+		fbConfig.Provider, fbConfig.OllamaModel = "ollama", model
+		fallback, err := createProviderWithRateLimit(fbConfig, logger)
+		if err != nil {
+			logger.Fatal("Failed to create the spending fallback", zap.String("model", model), zap.Error(err))
+		}
+		if tracer != nil {
+			fallback = llm.NewInstrumentedProvider(fallback, tracer)
+		}
+		if err := spendingLedger.SetFallback(fallback); err != nil {
+			logger.Fatal("Failed to set the spending fallback", zap.Error(err))
+		}
+		logger.Info("Spending fallback enabled", zap.String("provider", "ollama"), zap.String("model", model))
+	}
 	llmProvider = guardLLM(llmProvider)
 	if st := spendingLedger.Status(); st.LimitUSD > 0 {
 		logger.Info("Monthly spending limit enabled",

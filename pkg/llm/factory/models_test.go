@@ -15,12 +15,13 @@ func TestModelRegistry_GetModelsForProvider(t *testing.T) {
 
 	// Counts updated 2026-04-22 after refreshing the built-in catalog to current
 	// provider offerings (added Opus 4.7, GPT-5.x ladder, Gemini 3.x previews,
-	// new Mistral dated IDs, llama4/gemma4/phi4-mini/qwen3.5).
+	// new Mistral dated IDs, llama4/gemma4/phi4-mini/qwen3.5), then for Claude
+	// Opus 5.5 and Haiku 5.5 (added with the monthly spending limit).
 	tests := []struct {
 		provider      string
 		expectedCount int
 	}{
-		{"anthropic", 7},
+		{"anthropic", 9},
 		{"openai", 16},
 		{"gemini", 7},
 		{"bedrock", 8},
@@ -55,8 +56,8 @@ func TestModelRegistry_GetModelsForProvider_HuggingFaceRemoved(t *testing.T) {
 func TestModelRegistry_GetAllModels_TotalCount(t *testing.T) {
 	reg := NewModelRegistry()
 	all := reg.GetAllModels()
-	// anthropic(7) + openai(16) + gemini(7) + bedrock(8) + ollama(14) + mistral(13) + azure-openai(8) = 73
-	assert.Len(t, all, 73)
+	// anthropic(9) + openai(16) + gemini(7) + bedrock(8) + ollama(14) + mistral(13) + azure-openai(8) = 75
+	assert.Len(t, all, 75)
 }
 
 func TestModelRegistry_NewFields(t *testing.T) {

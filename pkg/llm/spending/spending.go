@@ -17,7 +17,10 @@
 // for the current calendar month and saves it to a file; Wrap puts a provider
 // behind it. Once the month's total reaches the limit, new turns are refused
 // (Admit) and calls outside an admitted turn fail with a *LimitError, until
-// the month changes or the limit is raised.
+// the month changes or the limit is raised. Providers that cost nothing (see
+// IsFree), such as a model on the server's own computer, are never refused.
+// With a fallback (SetFallback), refused calls are answered by it instead, so
+// the server keeps answering past the limit at no cost.
 //
 // A turn admitted while under the limit runs to the end, so the total can
 // pass the limit by the cost of the turns in progress when it was reached.
@@ -34,6 +37,8 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+
+	llmtypes "github.com/teradata-labs/loom/pkg/llm/types"
 )
 
 // ErrLimitReached is matched (errors.Is) by every *LimitError.
@@ -65,6 +70,9 @@ type Status struct {
 	LimitUSD float64 `json:"limit_usd"`
 	// Reached is true when there is a limit and SpentUSD is at or over it.
 	Reached bool `json:"reached"`
+	// FallingBack is true when Reached and a fallback answers the calls the
+	// limit refuses (SetFallback).
+	FallingBack bool `json:"falling_back"`
 }
 
 // Ledger adds up this month's spending. Safe for concurrent use.
@@ -75,6 +83,8 @@ type Ledger struct {
 	now   func() time.Time
 	month string
 	spent float64
+	// fallback answers calls refused over the limit; nil means none.
+	fallback llmtypes.LLMProvider
 }
 
 // Open loads the ledger saved at path (a missing file starts at zero) with
@@ -122,12 +132,39 @@ func (l *Ledger) rollLocked() {
 }
 
 func (l *Ledger) statusLocked() Status {
+	reached := l.limit > 0 && l.spent >= l.limit
 	return Status{
-		Month:    l.month,
-		SpentUSD: l.spent,
-		LimitUSD: l.limit,
-		Reached:  l.limit > 0 && l.spent >= l.limit,
+		Month:       l.month,
+		SpentUSD:    l.spent,
+		LimitUSD:    l.limit,
+		Reached:     reached,
+		FallingBack: reached && l.fallback != nil,
 	}
+}
+
+// ErrFallbackNotFree is returned by SetFallback for a provider that is not
+// free (IsFree): a paid fallback would spend past the limit.
+var ErrFallbackNotFree = errors.New("the spending fallback must be a provider that costs nothing")
+
+// SetFallback makes p answer the calls the limit refuses, so turns keep
+// running past the limit instead of being refused. p must cost nothing
+// (IsFree), or ErrFallbackNotFree is returned. nil removes the fallback.
+// The new status is saved.
+func (l *Ledger) SetFallback(p llmtypes.LLMProvider) error {
+	if p != nil && !IsFree(p) {
+		return ErrFallbackNotFree
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.fallback = p
+	return l.saveLocked()
+}
+
+// fallbackProvider returns the fallback, or nil.
+func (l *Ledger) fallbackProvider() llmtypes.LLMProvider {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.fallback
 }
 
 // Status returns this month's total and limit.
@@ -165,12 +202,17 @@ func (l *Ledger) check() error {
 
 // Admit starts a turn: it returns a *LimitError when the limit is reached,
 // and otherwise a context whose LLM calls run even if the limit is reached
-// during the turn, so an answer is not cut off halfway.
+// during the turn, so an answer is not cut off halfway. With a fallback, a
+// turn over the limit is not refused: ctx is returned as it is, so the
+// turn's calls go to the fallback.
 func (l *Ledger) Admit(ctx context.Context) (context.Context, error) {
 	if l == nil {
 		return ctx, nil
 	}
 	if err := l.check(); err != nil {
+		if l.fallbackProvider() != nil {
+			return ctx, nil
+		}
 		return ctx, err
 	}
 	return context.WithValue(ctx, admittedKey{}, true), nil

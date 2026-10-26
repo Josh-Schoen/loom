@@ -7,7 +7,8 @@ weight: 47
 
 A monthly limit on the estimated cost of a `looms serve` process's LLM calls.
 When the month's total reaches the limit, new turns are refused until the
-month changes or the limit is raised.
+month changes or the limit is raised. Providers that cost nothing (local
+Ollama models) are never refused.
 
 **Status**: ✅ Implemented (`pkg/llm/spending`, `looms serve`;
 `MultiAgentServer` Weave and StreamWeave).
@@ -20,6 +21,7 @@ month changes or the limit is raised.
 |------|-------|
 | Setting | `server.spending.monthly_limit_usd` (float, US dollars) |
 | Default | `0` (no limit; the total is still kept) |
+| Fallback | `server.spending.fallback_ollama_model` (string, Ollama model tag; default `""`, none) |
 | Ledger file | `$LOOM_DATA_DIR/spending.json` (mode 0600) |
 | Month | Calendar month in the server's local time zone |
 | Refusal | gRPC `RESOURCE_EXHAUSTED` with `google.rpc.ErrorInfo{reason: "SPENDING_LIMIT_REACHED", domain: "loom"}`; HTTP 429; SSE error frame with `"reason": "SPENDING_LIMIT_REACHED"` |
@@ -47,6 +49,35 @@ month changes or the limit is raised.
 server:
   spending:
     monthly_limit_usd: 20
+```
+
+### server.spending.fallback_ollama_model
+
+**Type**: `string` (an Ollama model tag)
+**Default**: `""` (no fallback)
+**Required**: No
+
+**Behavior**:
+- Set: an Ollama client for this model, at `llm.ollama_endpoint` (else
+  `OLLAMA_ENDPOINT`, else `http://localhost:11434`), is the ledger's fallback
+  (`Ledger.SetFallback`). Over the limit, turns are not refused and every
+  call the limit would refuse is answered by the fallback instead.
+- The fallback is instrumented when tracing is on. Its calls cost nothing
+  and add nothing to the total.
+- `SetFallback` returns `spending.ErrFallbackNotFree` for a provider that is
+  not free, so a fallback can never spend past the limit.
+- Read at startup. Changing it needs a server restart.
+
+**Example**:
+
+```yaml
+server:
+  spending:
+    monthly_limit_usd: 20
+    fallback_ollama_model: gemma4:12b
+llm:
+  provider: anthropic
+  ollama_endpoint: http://127.0.0.1:11534
 ```
 
 ---
@@ -81,9 +112,10 @@ ledger), so a provider shared by several agents is counted once per call.
 
 ### Turns
 
-`Weave` and `StreamWeave` check the ledger after validating the request and
-before running the agent (`MultiAgentServer.admitTurn`). Over the limit they
-return:
+`Weave` and `StreamWeave` check the ledger after resolving the agent and
+before running it (`MultiAgentServer.admitTurn`). Over the limit they
+return the error below, unless the agent's main LLM costs nothing (see
+[Free providers](#free-providers)):
 
 ```
 code: RESOURCE_EXHAUSTED
@@ -120,6 +152,20 @@ background agents) fail with a `*spending.LimitError`
 (`errors.Is(err, spending.ErrLimitReached)`) once the limit is reached.
 Provider health checks are never refused.
 
+### Free providers
+
+A provider that implements `CostsNothing() bool` returning `true`, itself or
+anywhere in its `Unwrap()` chain, is free (`spending.IsFree`). Implemented by
+`ollama.Client`.
+
+- Calls to a free provider are never refused, inside or outside a turn.
+- A turn whose agent's main LLM (`GetLLMForRole(LLM_ROLE_UNSPECIFIED)`) is
+  free runs over the limit. Its context is not admitted, so a paid provider
+  it calls during that turn (a cloud `compressor_llm`, judge or classifier)
+  still fails with `*spending.LimitError`.
+- Free calls still pass through `Record`; they report `CostUSD` 0, so they
+  add nothing.
+
 ---
 
 ## Ledger file
@@ -132,7 +178,8 @@ and at startup:
   "month": "2026-10",
   "spent_usd": 5.2,
   "limit_usd": 50,
-  "reached": false
+  "reached": false,
+  "falling_back": false
 }
 ```
 
@@ -142,6 +189,7 @@ and at startup:
 | `spent_usd` | number | Estimated cost of this month's calls |
 | `limit_usd` | number | The configured limit; `0` means none |
 | `reached` | bool | `limit_usd > 0 && spent_usd >= limit_usd` |
+| `falling_back` | bool | `reached` and a fallback is set: the fallback answers |
 
 A file for an earlier month starts over at 0. Other programs on the server
 machine (a setup app) may read it to show the month's spending; only

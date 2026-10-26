@@ -339,18 +339,24 @@ func (s *MultiAgentServer) SetSpendingLedger(l *spending.Ledger) {
 	s.spending = l
 }
 
-// admitTurn starts a turn under the spending limit: RESOURCE_EXHAUSTED when
-// the month's limit is reached, otherwise a context whose LLM calls finish
-// the turn even if the limit is reached during it.
-func (s *MultiAgentServer) admitTurn(ctx context.Context) (context.Context, error) {
+// admitTurn starts ag's turn under the spending limit: RESOURCE_EXHAUSTED
+// when the month's limit is reached, otherwise a context whose LLM calls
+// finish the turn even if the limit is reached during it. An agent that
+// answers with a provider that costs nothing (spending.IsFree, e.g. a local
+// Ollama model) still runs over the limit; its context is not admitted, so
+// any paid provider it calls during the turn is still refused.
+func (s *MultiAgentServer) admitTurn(ctx context.Context, ag *agent.Agent) (context.Context, error) {
 	s.mu.RLock()
 	ledger := s.spending
 	s.mu.RUnlock()
-	ctx, err := ledger.Admit(ctx)
+	admitted, err := ledger.Admit(ctx)
 	if err != nil {
+		if ag != nil && spending.IsFree(ag.GetLLMForRole(loomv1.LLMRole_LLM_ROLE_UNSPECIFIED)) {
+			return ctx, nil
+		}
 		return ctx, spendingLimitStatus(err)
 	}
-	return ctx, nil
+	return admitted, nil
 }
 
 // SpendingLimitReason is the google.rpc.ErrorInfo reason (domain "loom") on
@@ -924,9 +930,6 @@ func (s *MultiAgentServer) Weave(ctx context.Context, req *loomv1.WeaveRequest) 
 	// Request facts the model sees for this turn only (e.g. the caller's
 	// local time); see agent.WithRequestContext.
 	ctx = agent.WithRequestContext(ctx, req.GetContext())
-	if ctx, err = s.admitTurn(ctx); err != nil {
-		return nil, err
-	}
 
 	// Get agent: if no agent_id specified but session_id is, look up which agent owns the session.
 	// This fixes the bug where Weave(session_id=X) without agent_id falls through to the
@@ -971,6 +974,11 @@ func (s *MultiAgentServer) Weave(ctx context.Context, req *loomv1.WeaveRequest) 
 		if err != nil {
 			return nil, err
 		}
+	}
+	// The spending limit is checked once the agent is known: an agent that
+	// answers with a provider that costs nothing is not stopped by it.
+	if ctx, err = s.admitTurn(ctx, ag); err != nil {
+		return nil, err
 	}
 
 	// Get or create session
@@ -1161,9 +1169,6 @@ func (s *MultiAgentServer) StreamWeave(req *loomv1.WeaveRequest, stream loomv1.L
 	// Request facts the model sees for this turn only (e.g. the caller's
 	// local time); see agent.WithRequestContext.
 	ctx = agent.WithRequestContext(ctx, req.GetContext())
-	if ctx, err = s.admitTurn(ctx); err != nil {
-		return err
-	}
 
 	// Get agent: if no agent_id specified but session_id is, look up which agent owns the session.
 	var ag *agent.Agent
@@ -1204,6 +1209,10 @@ func (s *MultiAgentServer) StreamWeave(req *loomv1.WeaveRequest, stream loomv1.L
 		if err != nil {
 			return err
 		}
+	}
+	// The spending limit is checked once the agent is known (see Weave).
+	if ctx, err = s.admitTurn(ctx, ag); err != nil {
+		return err
 	}
 
 	// Generate session ID if not provided
