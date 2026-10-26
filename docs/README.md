@@ -117,6 +117,7 @@ API specifications and command documentation.
 - **[Mistral](reference/llm-mistral.md)** - Mistral models
 - **[Gemini](reference/llm-gemini.md)** - Google Gemini models
 - **[HuggingFace](reference/llm-huggingface.md)** - HuggingFace Inference API
+- **[ChatGPT plan](reference/llm-chatgpt.md)** - A ChatGPT user's plan via Sign in with ChatGPT (⚠️ Partial)
 
 ### Commands & APIs
 - **[CLI Commands](reference/cli.md)** - Complete `looms` and `loom` command reference

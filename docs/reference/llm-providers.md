@@ -18,6 +18,7 @@ Reference for all supported LLM providers and their configuration.
 - [Mistral AI](#6-mistral-ai) - Open and commercial models
 - [Google Gemini](#7-google-gemini) - Google AI Studio
 - [HuggingFace](#8-huggingface) - Open-source models via the HF Inference API
+- [ChatGPT plan](#chatgpt-plan-partial) - A ChatGPT user's plan via Sign in with ChatGPT (⚠️ Partial)
 
 ### Planned Providers
 - [Google Vertex AI](#9-google-vertex-ai) - GCP integration (Planned)
@@ -50,6 +51,7 @@ Reference for all supported LLM providers and their configuration.
 | **Mistral AI** | ✅ Implemented | Native | 128k-262k | $0.075-$8/1M tokens | Reasoning, code models |
 | **Google Gemini** | ✅ Implemented | Native | 1.05M | $0-$12/1M tokens | Long context, multimodal |
 | **HuggingFace** | ✅ Implemented | Native (model-dependent) | Varies | ~$0.20-$1.00/1M tokens (estimated) | Open-source models |
+| **ChatGPT plan** | ⚠️ Partial (not run against a live account) | Native (function tools) | Varies | The user's ChatGPT plan limits | One person's own requests, no API key |
 | **Google Vertex AI** | 📋 Planned | TBD | TBD | TBD | GCP infrastructure |
 
 ### Authentication Methods
@@ -623,6 +625,21 @@ Any other model on the HF Inference API can be used; unlisted models fall back t
 **Detailed Guide**: [llm-huggingface.md](./llm-huggingface/)
 
 **Reference**: [HuggingFace Inference API](https://huggingface.co/docs/api-inference/index)
+
+### ChatGPT plan (Partial)
+
+**Status**: ⚠️ Partial. Implemented and tested against fake servers; not yet run against a live ChatGPT account.
+
+Provider `chatgpt` answers with a ChatGPT user's plan (OpenAI's Sign in with ChatGPT, plan usage) instead of an API key: `looms chatgpt login` signs in, and requests go to the Responses API with the user's access token. OpenAI's terms allow plan usage only for the signed-in user's own requests, so the provider is bound to one loom user (`llm.chatgpt_user_id`).
+
+```yaml
+llm:
+  provider: chatgpt
+  chatgpt_model: <slug from 'looms chatgpt models'>
+  chatgpt_user_id: sam
+```
+
+**Detailed Guide**: [llm-chatgpt.md](./llm-chatgpt/)
 
 
 ## Planned Providers
