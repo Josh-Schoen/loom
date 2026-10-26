@@ -21,6 +21,7 @@ Ollama models) are never refused.
 |------|-------|
 | Setting | `server.spending.monthly_limit_usd` (float, US dollars) |
 | Default | `0` (no limit; the total is still kept) |
+| Fallback | `server.spending.fallback_ollama_model` (string, Ollama model tag; default `""`, none) |
 | Ledger file | `$LOOM_DATA_DIR/spending.json` (mode 0600) |
 | Month | Calendar month in the server's local time zone |
 | Refusal | gRPC `RESOURCE_EXHAUSTED` with `google.rpc.ErrorInfo{reason: "SPENDING_LIMIT_REACHED", domain: "loom"}`; HTTP 429; SSE error frame with `"reason": "SPENDING_LIMIT_REACHED"` |
@@ -48,6 +49,35 @@ Ollama models) are never refused.
 server:
   spending:
     monthly_limit_usd: 20
+```
+
+### server.spending.fallback_ollama_model
+
+**Type**: `string` (an Ollama model tag)
+**Default**: `""` (no fallback)
+**Required**: No
+
+**Behavior**:
+- Set: an Ollama client for this model, at `llm.ollama_endpoint` (else
+  `OLLAMA_ENDPOINT`, else `http://localhost:11434`), is the ledger's fallback
+  (`Ledger.SetFallback`). Over the limit, turns are not refused and every
+  call the limit would refuse is answered by the fallback instead.
+- The fallback is instrumented when tracing is on. Its calls cost nothing
+  and add nothing to the total.
+- `SetFallback` returns `spending.ErrFallbackNotFree` for a provider that is
+  not free, so a fallback can never spend past the limit.
+- Read at startup. Changing it needs a server restart.
+
+**Example**:
+
+```yaml
+server:
+  spending:
+    monthly_limit_usd: 20
+    fallback_ollama_model: gemma4:12b
+llm:
+  provider: anthropic
+  ollama_endpoint: http://127.0.0.1:11534
 ```
 
 ---
@@ -148,7 +178,8 @@ and at startup:
   "month": "2026-10",
   "spent_usd": 5.2,
   "limit_usd": 50,
-  "reached": false
+  "reached": false,
+  "falling_back": false
 }
 ```
 
@@ -158,6 +189,7 @@ and at startup:
 | `spent_usd` | number | Estimated cost of this month's calls |
 | `limit_usd` | number | The configured limit; `0` means none |
 | `reached` | bool | `limit_usd > 0 && spent_usd >= limit_usd` |
+| `falling_back` | bool | `reached` and a fallback is set: the fallback answers |
 
 A file for an earlier month starts over at 0. Other programs on the server
 machine (a setup app) may read it to show the month's spending; only

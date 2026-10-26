@@ -281,6 +281,12 @@ type SpendingConfig struct {
 	// MonthlyLimitUSD refuses new turns (RESOURCE_EXHAUSTED) once the
 	// month's estimated spending reaches it; 0 means no limit (default: 0)
 	MonthlyLimitUSD float64 `mapstructure:"monthly_limit_usd"`
+
+	// FallbackOllamaModel is an Ollama model (at llm.ollama_endpoint) that
+	// answers once the limit is reached, instead of turns being refused. It
+	// costs nothing, so it does not add to the month's total; "" means no
+	// fallback (default: "")
+	FallbackOllamaModel string `mapstructure:"fallback_ollama_model"`
 }
 
 // DevicePairingConfig enables pairing client devices by QR code or link
@@ -1195,6 +1201,7 @@ func setDefaults() {
 	viper.SetDefault("server.client_tools.default_timeout_seconds", int(clienttools.DefaultTimeout/time.Second))
 	viper.SetDefault("server.client_tools.max_timeout_seconds", int(clienttools.DefaultMaxTimeout/time.Second))
 	viper.SetDefault("server.spending.monthly_limit_usd", 0.0)
+	viper.SetDefault("server.spending.fallback_ollama_model", "")
 	viper.SetDefault("server.device_pairing.enabled", false)
 	viper.SetDefault("server.device_pairing.required", false)
 	viper.SetDefault("server.device_pairing.public_url", "")

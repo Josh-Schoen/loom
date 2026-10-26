@@ -205,3 +205,46 @@ func TestFreeProviderRunsOverLimit(t *testing.T) {
 	assert.ErrorIs(t, err, ErrLimitReached)
 	assert.Zero(t, paid.calls)
 }
+
+// With a fallback, over the limit turns are not refused and paid calls are
+// answered by the fallback; under the limit the paid provider answers.
+func TestFallbackAnswersOverLimit(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "spending.json")
+	l, err := Open(path, 1.0)
+	require.NoError(t, err)
+	paid := &fakeProvider{cost: 0.6}
+	assert.ErrorIs(t, l.SetFallback(paid), ErrFallbackNotFree, "a paid fallback would spend past the limit")
+	free := &freeProvider{}
+	require.NoError(t, l.SetFallback(free))
+	p := Wrap(paid, l)
+
+	ctx, err := l.Admit(context.Background())
+	require.NoError(t, err)
+	_, err = p.Chat(ctx, nil, nil)
+	require.NoError(t, err)
+	_, err = p.(llmtypes.StreamingLLMProvider).ChatStream(ctx, nil, nil, nil)
+	require.NoError(t, err)
+	assert.Equal(t, 2, paid.calls, "under the limit the paid provider answers")
+	assert.True(t, l.Status().Reached)
+	assert.True(t, l.Status().FallingBack)
+
+	ctx, err = l.Admit(context.Background())
+	require.NoError(t, err, "over the limit with a fallback the turn runs")
+	_, err = p.Chat(ctx, nil, nil)
+	require.NoError(t, err)
+	_, err = p.(llmtypes.StreamingLLMProvider).ChatStream(ctx, nil, nil, nil)
+	require.NoError(t, err)
+	assert.Equal(t, 2, paid.calls, "over the limit the paid provider is not called")
+	assert.Equal(t, 2, free.calls, "the fallback answers")
+	assert.InDelta(t, 1.2, l.Status().SpentUSD, 1e-9)
+
+	data, err := os.ReadFile(path)
+	require.NoError(t, err)
+	var saved Status
+	require.NoError(t, json.Unmarshal(data, &saved))
+	assert.True(t, saved.FallingBack, "the file says the fallback is answering")
+
+	require.NoError(t, l.SetFallback(nil))
+	_, err = l.Admit(context.Background())
+	assert.ErrorIs(t, err, ErrLimitReached, "without the fallback the limit stops turns again")
+}

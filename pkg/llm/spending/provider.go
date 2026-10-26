@@ -91,9 +91,13 @@ func (p *Provider) Model() string { return p.inner.Model() }
 // Unwrap returns the wrapped provider.
 func (p *Provider) Unwrap() llmtypes.LLMProvider { return p.inner }
 
-// Chat runs one call when the ledger allows it and records its cost.
+// Chat runs one call when the ledger allows it and records its cost. A call
+// the limit refuses goes to the ledger's fallback, when it has one.
 func (p *Provider) Chat(ctx context.Context, messages []llmtypes.Message, tools []shuttle.Tool) (*llmtypes.LLMResponse, error) {
 	if err := p.allow(ctx); err != nil {
+		if fb := p.ledger.fallbackProvider(); fb != nil {
+			return fb.Chat(ctx, messages, tools)
+		}
 		return nil, err
 	}
 	resp, err := p.inner.Chat(ctx, messages, tools)
@@ -102,21 +106,29 @@ func (p *Provider) Chat(ctx context.Context, messages []llmtypes.Message, tools 
 }
 
 // ChatStream streams when the wrapped provider can, and otherwise answers
-// with Chat; either way the ledger is checked first and the cost recorded.
+// with Chat; either way the ledger is checked first and the cost recorded. A
+// call the limit refuses goes to the ledger's fallback, when it has one.
 func (p *Provider) ChatStream(ctx context.Context, messages []llmtypes.Message, tools []shuttle.Tool, tokenCallback llmtypes.TokenCallback) (*llmtypes.LLMResponse, error) {
+	target := p.inner
 	if err := p.allow(ctx); err != nil {
-		return nil, err
+		fb := p.ledger.fallbackProvider()
+		if fb == nil {
+			return nil, err
+		}
+		target = fb
 	}
 	var (
 		resp *llmtypes.LLMResponse
 		err  error
 	)
-	if sp, ok := p.inner.(llmtypes.StreamingLLMProvider); ok {
+	if sp, ok := target.(llmtypes.StreamingLLMProvider); ok {
 		resp, err = sp.ChatStream(ctx, messages, tools, tokenCallback)
 	} else {
-		resp, err = p.inner.Chat(ctx, messages, tools)
+		resp, err = target.Chat(ctx, messages, tools)
 	}
-	p.record(resp)
+	if target == p.inner {
+		p.record(resp)
+	}
 	return resp, err
 }
 
