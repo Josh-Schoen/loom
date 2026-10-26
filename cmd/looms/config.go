@@ -28,6 +28,7 @@ import (
 	"github.com/teradata-labs/loom/pkg/clienttools"
 	loomconfig "github.com/teradata-labs/loom/pkg/config"
 	"github.com/teradata-labs/loom/pkg/llm/scripted"
+	"github.com/teradata-labs/loom/pkg/observability"
 	"github.com/teradata-labs/loom/pkg/shuttle"
 	"github.com/zalando/go-keyring"
 	"gopkg.in/yaml.v3"
@@ -108,6 +109,16 @@ type Config struct {
 
 	// Embedding configures vector embeddings for hybrid semantic memory search.
 	Embedding EmbeddingConfig `mapstructure:"embedding"`
+
+	// SkipEmbeddedAgents disables auto-installation of guide, weaver, and bundled
+	// skills into the agents/skills directories on startup. Set to true for runtime
+	// pods that should only serve the explicitly configured agent(s).
+	SkipEmbeddedAgents bool `mapstructure:"skip_embedded_agents"`
+
+	// PatternsDir is the server-level directory containing pattern YAML files.
+	// Per-agent metadata["patterns_dir"] overrides this; agents fall back to
+	// $LOOM_DATA_DIR/patterns when both are empty.
+	PatternsDir string `mapstructure:"patterns_dir"`
 }
 
 // EmbeddingConfig configures the vector embedding provider for hybrid memory search.
@@ -202,19 +213,25 @@ type TUIConfig struct {
 
 // ServerConfig holds server-specific configuration.
 type ServerConfig struct {
-	Port              int                 `mapstructure:"port"`
-	Host              string              `mapstructure:"host"`
-	HTTPPort          int                 `mapstructure:"http_port"` // HTTP/REST+SSE port (default: 5006, 0=disabled)
-	EnableReflection  bool                `mapstructure:"enable_reflection"`
-	InsecureAdmin     bool                `mapstructure:"insecure_admin"`      // Allow admin endpoints without LOOM_ADMIN_TOKEN (default: false)
-	AllowTimeOverride bool                `mapstructure:"allow_time_override"` // Honor WeaveRequest.occurred_at for replayed/imported conversations (default: false)
-	TLS               TLSConfig           `mapstructure:"tls"`
-	Clarification     ClarificationConfig `mapstructure:"clarification"`  // Clarification question timeouts
-	ClientTools       ClientToolsConfig   `mapstructure:"client_tools"`   // Client-executed tool wait policy
-	DevicePairing     DevicePairingConfig `mapstructure:"device_pairing"` // Pair phones/desktop apps by QR code
-	Spending          SpendingConfig      `mapstructure:"spending"`       // Monthly limit on estimated AI spending
-	CORS              CORSServerConfig    `mapstructure:"cors"`           // CORS configuration for HTTP endpoints
-	Auth              AuthConfig          `mapstructure:"auth"`           // Endpoint authentication (Supabase JWT)
+	Port              int    `mapstructure:"port"`
+	Host              string `mapstructure:"host"`
+	HTTPPort          int    `mapstructure:"http_port"` // HTTP/REST+SSE port (default: 5006, 0=disabled)
+	EnableReflection  bool   `mapstructure:"enable_reflection"`
+	InsecureAdmin     bool   `mapstructure:"insecure_admin"`      // Allow admin endpoints without LOOM_ADMIN_TOKEN (default: false)
+	AllowTimeOverride bool   `mapstructure:"allow_time_override"` // Honor WeaveRequest.occurred_at for replayed/imported conversations (default: false)
+	// AllowAssistantOverride honors WeaveRequest.replay_assistant_message
+	// (generation-free conversation replay — the caller supplies the assistant's
+	// turn verbatim). Separate from allow_time_override so enabling timestamp
+	// anchoring never implicitly accepts caller-supplied assistant content
+	// (default: false).
+	AllowAssistantOverride bool                `mapstructure:"allow_assistant_override"`
+	TLS                    TLSConfig           `mapstructure:"tls"`
+	Clarification          ClarificationConfig `mapstructure:"clarification"`  // Clarification question timeouts
+	ClientTools            ClientToolsConfig   `mapstructure:"client_tools"`   // Client-executed tool wait policy
+	DevicePairing          DevicePairingConfig `mapstructure:"device_pairing"` // Pair phones/desktop apps by QR code
+	Spending               SpendingConfig      `mapstructure:"spending"`       // Monthly limit on estimated AI spending
+	CORS                   CORSServerConfig    `mapstructure:"cors"`           // CORS configuration for HTTP endpoints
+	Auth                   AuthConfig          `mapstructure:"auth"`           // Endpoint authentication (Supabase JWT)
 }
 
 // AuthConfig gates JWT authentication of Loom's gRPC/HTTP endpoints. When
@@ -685,7 +702,7 @@ type ObservabilityConfig struct {
 	// OTel mode — exports to any OTLP HTTP backend (Opik, Jaeger, Tempo, etc.)
 	OTLPEndpoint     string            `mapstructure:"otlp_endpoint"`      // Full OTLP HTTP URL
 	OTLPHeaders      map[string]string `mapstructure:"otlp_headers"`       // e.g. Authorization: Bearer <key>
-	OTLPInsecure     bool              `mapstructure:"otlp_insecure"`      // Skip TLS (local dev only)
+	OTLPInsecure     bool              `mapstructure:"otlp_insecure"`      // Use plaintext HTTP (local dev only)
 	OTLPIncludeSpans []string          `mapstructure:"otlp_include_spans"` // Span name prefixes to export; empty = all
 }
 
@@ -858,6 +875,15 @@ type ToolPermissionsConfig struct {
 	// YOLO mode bypasses all permission prompts (default: false)
 	// Can be enabled via --yolo flag or LOOM_YOLO=true env var
 	YOLO bool `mapstructure:"yolo"`
+
+	// SafeFiles confines the file tools (file_read, file_write, edit_files) to
+	// the workspace — the tool's working directory, the sandbox dir, the loom
+	// data dir and temp. Off by default, for the same reason YOLO permissions
+	// are on by default: an agent works in its own tree and an absolute path
+	// its caller holds is not an escape. Turn it on where the agent is driven
+	// against paths the deployment does not trust.
+	// --safe-files flag, tools.permissions.safe_files, or LOOM_FILE_SAFE_MODE.
+	SafeFiles bool `mapstructure:"safe_files"`
 
 	// AllowedTools is a list of tool names that are always allowed without prompts
 	// Empty list means all tools require approval (if RequireApproval is true)
@@ -1194,6 +1220,9 @@ func setDefaults() {
 	viper.SetDefault("server.enable_reflection", true)
 	viper.SetDefault("server.insecure_admin", false)
 	viper.SetDefault("server.allow_time_override", false)
+	viper.SetDefault("server.allow_assistant_override", false)
+	viper.SetDefault("skip_embedded_agents", false)
+	viper.SetDefault("patterns_dir", "")
 
 	// Clarification defaults
 	viper.SetDefault("server.clarification.rpc_timeout_seconds", 5)
@@ -1896,9 +1925,11 @@ func (c *Config) Validate() error {
 			}
 			// Note: HawkAPIKey is optional - not required for local Hawk installations
 		case "otel":
-			// OTel mode: validate endpoint
-			if c.Observability.OTLPEndpoint == "" {
-				return fmt.Errorf("observability.otlp_endpoint is required when mode=otel")
+			// OTel mode: validate endpoint — also accept the platform env var
+			// injected by AgentOpsCore at deploy time (OTEL_EXPORTER_OTLP_TRACES_ENDPOINT).
+			// cmd_serve.go will apply this override before building the tracer.
+			if c.Observability.OTLPEndpoint == "" && observability.ResolveOTLPEndpointEnv() == "" {
+				return fmt.Errorf("observability.otlp_endpoint is required when mode=otel (set otlp_endpoint, OTEL_EXPORTER_OTLP_TRACES_ENDPOINT, OTEL_EXPORTER_OTLP_ENDPOINT, or LOOM_OTLP_ENDPOINT)")
 			}
 		case "none":
 			// No-op mode: no validation needed
@@ -2000,6 +2031,7 @@ server:
   enable_reflection: true
   # insecure_admin: false  # Set to true to allow admin endpoints without LOOM_ADMIN_TOKEN (NOT recommended for production)
   # allow_time_override: false  # Set to true to honor WeaveRequest.occurred_at (replayed/imported conversations only)
+  # allow_assistant_override: false  # Set to true to honor WeaveRequest.replay_assistant_message (generation-free conversation replay only)
 
 llm:
   # Provider options: anthropic, bedrock, ollama, openai, azure-openai, mistral

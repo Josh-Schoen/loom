@@ -3,7 +3,7 @@
 -- Licensed under the Apache License, Version 2.0 (the "License");
 -- you may not use this file except in compliance with the License.
 
--- 000024_graph_entities_per_user.up.sql
+-- 000025_graph_entities_per_user.up.sql
 -- Graph memory is scoped per user: several people can share one agent, and
 -- each may have their own entity with the same name (e.g. "mom"). RLS already
 -- hides other users' rows, but UNIQUE(agent_id, name) still made the second

@@ -151,8 +151,9 @@ func builtinToolsToSuppress() []string {
 			"shared_memory_write",
 			"top_n_query",
 			"group_by_query",
-			// Orchestration tool registered per-session by MultiAgentServer.Weave.
-			"manage_ephemeral_agents",
+			// manage_ephemeral_agents is intentionally NOT suppressed here: it is a
+			// per-session opt-in tool (agent declares it in spec.tools). Suppressing
+			// it under tools.none would silently break agents that explicitly request it.
 		)
 	}
 	return suppressed
@@ -388,6 +389,7 @@ type registrySubsystemSink interface {
 	SetTaskManager(manager *task.Manager, decomposer *task.Decomposer)
 	SetGraphMemoryStore(store memory.GraphMemoryStore, embedder memory.Embedder)
 	SetSuppressedBuiltinTools(names []string)
+	GraphMemoryEnabledFor(nameOrID string) bool
 }
 
 // resolveJudgeFallback picks the judge's fallback LLM: the pool's active
@@ -432,6 +434,13 @@ func wireRegistrySubsystems(
 		reg.SetGraphMemoryStore(graphMemoryStore, memoryEmbedder)
 		logger.Info("Graph memory store injected into agent registry",
 			zap.Bool("embedder_present", memoryEmbedder != nil))
+		if taskManager != nil {
+			// The task manager is server-wide; graph memory is opted out per
+			// agent. Route its completion-memory writes through the registry's
+			// per-agent view so `graph_memory.enabled: false` is honored.
+			taskManager.SetGraphMemoryPolicy(reg.GraphMemoryEnabledFor)
+			logger.Info("Task-completion memory gated on per-agent graph memory setting")
+		}
 	}
 	if len(suppressed) > 0 {
 		reg.SetSuppressedBuiltinTools(suppressed)
@@ -531,6 +540,22 @@ func inheritCredentials(dst, src LLMConfig) LLMConfig {
 	return dst
 }
 
+// resolveBedrockCredentials returns the explicit AWS credentials to pass to the
+// Bedrock client. When a named profile is configured the caller should let the
+// AWS SDK resolve credentials from the profile chain — returning empty strings
+// here prevents explicit key/secret values (including ambient env vars) from
+// overriding the profile. Without a profile the fields are expanded for
+// ${ENV_VAR} placeholders and returned directly; ambient env vars that are not
+// referenced in the config fields are not injected.
+func resolveBedrockCredentials(cfg LLMConfig) (accessKeyID, secretAccessKey, sessionToken string) {
+	if cfg.BedrockProfile != "" {
+		return "", "", ""
+	}
+	return loomconfig.ExpandEnvPlaceholders(cfg.BedrockAccessKeyID),
+		loomconfig.ExpandEnvPlaceholders(cfg.BedrockSecretAccessKey),
+		loomconfig.ExpandEnvPlaceholders(cfg.BedrockSessionToken)
+}
+
 func buildProviderPool(cfg *Config, _ *factory.ProviderFactory, logger *zap.Logger) (map[string]agent.LLMProvider, error) {
 	if len(cfg.Providers) == 0 {
 		return nil, nil
@@ -595,11 +620,12 @@ func createProviderWithRateLimit(cfg LLMConfig, logger *zap.Logger) (agent.LLMPr
 		// NewClientForModel routes Anthropic Claude models to the streaming +
 		// caching SDK client and others to the Converse client (single source of
 		// truth for Bedrock client selection — see bedrock.NewClientForModel).
+		accessKeyID, secretAccessKey, sessionToken := resolveBedrockCredentials(cfg)
 		client, err := bedrock.NewClientForModel(bedrock.Config{
 			Region:            cfg.BedrockRegion,
-			AccessKeyID:       cfg.BedrockAccessKeyID,
-			SecretAccessKey:   cfg.BedrockSecretAccessKey,
-			SessionToken:      cfg.BedrockSessionToken,
+			AccessKeyID:       accessKeyID,
+			SecretAccessKey:   secretAccessKey,
+			SessionToken:      sessionToken,
 			BearerToken:       cfg.BedrockBearerToken,
 			Profile:           cfg.BedrockProfile,
 			ModelID:           cfg.BedrockModelID,
@@ -718,18 +744,23 @@ func createProviderWithRateLimit(cfg LLMConfig, logger *zap.Logger) (agent.LLMPr
 		}), nil
 
 	case "litellm":
-		endpoint := cfg.LiteLLMEndpoint
+		endpoint := loomconfig.ExpandEnvPlaceholders(cfg.LiteLLMEndpoint)
 		if endpoint == "" {
 			endpoint = os.Getenv("LITELLM_ENDPOINT")
 		}
 		if endpoint == "" {
-			endpoint = os.Getenv("LITELLM_BASE_URL")
+			endpoint = os.Getenv("LITELLM_BASE_URL") // injected by avmo-tera-cloud runtime pods
 		}
-		key := apiKey(cfg.LiteLLMAPIKey, "LITELLM_API_KEY")
+		key := apiKey(loomconfig.ExpandEnvPlaceholders(cfg.LiteLLMAPIKey), "LITELLM_API_KEY")
+		extraHeaders := make(map[string]string, len(cfg.LiteLLMExtraHeaders))
+		for k, v := range cfg.LiteLLMExtraHeaders {
+			extraHeaders[k] = loomconfig.ExpandEnvPlaceholders(v)
+		}
 		return litellm.NewClient(litellm.Config{
 			Endpoint:          endpoint,
 			APIKey:            key,
-			Model:             cfg.LiteLLMModel,
+			Model:             loomconfig.ExpandEnvPlaceholders(cfg.LiteLLMModel),
+			ExtraHeaders:      extraHeaders,
 			MaxTokens:         cfg.MaxTokens,
 			Temperature:       cfg.Temperature,
 			Timeout:           time.Duration(cfg.Timeout) * time.Second,
@@ -1012,10 +1043,32 @@ func createLLMProviderFromProtoConfig(protoConfig *loomv1.LLMConfig, serverConfi
 		if model == "" {
 			model = serverConfig.LLM.LiteLLMModel
 		}
+		// Endpoint and API key are frequently injected via environment
+		// variables (e.g. avmo-tera-cloud runtime pods set LITELLM_BASE_URL /
+		// LITELLM_API_KEY) rather than the config file, and Viper's
+		// AutomaticEnv does not bind nested secret keys that are absent from
+		// the config. Fall back to the environment so agent-config-driven
+		// providers get the same credentials as the primary LLM.
+		endpoint := loomconfig.ExpandEnvPlaceholders(serverConfig.LLM.LiteLLMEndpoint)
+		if endpoint == "" {
+			endpoint = os.Getenv("LITELLM_ENDPOINT")
+		}
+		if endpoint == "" {
+			endpoint = os.Getenv("LITELLM_BASE_URL")
+		}
+		apiKey := loomconfig.ExpandEnvPlaceholders(serverConfig.LLM.LiteLLMAPIKey)
+		if apiKey == "" {
+			apiKey = os.Getenv("LITELLM_API_KEY")
+		}
+		extraHeaders := make(map[string]string, len(serverConfig.LLM.LiteLLMExtraHeaders))
+		for k, v := range serverConfig.LLM.LiteLLMExtraHeaders {
+			extraHeaders[k] = loomconfig.ExpandEnvPlaceholders(v)
+		}
 		return litellm.NewClient(litellm.Config{
-			Endpoint:          serverConfig.LLM.LiteLLMEndpoint,
-			APIKey:            serverConfig.LLM.LiteLLMAPIKey,
-			Model:             model,
+			Endpoint:          endpoint,
+			APIKey:            apiKey,
+			Model:             loomconfig.ExpandEnvPlaceholders(model),
+			ExtraHeaders:      extraHeaders,
 			MaxTokens:         maxTokens,
 			Temperature:       temperature,
 			Timeout:           timeout,
@@ -1042,6 +1095,13 @@ func exportConfigToEnv(cfg *Config) {
 	if cfg.Tools.WebSearch.SerpAPIKey != "" {
 		// #nosec G104 -- os.Setenv rarely fails, and we can continue without it
 		_ = os.Setenv("SERPAPI_KEY", cfg.Tools.WebSearch.SerpAPIKey)
+	}
+	// Safe mode for the file tools. Only set when asked: the env var is also
+	// the direct switch for a library embedding, and writing "false" here
+	// would override a caller that set it before start.
+	if cfg.Tools.Permissions.SafeFiles {
+		// #nosec G104 -- os.Setenv rarely fails, and we can continue without it
+		_ = os.Setenv("LOOM_FILE_SAFE_MODE", "true")
 	}
 }
 
@@ -1105,11 +1165,11 @@ func runServe(cmd *cobra.Command, args []string) {
 	defer func() { _ = logger.Sync() }()
 
 	// Replace the zap global so library packages that log via zap.L()
-	// (Agent.runConversationLoop Phase D, skill required-tool warnings,
-	// task context errors, etc.) reach the same sink as the structured
-	// server logger. Without this, those diagnostics go to the default
-	// Nop and silently disappear — which is what hid the original
-	// skills-overhaul Phase D wiring gap during initial diagnosis.
+	// (Agent.emitSkillTasksAsync, skill required-tool warnings, task context
+	// errors, etc.) reach the same sink as the structured server logger.
+	// Without this, those diagnostics go to the default Nop and silently
+	// disappear — which is what hid the original skill task emission wiring
+	// gap during initial diagnosis.
 	zap.ReplaceGlobals(logger)
 
 	// The scheduler registry's logger must be installed BEFORE any agent or
@@ -1134,6 +1194,9 @@ func runServe(cmd *cobra.Command, args []string) {
 
 	// Create tracer based on mode
 	var tracer observability.Tracer
+
+	applyOTLPEnvOverride(&config.Observability, logger)
+
 	if config.Observability.Enabled {
 		mode := config.Observability.Mode
 		if mode == "" {
@@ -1204,7 +1267,7 @@ func runServe(cmd *cobra.Command, args []string) {
 				Endpoint:       config.Observability.OTLPEndpoint,
 				Headers:        config.Observability.OTLPHeaders,
 				Insecure:       config.Observability.OTLPInsecure,
-				ServiceName:    "looms",
+				ServiceName:    otlpServiceName("looms"),
 				ServiceVersion: rootCmd.Version,
 				Privacy: observability.PrivacyConfig{
 					RedactCredentials: true,
@@ -1417,25 +1480,15 @@ func runServe(cmd *cobra.Command, args []string) {
 		logger.Warn("Examples source not found, skipping copy")
 	}
 
+	skillsDir := filepath.Join(loomDataDir, "skills")
 	// The bundled weaver and guide agents (and weaver's skills) build and
 	// explain agents, with shell access. A server for people who only talk to
-	// their own assistant turns them off with agents.install_bundled: false.
-	if viper.GetBool("agents.install_bundled") {
-		installBundledAgents(loomDataDir, logger)
+	// their own assistant turns them off with agents.install_bundled: false;
+	// skip_embedded_agents does the same for runtime pods.
+	if config.SkipEmbeddedAgents || !viper.GetBool("agents.install_bundled") {
+		logger.Info("Skipping embedded agent/skill installation (skip_embedded_agents=true or agents.install_bundled=false)")
 	} else {
-		logger.Info("Bundled agents (weaver, guide) not installed: agents.install_bundled is false")
-	}
-	skillsDir := filepath.Join(loomDataDir, "skills")
-
-	// Create agent guide in loom data directory (visible to agents)
-	agentGuidePath := filepath.Join(loomDataDir, "START_HERE.md")
-	if _, err := os.Stat(agentGuidePath); os.IsNotExist(err) {
-		agentGuide := embedded.GetStartHere()
-		if err := os.WriteFile(agentGuidePath, agentGuide, 0600); err != nil {
-			logger.Warn("Failed to create agent guide", zap.Error(err))
-		} else {
-			logger.Info("Agent guide created", zap.String("path", agentGuidePath))
-		}
+		installBundledAgents(loomDataDir, logger)
 	}
 
 	// Get artifact store from storage backend
@@ -1857,11 +1910,13 @@ func runServe(cmd *cobra.Command, args []string) {
 					}
 				}
 
-				// Set PatternsDir from metadata or default to $LOOM_DATA_DIR/patterns.
+				// Set PatternsDir from metadata or the server-level default.
 				// Patterns are enabled by default (DefaultPatternConfig), so all agents
 				// need a patterns directory to find filesystem patterns.
 				if pd, ok := cfg.Metadata["patterns_dir"]; ok && pd != "" {
 					agentCfg.PatternsDir = pd
+				} else if config.PatternsDir != "" {
+					agentCfg.PatternsDir = config.PatternsDir
 				} else {
 					agentCfg.PatternsDir = filepath.Join(loomconfig.GetLoomDataDir(), "patterns")
 				}
@@ -2427,6 +2482,15 @@ func runServe(cmd *cobra.Command, args []string) {
 	loomService.SetSpendingLedger(spendingLedger)
 	if config.Server.AllowTimeOverride {
 		logger.Info("Arrival-time override enabled (server.allow_time_override): WeaveRequest.occurred_at will be honored")
+	}
+
+	// Honor WeaveRequest.replay_assistant_message only when the operator opted
+	// in — generation-free replay writes caller-supplied assistant turns, so it
+	// has its own switch, separate from allow_time_override (see
+	// applyReplayAssistant).
+	loomService.SetAllowAssistantOverride(config.Server.AllowAssistantOverride)
+	if config.Server.AllowAssistantOverride {
+		logger.Info("Assistant override enabled (server.allow_assistant_override): WeaveRequest.replay_assistant_message will be honored")
 	}
 
 	// Set provider factory for dynamic model switching
@@ -3128,9 +3192,11 @@ func runServe(cmd *cobra.Command, args []string) {
 				}
 			}
 
-			// Set PatternsDir from metadata or default to $LOOM_DATA_DIR/patterns
+			// Set PatternsDir from metadata or the server-level default.
 			if pd, ok := agentConfig.Metadata["patterns_dir"]; ok && pd != "" {
 				cfg.PatternsDir = pd
+			} else if config.PatternsDir != "" {
+				cfg.PatternsDir = config.PatternsDir
 			} else {
 				cfg.PatternsDir = filepath.Join(loomconfig.GetLoomDataDir(), "patterns")
 			}
@@ -3453,9 +3519,10 @@ func runServe(cmd *cobra.Command, args []string) {
 
 		if err := server.ValidateProviders(preflightCtx, agents); err != nil {
 			logger.Fatal("LLM provider preflight check failed", zap.Error(err))
+		} else {
+			logger.Info("All LLM provider preflight checks passed",
+				zap.Int("agents_checked", len(agents)))
 		}
-		logger.Info("All LLM provider preflight checks passed",
-			zap.Int("agents_checked", len(agents)))
 	}
 
 	// Start server
@@ -3841,24 +3908,13 @@ func initializeMCPManager(config *Config, logger *zap.Logger) (*mcpManager, erro
 		// Enabled defaults are handled by fixMCPEnabledDefault in config loading:
 		// servers without explicit "enabled: false" in YAML default to true.
 
-		// Expand ${ENV_VAR} in header values so secrets (e.g. a bearer token for
-		// an authenticated remote MCP server) come from the environment rather
-		// than being committed to the config file.
-		var headers map[string]string
-		if len(serverConfig.Headers) > 0 {
-			headers = make(map[string]string, len(serverConfig.Headers))
-			for k, v := range serverConfig.Headers {
-				headers[k] = os.ExpandEnv(v)
-			}
-		}
-
 		mcpConfig.Servers[serverName] = manager.ServerConfig{
 			Command:          serverConfig.Command,
 			Args:             serverConfig.Args,
 			Env:              serverConfig.Env,
 			Transport:        transport,
-			URL:              serverConfig.URL,
-			Headers:          headers,
+			URL:              loomconfig.ExpandEnvPlaceholders(serverConfig.URL),
+			Headers:          expandMCPHeaders(serverConfig.Headers),
 			EnableSessions:   serverConfig.EnableSessions,
 			EnableResumption: serverConfig.EnableResumption,
 			Enabled:          enabled,
@@ -3884,6 +3940,17 @@ func initializeMCPManager(config *Config, logger *zap.Logger) (*mcpManager, erro
 	return &mcpManager{
 		manager: mcpMgr,
 	}, nil
+}
+
+func expandMCPHeaders(headers map[string]string) map[string]string {
+	if len(headers) == 0 {
+		return headers
+	}
+	expanded := make(map[string]string, len(headers))
+	for key, value := range headers {
+		expanded[key] = loomconfig.ExpandEnvPlaceholders(value)
+	}
+	return expanded
 }
 
 // enabledMCPServerNames returns the names of the manager's servers that are
@@ -4161,11 +4228,14 @@ func registerUIAppTools(ag *agent.Agent, tools []shuttle.Tool, declared bool) st
 	return "lazy"
 }
 
-// installBundledAgents copies the embedded weaver and guide agents and the
-// weaver skills into the data directory, each only if it is not there yet,
-// so people can edit or delete them.
+// installBundledAgents copies the embedded weaver and guide agents, the
+// bundled skills and the agent guide (START_HERE.md) into the data
+// directory, each only if it is not there yet, so people can edit or delete
+// them.
 func installBundledAgents(loomDataDir string, logger *zap.Logger) {
-	// Copy default weaver agent to loom data directory (if not exists)
+	skillsDir := filepath.Join(loomDataDir, "skills")
+	// Copy default weaver and guide agents + bundled skills to loom data directory
+	// (skipped when skip_embedded_agents is set — e.g. runtime pods that serve only the deployed agent)
 	agentsDir := filepath.Join(loomDataDir, "agents")
 	weaverDestPath := filepath.Join(agentsDir, "weaver.yaml")
 	if _, err := os.Stat(weaverDestPath); os.IsNotExist(err) {
@@ -4219,7 +4289,6 @@ func installBundledAgents(loomDataDir string, logger *zap.Logger) {
 	// Deploy bundled weaver skills (if not exists). One block per skill so
 	// users can delete an individual file to opt out without losing the
 	// others.
-	skillsDir := filepath.Join(loomDataDir, "skills")
 	weaverBundledSkills := []struct {
 		name string
 		data []byte
@@ -4247,6 +4316,17 @@ func installBundledAgents(loomDataDir string, logger *zap.Logger) {
 		} else {
 			logger.Debug("Weaver skill already exists",
 				zap.String("name", s.name), zap.String("path", path))
+		}
+	}
+
+	// Create agent guide in loom data directory (visible to agents)
+	agentGuidePath := filepath.Join(loomDataDir, "START_HERE.md")
+	if _, err := os.Stat(agentGuidePath); os.IsNotExist(err) {
+		agentGuide := embedded.GetStartHere()
+		if err := os.WriteFile(agentGuidePath, agentGuide, 0600); err != nil {
+			logger.Warn("Failed to create agent guide", zap.Error(err))
+		} else {
+			logger.Info("Agent guide created", zap.String("path", agentGuidePath))
 		}
 	}
 }

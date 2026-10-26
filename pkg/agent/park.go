@@ -33,10 +33,12 @@ import (
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 
+	loomv1 "github.com/teradata-labs/loom/gen/go/loom/v1"
 	mcpadapter "github.com/teradata-labs/loom/pkg/mcp/adapter"
 	"github.com/teradata-labs/loom/pkg/observability"
 	"github.com/teradata-labs/loom/pkg/session"
 	"github.com/teradata-labs/loom/pkg/shuttle"
+	"github.com/teradata-labs/loom/pkg/taskctx"
 	"github.com/teradata-labs/loom/pkg/types"
 )
 
@@ -53,7 +55,8 @@ type hitlParkConfig struct {
 // offered.
 const defaultParkTTL = 168 * time.Hour
 
-// WithHITLPark enables park-and-resume for governed calls and contact_human.
+// WithHITLPark enables park-and-resume for governed calls, contact_human and
+// shuttle.ParkableQuestion tools.
 // store persists the grouped request; ttl bounds how long a parked request
 // may wait for a decision (non-positive → 168h); notifier emits the pending
 // event. A nil store leaves park disabled and the legacy in-turn resolver
@@ -80,7 +83,11 @@ type TurnParkedError struct {
 	RequestID string
 	SessionID string
 	ExpiresAt time.Time
+	// Usage is the parking call's own usage (the batch's assistant row carries
+	// it). TurnUsage is the sum of every LLM call the turn made before it
+	// parked — see Response.TurnUsage; a metering embedder reads this one.
 	Usage     Usage
+	TurnUsage Usage
 }
 
 func (e *TurnParkedError) Error() string {
@@ -364,6 +371,13 @@ func (a *Agent) claimParkedRequest(ctx context.Context, hr *shuttle.HumanRequest
 				zap.Error(eerr))
 			return ErrClaimNotConfirmed
 		}
+		// The row is retired HERE, successfully — which puts it beyond the
+		// lapsed-TTL reclaim, whose guard consults pending rows only. Settle
+		// the task and memo now or nothing ever will (round-7's residual M2
+		// leg): the expiry above is precisely a declaration that the parked
+		// turn is finished without a resume.
+		a.settleAbandonedParkTask(ctx, hr,
+			"Human decision expired before it could be claimed; the turn was abandoned.")
 		return ErrDecisionExpired
 	}
 
@@ -396,10 +410,30 @@ func (a *Agent) abandonParkedRequest(ctx context.Context, hr *shuttle.HumanReque
 	// RESOURCE_HOLDER scheduling class.
 	a.ReleaseParkedHandles(hr.SessionID)
 
+	// The turn is explicitly declared dead here, so its task must not stay
+	// IN_PROGRESS — this function used to retire the ROW and orphan the TASK,
+	// the same leak the lapsed-TTL path had (round-5 M2 named both).
+	a.settleAbandonedParkTask(ctx, hr,
+		"The turn that raised this request can no longer be resumed; it was abandoned.")
+
 	zap.L().Warn("closed a parked request whose turn can no longer be resumed",
 		zap.String("session_id", hr.SessionID),
 		zap.String("request_id", hr.ID),
 		zap.NamedError("cause", cause))
+}
+
+// settleAbandonedParkTask closes an abandoned park's implicit task and releases
+// its memo entry — the shared tail of the two paths that declare a parked turn
+// finished without a resume (a lapsed TTL, an unresumable row). CompleteForTurn's
+// implicit-key guard keeps explicit tasks' lifecycles with their owners; a
+// legacy row without a task id settles nothing, since the task cannot be found
+// from here.
+func (a *Agent) settleAbandonedParkTask(ctx context.Context, hr *shuttle.HumanRequest, reason string) {
+	if hr.TaskID == "" {
+		return
+	}
+	a.implicitTasks.AbortForTurn(ctx, hr.TaskID, reason)
+	a.implicitTasks.ReleaseTaskMemo(hr.SessionID, hr.TaskID)
 }
 
 // lockSession serializes resumes of one session within this process, and
@@ -446,6 +480,7 @@ func (a *Agent) guardParkedTail(ctx context.Context, sessionID string, sess *Ses
 		// "pending" alone lets a park nobody ever decided refuse every future
 		// turn on this session, permanently.
 		if !r.ExpiresAt.IsZero() && now.After(r.ExpiresAt) {
+			a.reclaimLapsedPark(ctx, r)
 			continue
 		}
 		return &SessionParkedError{RequestID: r.ID, SessionID: sessionID, ExpiresAt: r.ExpiresAt}
@@ -500,8 +535,8 @@ func unappliedParkedTail(sess *Session) *Message {
 type resumedTurnKey struct{}
 
 // contextWithResumedTurn marks ctx as a resume. Per-TURN entry work in
-// runConversationLoop — graph-memory context injection — must not run twice
-// for one turn just because the loop is entered twice.
+// runConversationLoop — graph-memory context injection and extraction —
+// must not run twice for one turn just because the loop is entered twice.
 func contextWithResumedTurn(ctx context.Context) context.Context {
 	return context.WithValue(ctx, resumedTurnKey{}, true)
 }
@@ -559,24 +594,109 @@ func (a *Agent) ReleaseParkedHandles(sessionID string) {
 	}
 }
 
-// isParkQuestion reproduces the pre-scan's question classification at
-// completion time: a registered contact_human whose preflight verdict is not
-// Deny. A contact_human that fails this — policy-denied, or unregistered —
-// was deliberately NOT a park item and must complete through the normal
-// dispatch ceremony (policy denial, "tool not found"), never through answer
-// synthesis: a caller-supplied answer for it would lift a Deny.
-func (a *Agent) isParkQuestion(ctx Context, call ToolCall) bool {
-	if call.Name != "contact_human" {
+// parkQuestionOf classifies a call as a park question: a registered
+// contact_human (legacy; pq is nil) or a registered ParkableQuestion whose
+// ParkQuestion says ok. Policy (Preflight) is the caller's concern.
+func (a *Agent) parkQuestionOf(ctx Context, call ToolCall) (question string, pq shuttle.ParkableQuestion, ok bool) {
+	if call.Name == "contact_human" {
+		if _, found := a.tools.Get("contact_human"); !found {
+			return "", nil, false
+		}
+		return extractHITLInfo(call.Input).Question, nil, true
+	}
+	t, found := a.tools.Get(call.Name)
+	if !found {
+		return "", nil, false
+	}
+	p, isPQ := t.(shuttle.ParkableQuestion)
+	if !isPQ {
+		return "", nil, false
+	}
+	spanCtx, span := ctx.Tracer().StartSpan(ctx, "agent.park_question")
+	defer ctx.Tracer().EndSpan(span)
+	span.SetAttribute("tool", call.Name)
+	q, ok := p.ParkQuestion(spanCtx, call.Input)
+	span.SetAttribute("parks", ok)
+	return q, p, ok
+}
+
+// parkedAsQuestion reports whether a rowless call completes through answer
+// synthesis on resume. The kind recorded on the park row is the authority: a
+// ParkableQuestion's classification depends on its input and on tool state, so
+// re-asking ParkQuestion could flip between park and resume and either run
+// Execute under an approval nobody gave or discard the human's answer. A
+// policy Deny is re-checked fresh and is never lifted: a denied call
+// completes through the normal dispatch ceremony instead. A contact_human
+// that is no longer registered also dispatches ("tool not found").
+//
+// Rows written before kinds were recorded carry none; for those only a
+// registered contact_human is treated as a question, as before.
+func (a *Agent) parkedAsQuestion(ctx Context, call ToolCall, kinds map[string]string) bool {
+	switch kinds[call.ID] {
+	case "question":
+	case "":
+		if call.Name != "contact_human" {
+			return false
+		}
+	default:
 		return false
 	}
-	if _, ok := a.tools.Get("contact_human"); !ok {
-		return false
+	if call.Name == "contact_human" {
+		if _, found := a.tools.Get("contact_human"); !found {
+			return false
+		}
 	}
 	return a.executor.Preflight(ctx, call.Name, call.Input).Kind != shuttle.Deny
 }
 
+// parkedAnswerResult builds the result of a parked question from the human's
+// non-empty answer. Execute never runs here: the question was asked and
+// answered. A tool that is no longer registered yields a tool_not_found error
+// result; one that is registered but no longer a ParkableQuestion yields
+// internal_error. Both are visible to the model. The tool_not_found message
+// matches dispatch's unknown-tool error, but dispatch returns a Go error with
+// no result or code, and it first tries dynamic registration, which this
+// check does not.
+func (a *Agent) parkedAnswerResult(ctx Context, call ToolCall, answer string) *shuttle.Result {
+	if call.Name == "contact_human" {
+		return &shuttle.Result{
+			Success: true,
+			Data: map[string]interface{}{
+				"response":     answer,
+				"responded_by": "user",
+				"status":       "responded",
+			},
+		}
+	}
+	t, found := a.tools.Get(call.Name)
+	if !found {
+		return &shuttle.Result{Success: false, Error: &shuttle.Error{
+			Code:    "tool_not_found",
+			Message: fmt.Sprintf("tool not found: %s", call.Name),
+		}}
+	}
+	pq, _ := t.(shuttle.ParkableQuestion)
+	if pq == nil {
+		return &shuttle.Result{Success: false, Error: &shuttle.Error{
+			Code:    "internal_error",
+			Message: "tool is no longer available to build a result for the human's answer",
+		}}
+	}
+	spanCtx, span := ctx.Tracer().StartSpan(ctx, "agent.park_answer_result")
+	defer ctx.Tracer().EndSpan(span)
+	span.SetAttribute("tool", call.Name)
+	res := pq.ParkAnswerResult(spanCtx, call.Input, answer)
+	if res == nil {
+		res = &shuttle.Result{Success: false, Error: &shuttle.Error{
+			Code:    "internal_error",
+			Message: "tool returned no result for the answer",
+		}}
+	}
+	return res
+}
+
 // parkItem is one batch call needing a human: an approval-gated call or a
-// contact_human question.
+// contact_human or ParkableQuestion question.
 type parkItem struct {
 	call     ToolCall
 	seq      int
@@ -586,26 +706,21 @@ type parkItem struct {
 }
 
 // maybeParkBatch is the pre-scan: every call of the batch — contact_human
-// included — is preflighted; a Deny is never lifted (the call falls to the
-// dispatch loop and denies as today), a contact_human survives as a question
-// item, an Ask as an approval item. With no items it returns nil and the
+// and ParkableQuestion tools included — is preflighted; a Deny is never
+// lifted (the call falls to the dispatch loop and denies as today), a
+// contact_human or ParkableQuestion survives as a question item, an Ask as an
+// approval item. With no items it returns nil and the
 // serial dispatch loop runs exactly as today. With items it persists ONE
 // grouped request and ends the turn with TurnParkedError.
-func (a *Agent) maybeParkBatch(ctx Context, sess *Session, llmResp *LLMResponse) error {
+func (a *Agent) maybeParkBatch(ctx Context, sess *Session, llmResp *LLMResponse, turnUsage Usage) error {
 	var items []parkItem
 	for i, call := range llmResp.ToolCalls {
 		d := a.executor.Preflight(ctx, call.Name, call.Input)
 		if d.Kind == shuttle.Deny {
 			continue
 		}
-		if call.Name == "contact_human" {
-			// Unregistered contact_human keeps today's "tool not found" at
-			// execution.
-			if _, ok := a.tools.Get("contact_human"); !ok {
-				continue
-			}
-			info := extractHITLInfo(call.Input)
-			items = append(items, parkItem{call: call, seq: i, kind: "question", question: info.Question})
+		if q, _, ok := a.parkQuestionOf(ctx, call); ok {
+			items = append(items, parkItem{call: call, seq: i, kind: "question", question: q})
 			continue
 		}
 		if d.Kind == shuttle.Ask {
@@ -628,12 +743,31 @@ func (a *Agent) maybeParkBatch(ctx Context, sess *Session, llmResp *LLMResponse)
 		return nil
 	}
 
+	// Record this turn's task NOW, on the HUMAN_REQUEST trigger.
+	//
+	// A turn whose first action needs a human decision returns from here before
+	// dispatchOneCall ever runs, so its TOOL_CALL trigger never fires and the
+	// turn recorded nothing at all — no task, and therefore no timeline for the
+	// one turn shape a human is most likely to go looking for, because they were
+	// the one asked to decide something in it. dispatchOneCall's TOOL_CALL
+	// comment already assumes this trigger fires here; it simply never did.
+	//
+	// Before the Store call, not after: the park row is written under the turn's
+	// ambient attribution, so the human request the person sees hangs off the
+	// same task as the work around it. A store failure below fails the turn with
+	// a task already recorded, which is accurate — the turn ended, and it ended
+	// badly.
+	//
+	// A no-op when the turn already recorded a task (work-then-park): the
+	// binding is filled and every trigger after the first short circuits.
+	a.maybeRecordImplicitTask(ctx, loomv1.ImplicitTaskTrigger_IMPLICIT_TASK_TRIGGER_HUMAN_REQUEST)
+
 	now := time.Now()
 	params, truncated := buildParkParams(items)
 	kind, question := parkKindAndQuestion(items)
 	hr := &shuttle.HumanRequest{
 		ID:              uuid.New().String(),
-		AgentID:         a.id,
+		AgentID:         a.GetID(),
 		SessionID:       sess.ID,
 		Question:        question,
 		Context:         map[string]interface{}{"kind": "parked"},
@@ -660,6 +794,7 @@ func (a *Agent) maybeParkBatch(ctx Context, sess *Session, llmResp *LLMResponse)
 		SessionID: sess.ID,
 		ExpiresAt: hr.ExpiresAt,
 		Usage:     llmResp.Usage,
+		TurnUsage: turnUsage,
 	}
 }
 
@@ -825,6 +960,22 @@ func (a *Agent) ResumeChat(ctx context.Context, sessionID string, decision ParkD
 	}
 	ctx = contextWithResumedTurn(ctx)
 
+	// Re-establish the parked turn's task identity.
+	//
+	// A resume built its context with no binding, no turn index and no user
+	// message, so everything written after the human's decision — the approved
+	// tool's own row above all — landed with a NULL task_id. The row that fell
+	// out of the record was the one a person had explicitly authorised, which is
+	// the opposite of the ordering a timeline should have.
+	//
+	// The binding is attached HERE, before any further context derivation, so
+	// the collector-bearing ctx the agentContext is later built from already
+	// carries it — writers that capture a derived context read the attribution
+	// through this binding the moment it is filled. It starts empty and is
+	// filled only after every refusal gate below, the claim included. The turn
+	// identity itself is recovered further down, once the session is loaded.
+	ctx, taskBinding := taskctx.ContextWithBinding(ctx)
+
 	// The request row — not the caller's payload — is the batch binding. Its
 	// params keys ARE the items the human saw; a caller-supplied ItemIDs list
 	// is honored only as a cross-check.
@@ -875,6 +1026,13 @@ func (a *Agent) ResumeChat(ctx context.Context, sessionID string, decision ParkD
 	// The session is loaded only once the request has been validated: a bogus
 	// or foreign RequestID must not create and persist a session row.
 	sess := a.memory.GetOrCreateSessionWithAgent(ctx, sessionID, a.config.Name, "")
+
+	// The parked turn's index and opening message, from the same tail rows
+	// locateParkedBatch anchors on — so the two cannot disagree about which turn
+	// is being resumed. The index is half the emitter's idempotency key:
+	// recovering the SAME index is what makes the resume rebind to the task the
+	// parked half recorded instead of describing a different turn.
+	turnIndex, turnUserMessage := parkedTurnIdentity(sess)
 
 	batch, rowless, err := locateParkedBatch(sess, itemIDs)
 	if err != nil {
@@ -930,6 +1088,36 @@ func (a *Agent) ResumeChat(ctx context.Context, sessionID string, decision ParkD
 		}
 	}
 
+	// Restore the parked turn's DURABLE task identity, before any context this
+	// turn derives. The park row carries the task it blocked (stamped at Store
+	// time from the turn's attribution), and that row — not a fresh emission —
+	// is the identity a resume should continue: re-minting through the
+	// policy-gated HUMAN_REQUEST trigger re-derives what the park already
+	// decided, and gets it wrong twice. A turn parked under a REAL claimed task
+	// resumed under a fresh implicit one; and a policy that declines on the
+	// resuming agent (mode off after a restart, cap spent, trigger excluded)
+	// left the approved rows unattributed and the parked task open forever.
+	// The emitter rebind below survives as the fallback for legacy rows written
+	// before the task_id column existed.
+	//
+	// Seeding the binding is enough for the close as well: completeImplicitTask
+	// closes through CompleteForTurn, whose implicit-key guard skips a task the
+	// emitter did not mint — so restoring an explicit task's identity attributes
+	// the resumed rows without stealing that task's lifecycle from its owner.
+	if hr.TaskID != "" {
+		// GetID reads a.id under a.mu. SetID is a live mutator and a resume
+		// runs on a different goroutine than the park — the same race
+		// b5c3684e fixed in the skill emitter and round 5 fixed in
+		// maybeRecordImplicitTask. This capture site was missed by both.
+		attr := taskctx.Attribution{
+			TaskID:    hr.TaskID,
+			SessionID: sessionID,
+			AgentID:   a.GetID(),
+		}
+		taskBinding.Set(attr)
+		ctx = taskctx.ContextWithAttribution(ctx, attr)
+	}
+
 	// Past this line the decision is ours and the turn is ours to finish.
 	// Session-handle lifecycle: adopt the handles the parked half minted
 	// (same-process embedders), so a handle the model is about to use is still
@@ -958,6 +1146,32 @@ func (a *Agent) ResumeChat(ctx context.Context, sessionID string, decision ParkD
 		session:          sess,
 		tracer:           a.tracer,
 		progressCallback: progressCallback,
+		taskBinding:      taskBinding,
+		turnIndex:        turnIndex,
+		userMessage:      turnUserMessage,
+	}
+
+	// Fill the turn's binding before anything the decision produces is written —
+	// completeParkedBatch below is the first writer.
+	//
+	// HUMAN_REQUEST is the honest trigger — a human decision is what resumed
+	// this turn — and it is the same trigger the park fired, so the emitter's
+	// key resolves to the task the parked half recorded: in-process through the
+	// per-turn memo the park deliberately did not release, and after a restart
+	// through CreateTaskIdempotent, which looks the key up before it creates.
+	// Either way this binds rather than mints, so the rows on both sides of the
+	// gap carry one task id.
+	//
+	// After every refusal gate, the CLAIM included: a resume that loses the
+	// claim race, or is refused for a stale decision or moved-on history, must
+	// not leave a task behind for a turn it never continued.
+	//
+	// Legacy fallback only: a park row that carries its task id has already
+	// seeded the binding above (and maybeRecordImplicitTask would decline on a
+	// filled binding anyway — this guard just says out loud that the durable id
+	// is the primary path and the emitter is the fallback).
+	if hr.TaskID == "" {
+		a.maybeRecordImplicitTask(agentCtx, loomv1.ImplicitTaskTrigger_IMPLICIT_TASK_TRIGGER_HUMAN_REQUEST)
 	}
 
 	if len(rowless) > 0 {
@@ -965,6 +1179,17 @@ func (a *Agent) ResumeChat(ctx context.Context, sessionID string, decision ParkD
 	}
 
 	response, err := a.runConversationLoop(agentCtx)
+
+	// The mirror of chat()'s deferred close, which a park skips: this is where
+	// the turn finally ends, so this is where its recorded task closes and its
+	// per-turn memo is released.
+	//
+	// A NESTED park is skipped for exactly the reason the first one was — the
+	// turn is still unfinished, and the next resume rebinds through the memo.
+	var parkedTerminal *TurnParkedError
+	if !errors.As(err, &parkedTerminal) {
+		defer a.completeImplicitTask(ctx, taskBinding, sessionID, int(turnIndex), implicitCloseReason(response, err), err != nil)
+	}
 
 	duration := time.Since(startTime)
 	if err != nil {
@@ -1004,7 +1229,7 @@ func (a *Agent) ResumeChat(ctx context.Context, sessionID string, decision ParkD
 	a.appendMessage(ctx, sess, Message{
 		Role:       "assistant",
 		Content:    response.Content,
-		AgentID:    a.id,
+		AgentID:    a.GetID(),
 		Timestamp:  time.Now(),
 		TokenCount: response.Usage.TotalTokens,
 		CostUSD:    response.Usage.CostUSD,
@@ -1022,6 +1247,28 @@ func (a *Agent) ResumeChat(ctx context.Context, sessionID string, decision ParkD
 	return response, nil
 }
 
+// reclaimLapsedPark settles the bookkeeping a lapsed park abandoned. The park
+// deliberately skipped the turn's close AND the memo release — the resume was
+// going to do both — but a lapsed row can never be resumed (the claim requires
+// expires_at in the future), so without this each park-then-lapse cycle left a
+// task stuck IN_PROGRESS forever and one memo entry leaked per cycle inside a
+// live session. This runs at the one place that already decides a lapsed park
+// no longer holds the session.
+//
+// Order matters: the row is EXPIRED first, so the reclamation is one-shot —
+// the guard only consults pending rows, and "timeout" is the same closure the
+// operator CLI writes. Each step fails open with a warn, matching the guard's
+// own ethos: bookkeeping must not cost the user their session.
+func (a *Agent) reclaimLapsedPark(ctx context.Context, r *shuttle.HumanRequest) {
+	if err := a.hitlPark.store.ExpireRequest(ctx, r.ID, "system:lapsed-park-reclaim"); err != nil {
+		zap.L().Warn("lapsed-park reclaim: could not expire the row; will retry on the next turn",
+			zap.String("request_id", r.ID), zap.Error(err))
+		return
+	}
+	a.settleAbandonedParkTask(ctx, r,
+		"Human decision expired unanswered; the turn was abandoned.")
+}
+
 // rawSessionMessages returns the session's L1 rows in append order.
 //
 // It reaches past types.Session.GetMessages on purpose: that one delegates to
@@ -1036,6 +1283,37 @@ func rawSessionMessages(sess *Session) []Message {
 		}
 	}
 	return sess.GetMessages()
+}
+
+// parkedTurnIdentity recovers the turn number and opening user message of the
+// turn that parked, so a resume can describe the same turn its parked half did.
+//
+// The turn number comes from the tail assistant batch — the same row
+// locateParkedBatch anchors on, walked the same way, so the two cannot disagree
+// about which turn is being resumed.
+//
+// The user message is the FIRST user row of that turn, not the last. The loop
+// appends further user-role rows WITHIN a turn (sidecar drain, empty-response
+// nudge, hygiene fixup, synthesis prompt), all stamped with the same turn; the
+// request that opened the turn is the one a board row should be named after.
+//
+// A session with no assistant batch yields turn 0 and no message. Nothing acts
+// on that: the callers' guards refuse such a resume before the identity is used.
+func parkedTurnIdentity(sess *Session) (turnIndex int64, userMessage string) {
+	msgs := rawSessionMessages(sess)
+
+	for i := len(msgs) - 1; i >= 0; i-- {
+		if msgs[i].Role == "assistant" && len(msgs[i].ToolCalls) > 0 {
+			turnIndex = msgs[i].Turn
+			break
+		}
+	}
+	for _, m := range msgs {
+		if m.Role == "user" && m.Turn == turnIndex {
+			return turnIndex, m.Content
+		}
+	}
+	return turnIndex, ""
 }
 
 // locateParkedBatch finds the tail tool batch and validates the decision
@@ -1116,7 +1394,8 @@ func locateParkedBatch(sess *Session, itemIDs []string) (Message, []ToolCall, er
 // in original batch order. Rejected: every rowless call gets a synthesized
 // permission_denied carrying the human's reason — no tool bodies run,
 // allow-classified calls included (block-all covers the refusal). Approved:
-// question items synthesize the human's answer as the contact_human result;
+// question items synthesize the human's answer as the contact_human result
+// (or the ParkableQuestion tool's ParkAnswerResult);
 // every other call executes through the normal dispatch ceremony.
 //
 // itemIDs are the calls the human's card actually described. ONLY those run
@@ -1165,6 +1444,18 @@ func (a *Agent) completeParkedBatch(ctx Context, sess *Session, batch Message, r
 		tracer:           ctx.Tracer(),
 		progressCallback: ctx.ProgressCallback(),
 	}
+	// The grant context is a DERIVED context, so it must not lose the turn's
+	// task identity on the way. The ambient attribution rides the embedded
+	// context.Context and would survive on its own, but the per-turn fields live
+	// on the concrete agentContext: without them the approved call's own
+	// TOOL_CALL trigger sees no binding and declines, which matters in the one
+	// configuration where the HUMAN_REQUEST rebind above did not fire (an
+	// operator who excluded that trigger but kept TOOL_CALL).
+	if tc, ok := ctx.(taskTurnContext); ok {
+		grantCtx.taskBinding = tc.TaskBinding()
+		grantCtx.turnIndex = tc.TurnIndex()
+		grantCtx.userMessage = tc.UserMessage()
+	}
 	granted := make(map[string]bool, len(itemIDs))
 	for _, id := range itemIDs {
 		granted[id] = true
@@ -1186,7 +1477,7 @@ func (a *Agent) completeParkedBatch(ctx Context, sess *Session, batch Message, r
 				Success: false,
 				Error:   &shuttle.Error{Code: "permission_denied", Message: reason, Retryable: false},
 			}, st)
-		case a.isParkQuestion(ctx, call):
+		case a.parkedAsQuestion(ctx, call, kinds):
 			answer, ok := decision.Answers[call.ID]
 			if !ok || answer == "" {
 				a.synthesizeParkedResult(ctx, sess, call, &shuttle.Result{
@@ -1195,14 +1486,7 @@ func (a *Agent) completeParkedBatch(ctx Context, sess *Session, batch Message, r
 				}, st)
 				continue
 			}
-			a.synthesizeParkedResult(ctx, sess, call, &shuttle.Result{
-				Success: true,
-				Data: map[string]interface{}{
-					"response":     answer,
-					"responded_by": "user",
-					"status":       "responded",
-				},
-			}, st)
+			a.synthesizeParkedResult(ctx, sess, call, a.parkedAnswerResult(ctx, call, answer), st)
 		case granted[call.ID]:
 			a.dispatchOneCall(grantCtx, sess, call, seqOf[call.ID], st)
 		default:
@@ -1246,7 +1530,7 @@ func (a *Agent) synthesizeParkedResult(ctx Context, sess *Session, call ToolCall
 		Content:    a.formatToolResult(ctx, sess.ID, call.Name, res, nil),
 		ToolUseID:  call.ID,
 		ToolResult: res,
-		AgentID:    a.id,
+		AgentID:    a.GetID(),
 		Timestamp:  time.Now(),
 	}, false)
 }

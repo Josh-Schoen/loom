@@ -56,6 +56,11 @@ func ByName(name string) shuttle.Tool {
 		return NewFileWriteTool("")
 	case "file_read":
 		return NewFileReadTool("")
+	case "edit_files":
+		return NewEditFilesTool("")
+	// execute_query is absent: it needs the agent's fabric.ExecutionBackend,
+	// which a name-only lookup cannot supply. A host that has a backend
+	// constructs it directly. See ExecuteQueryTool's doc comment.
 	case "analyze_image":
 		return NewVisionTool("")
 	case "parse_document":
@@ -74,20 +79,24 @@ func ByName(name string) shuttle.Tool {
 }
 
 // Names returns the names of all builtin tools.
-// Note: spawn_agent is NOT included - it requires per-agent context (session ID, spawn handler)
-// and must be created via NewSpawnAgentTool() when setting up agents.
+// Note: manage_ephemeral_agents requires per-session context (session ID, spawn
+// handler) and is created at request time via NewManageEphemeralAgentsTool().
+// It is listed here so YAML configs can include it in tools.builtin as an
+// opt-in gate for sub-agent spawning.
 func Names() []string {
 	return []string{
 		"http_request",
 		"web_search",
 		"file_write",
 		"file_read",
+		"edit_files",
 		"analyze_image",
 		"parse_document",
 		"grpc_call",
 		"shell_execute",
 		"agent_management",
 		"contact_human",
+		"manage_ephemeral_agents",
 	}
 }
 

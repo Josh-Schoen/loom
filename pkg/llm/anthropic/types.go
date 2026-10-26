@@ -50,6 +50,13 @@ type MessagesRequest struct {
 	// Fallbacks is "default" on models that support the server-side refusal
 	// fallback (see applyModelRules); empty otherwise.
 	Fallbacks string `json:"fallbacks,omitempty"`
+
+	// Thinking requests extended thinking: {"type":"adaptive","display":"summarized"}
+	// on 4.6+/5 models, {"type":"enabled","budget_tokens":N} on older ones.
+	Thinking map[string]interface{} `json:"thinking,omitempty"`
+	// OutputConfig carries effort on adaptive-thinking models (5-family / 4.6+);
+	// omitted elsewhere.
+	OutputConfig map[string]interface{} `json:"output_config,omitempty"`
 }
 
 // MessagesResponse represents a response from the Anthropic Messages API.
@@ -80,6 +87,13 @@ type ContentBlock struct {
 	ToolUseID string                 `json:"tool_use_id,omitempty"`
 	Content   string                 `json:"content,omitempty"`
 	Source    *ImageSource           `json:"source,omitempty"` // For image content blocks
+	// Extended thinking blocks: Thinking + Signature for type "thinking",
+	// Data for type "redacted_thinking". MarshalJSON keeps the thinking field
+	// present-but-empty on thinking blocks — the API 400s when it is absent
+	// but accepts "" (observed live, 2026-08-12 native probes).
+	Thinking  string `json:"thinking,omitempty"`
+	Signature string `json:"signature,omitempty"`
+	Data      string `json:"data,omitempty"`
 	// CacheControl marks a message-level cache breakpoint (HLD §5.2 step 8).
 	CacheControl *CacheControl `json:"cache_control,omitempty"`
 }
@@ -90,6 +104,17 @@ type ContentBlock struct {
 func (cb ContentBlock) MarshalJSON() ([]byte, error) {
 	m := map[string]interface{}{
 		"type": cb.Type,
+	}
+	if cb.Type == "thinking" {
+		// Present-but-empty law: the thinking field must exist even when the
+		// text is empty (display-omitted responses carry signature only).
+		m["thinking"] = cb.Thinking
+		if cb.Signature != "" {
+			m["signature"] = cb.Signature
+		}
+	}
+	if cb.Type == "redacted_thinking" && cb.Data != "" {
+		m["data"] = cb.Data
 	}
 	if cb.Text != "" {
 		m["text"] = cb.Text
@@ -175,8 +200,10 @@ type StreamEvent struct {
 
 // StreamDelta represents a delta in a streaming event.
 type StreamDelta struct {
-	Type        string `json:"type,omitempty"`         // text_delta, input_json_delta
+	Type        string `json:"type,omitempty"`         // text_delta, input_json_delta, thinking_delta, signature_delta
 	Text        string `json:"text,omitempty"`         // For text deltas
 	PartialJSON string `json:"partial_json,omitempty"` // For input_json_delta (tool input streaming)
 	StopReason  string `json:"stop_reason,omitempty"`  // For message_delta events
+	Thinking    string `json:"thinking,omitempty"`     // For thinking_delta
+	Signature   string `json:"signature,omitempty"`    // For signature_delta
 }

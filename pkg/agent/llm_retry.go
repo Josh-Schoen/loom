@@ -14,6 +14,7 @@
 package agent
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strings"
@@ -26,11 +27,60 @@ import (
 	"go.uber.org/zap"
 )
 
+// IsSyntheticWireUserRole reports whether role is a persisted Loom-internal
+// role that must be delivered to the LLM as user-turn content — the
+// skill-body sidecar, a hygiene retry injection, an empty-response retry
+// nudge, or a synthesis prompt — as opposed to the literal end user.
+// Exported so pkg/server's live-streaming gate (isNewMessageUpdateRole)
+// shares this definition instead of maintaining the same string set
+// independently.
+func IsSyntheticWireUserRole(role string) bool {
+	switch role {
+	case "skill_body", "hygiene_injection", "empty_response_retry", "synthesis_prompt":
+		return true
+	default:
+		return false
+	}
+}
+
+// normalizeWireRoles returns a copy of messages where synthetic
+// Loom-internal roles read "user". The persisted and in-memory session
+// messages are never mutated; only this local copy, built immediately
+// before the provider call, changes. Returns the input slice unchanged
+// (no allocation) when nothing needs folding — the common case, since most
+// turns carry no skill-body or hygiene-injection rows at all.
+func normalizeWireRoles(messages []Message) []Message {
+	needsFold := false
+	for _, m := range messages {
+		if IsSyntheticWireUserRole(m.Role) {
+			needsFold = true
+			break
+		}
+	}
+	if !needsFold {
+		return messages
+	}
+
+	out := make([]Message, len(messages))
+	for i, m := range messages {
+		if IsSyntheticWireUserRole(m.Role) {
+			m.Role = "user"
+		}
+		out[i] = m
+	}
+	return out
+}
+
 // chatWithRetry wraps LLM Chat calls with slot scheduling, capacity
 // observation, and exponential backoff retry logic. If the provider supports
 // streaming and a progress callback is configured, it will use streaming
 // with token buffering to emit real-time progress.
 func (a *Agent) chatWithRetry(ctx Context, messages []Message, tools []shuttle.Tool) (resp *LLMResponse, err error) {
+	// Fold synthetic Loom-internal roles to the wire "user" role before
+	// anything else sees this slice — including the debug dump below, which
+	// must capture the true wire-bound view, not the persisted role.
+	messages = normalizeWireRoles(messages)
+
 	// Debug tap: one context dump per provider call, before any dispatch branch.
 	// No-op unless the dump switch is on. Covers streaming, no-retry, and the
 	// retry loop alike since every path fans out from here.
@@ -52,7 +102,11 @@ func (a *Agent) chatWithRetry(ctx Context, messages []Message, tools []shuttle.T
 		defer func() {
 			var actual int64
 			if resp != nil {
-				actual = int64(resp.Usage.TotalTokens)
+				// Provider-metered usage, which for OpenAI-compatible and
+				// Gemini scopes includes cached prompt tokens (see
+				// types.Usage.RateLimitTokens) — not the cache-exclusive
+				// TotalTokens.
+				actual = int64(resp.Usage.ThroughputTokens())
 			}
 			grant.Release(actual)
 		}()
@@ -87,6 +141,48 @@ func (a *Agent) observeSchedulerOutcome(err error) {
 	}
 }
 
+// providerCtx returns the context for one provider call, suppressing extended
+// thinking when this history cannot be sent with it on.
+//
+// Thinking blocks are turn-scoped replay material and are never persisted, so
+// a turn rebuilt from the session store — a HITL park resumed mid tool loop —
+// replays its assistant tool_use rows without the blocks that accompanied
+// them. Anthropic rejects that pairing, which would kill the turn on resume.
+//
+// Both conditions are required. A resumed turn whose rows still carry their
+// blocks (the park never left the process) needs no suppression, and a missing
+// block outside a resume is not this problem — compile strips blocks from
+// SETTLED turns by design, and a model may simply have returned none.
+func (a *Agent) providerCtx(ctx Context, messages []Message) context.Context {
+	if isResumedTurn(ctx) && rebuiltToolTurn(messages) {
+		return llm.ContextSuppressThinking(ctx)
+	}
+	return ctx
+}
+
+// rebuiltToolTurn reports whether the newest turn present holds an assistant
+// message with tool calls but no thinking blocks — the shape a store rebuild
+// produces. Only the newest turn is examined: settled turns render without
+// their blocks on purpose.
+func rebuiltToolTurn(messages []Message) bool {
+	var newest int64
+	for i := range messages {
+		if messages[i].Turn > newest {
+			newest = messages[i].Turn
+		}
+	}
+	for i := range messages {
+		m := &messages[i]
+		if m.Turn != newest || m.Role != "assistant" || len(m.ToolCalls) == 0 {
+			continue
+		}
+		if len(m.ThinkingBlocks) == 0 {
+			return true
+		}
+	}
+	return false
+}
+
 // dispatchChat routes one LLM call to streaming, direct, or the retry loop.
 func (a *Agent) dispatchChat(ctx Context, messages []Message, tools []shuttle.Tool) (*LLMResponse, error) {
 	// Check if provider supports streaming and we have a progress callback
@@ -102,7 +198,7 @@ func (a *Agent) dispatchChat(ctx Context, messages []Message, tools []shuttle.To
 	// Non-streaming path with retry logic
 	// If retry is disabled, call LLM directly
 	if !a.config.Retry.Enabled || a.config.Retry.MaxRetries == 0 {
-		return a.llm.Chat(ctx, messages, tools)
+		return a.llm.Chat(a.providerCtx(ctx, messages), messages, tools)
 	}
 
 	var lastErr error
@@ -110,7 +206,7 @@ func (a *Agent) dispatchChat(ctx Context, messages []Message, tools []shuttle.To
 
 	for attempt := 0; attempt <= a.config.Retry.MaxRetries; attempt++ {
 		// Attempt LLM call
-		response, err := a.llm.Chat(ctx, messages, tools)
+		response, err := a.llm.Chat(a.providerCtx(ctx, messages), messages, tools)
 		if err == nil {
 			// Success! Log if we had previous failures
 			if attempt > 0 {
@@ -176,12 +272,17 @@ func (a *Agent) dispatchChat(ctx Context, messages []Message, tools []shuttle.To
 		a.config.Retry.MaxRetries+1, lastErr)
 }
 
+// toolInputActivityInterval throttles the IsToolInputStream progress events
+// emitted while a provider streams tool-input deltas: liveness needs a pulse,
+// not one event per JSON fragment.
+const toolInputActivityInterval = time.Second
+
 // chatWithStreaming uses streaming API with token buffering and progress emission.
 func (a *Agent) chatWithStreaming(ctx Context, messages []Message, tools []shuttle.Tool, progressCallback ProgressCallback) (*LLMResponse, error) {
 	streamingProvider, ok := a.llm.(llmtypes.StreamingLLMProvider)
 	if !ok {
 		// Fallback to non-streaming (should never happen due to check in chatWithRetry)
-		return a.llm.Chat(ctx, messages, tools)
+		return a.llm.Chat(a.providerCtx(ctx, messages), messages, tools)
 	}
 
 	// Token buffering state
@@ -239,8 +340,98 @@ func (a *Agent) chatWithStreaming(ctx Context, messages []Message, tools []shutt
 		}
 	}
 
+	// Tool-input (function-call argument) bytes never reach tokenCallback —
+	// the callback is text only, because its tokens become the visible
+	// partial response — so a tool argument the size of a document streams
+	// for minutes with no progress event at all, and anything watching for
+	// activity (an idle-based turn deadline, a proxy inactivity timer) sees a
+	// stalled stream. Providers report those deltas through
+	// NotifyStreamActivity; emit them as a throttled, content-free progress
+	// event so they count as activity without leaking JSON into the text.
+	var lastToolInputEmit time.Time
+	// toolInputReported flips once a provider reports per-call progress; that
+	// hook then owns the events, so the bare activity pulse stays silent.
+	toolInputReported := false
+	// Same suppression as the non-streaming path: a resumed turn's rebuilt
+	// rows carry no thinking blocks, and the provider rejects that pairing.
+	streamCtx := llmtypes.WithStreamActivity(a.providerCtx(ctx, messages), func() {
+		if toolInputReported {
+			return
+		}
+		now := time.Now()
+		if now.Sub(lastToolInputEmit) < toolInputActivityInterval {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		lastToolInputEmit = now
+		progressCallback(ProgressEvent{
+			Stage:             StageLLMGeneration,
+			Progress:          50,
+			Message:           "Generating tool call...",
+			Timestamp:         now,
+			IsToolInputStream: true,
+			Droppable:         true,
+			TokenCount:        tokenCount,
+			TTFT:              ttft,
+		})
+	})
+
+	// Providers that know which call is streaming also report its id, name and
+	// size so far. The first delta of each call (and the delta that first
+	// supplies its name or id) is emitted immediately so a consumer can show
+	// the tool before its arguments finish; later deltas are throttled.
+	type toolInputCall struct {
+		id, name string
+		lastEmit time.Time
+	}
+	toolInputCalls := map[int]*toolInputCall{}
+	streamCtx = llmtypes.WithToolInputProgress(streamCtx, func(p llmtypes.ToolInputProgress) {
+		toolInputReported = true
+		now := time.Now()
+		call, seen := toolInputCalls[p.Index]
+		if !seen {
+			call = &toolInputCall{}
+			toolInputCalls[p.Index] = call
+		}
+		identityChanged := !seen ||
+			(p.ToolName != "" && p.ToolName != call.name) ||
+			(p.ToolCallID != "" && p.ToolCallID != call.id)
+		if p.ToolName != "" {
+			call.name = p.ToolName
+		}
+		if p.ToolCallID != "" {
+			call.id = p.ToolCallID
+		}
+		if !identityChanged && now.Sub(call.lastEmit) < toolInputActivityInterval {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		call.lastEmit = now
+		progressCallback(ProgressEvent{
+			Stage:             StageLLMGeneration,
+			Progress:          50,
+			Message:           "Generating tool call...",
+			Timestamp:         now,
+			IsToolInputStream: true,
+			Droppable:         true,
+			TokenCount:        tokenCount,
+			TTFT:              ttft,
+			ToolName:          call.name,
+			ToolCallID:        call.id,
+			ToolInputBytes:    int64(p.Bytes),
+		})
+	})
+
 	// Call streaming provider
-	resp, err := streamingProvider.ChatStream(ctx, messages, tools, tokenCallback)
+	resp, err := streamingProvider.ChatStream(streamCtx, messages, tools, tokenCallback)
 	if err != nil {
 		return nil, err
 	}

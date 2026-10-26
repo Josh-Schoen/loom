@@ -18,6 +18,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -164,6 +165,30 @@ func (e *Executor) SetBuiltinToolProvider(provider BuiltinToolProvider) {
 	e.builtinToolProvider = provider
 }
 
+// CanonicalToolName returns the registered tool's own name for a lookup key.
+// Registry aliases point at the same Tool instance, so this keeps permissions,
+// admission, and circuit breakers keyed consistently with direct calls.
+// When the name is not found by direct lookup, a local suffix scan is tried
+// (same logic as tryDynamicRegistration) so callers get the server-qualified
+// name even for suffix or sanitized-name inputs.
+func (e *Executor) CanonicalToolName(name string) string {
+	if tool, ok := e.registry.Get(name); ok {
+		return tool.Name()
+	}
+	suffix := ":" + name
+	var matches []Tool
+	for _, t := range e.registry.ListTools() {
+		n := t.Name()
+		if strings.HasSuffix(n, suffix) || strings.ReplaceAll(n, ":", "_") == name {
+			matches = append(matches, t)
+		}
+	}
+	if len(matches) == 1 {
+		return matches[0].Name()
+	}
+	return name
+}
+
 // admit runs the admission gates for a tool call. It returns the request handed
 // to the hooks, the admission result, and — when the decision is Deny — a ready
 // permission_denied Result to return in place of running the tool. The
@@ -171,9 +196,10 @@ func (e *Executor) SetBuiltinToolProvider(provider BuiltinToolProvider) {
 // without a chain attached — so SetPermissionChecker is never silently inert:
 // a host that sets both gets the checker first, then the chain. With neither
 // configured the call is a pure pass-through.
-func (e *Executor) admit(ctx context.Context, toolName string, params map[string]interface{}) (AdmissionRequest, AdmissionResult, *Result) {
+
+func (e *Executor) admit(ctx context.Context, toolName, requestedToolName string, params map[string]interface{}) (AdmissionRequest, AdmissionResult, *Result) {
 	if e.permissionChecker != nil {
-		if err := e.permissionChecker.CheckPermission(ctx, toolName, params); err != nil {
+		if err := e.permissionChecker.checkPermissionNames(ctx, toolName, requestedToolName, params); err != nil {
 			denied := &Result{
 				Success: false,
 				Error:   &Error{Code: "permission_denied", Message: err.Error(), Retryable: false},
@@ -191,12 +217,13 @@ func (e *Executor) admit(ctx context.Context, toolName string, params map[string
 	}
 
 	req := AdmissionRequest{
-		Ctx:       ctx,
-		ToolName:  toolName,
-		Params:    params,
-		UserID:    userID,
-		SessionID: session.SessionIDFromContext(ctx),
-		State:     e.approvedSet,
+		Ctx:               ctx,
+		ToolName:          toolName,
+		RequestedToolName: requestedToolName,
+		Params:            params,
+		UserID:            userID,
+		SessionID:         session.SessionIDFromContext(ctx),
+		State:             e.approvedSet,
 	}
 
 	res := e.admissionChain.Admit(req)
@@ -263,8 +290,9 @@ func (e *Executor) Preflight(ctx context.Context, toolName string, params map[st
 
 	normalizedParams := NormalizeParametersToSchema(tool, params)
 
+	canonicalToolName := tool.Name()
 	if e.permissionChecker != nil {
-		if err := e.permissionChecker.CheckPermission(ctx, toolName, normalizedParams); err != nil {
+		if err := e.permissionChecker.checkPermissionNames(ctx, canonicalToolName, toolName, normalizedParams); err != nil {
 			return Decision{Kind: Deny, Reason: err.Error()}
 		}
 	}
@@ -277,12 +305,13 @@ func (e *Executor) Preflight(ctx context.Context, toolName string, params map[st
 		userID = e.identityResolver(ctx)
 	}
 	req := AdmissionRequest{
-		Ctx:       ctx,
-		ToolName:  toolName,
-		Params:    normalizedParams,
-		UserID:    userID,
-		SessionID: session.SessionIDFromContext(ctx),
-		State:     e.approvedSet,
+		Ctx:               ctx,
+		ToolName:          canonicalToolName,
+		RequestedToolName: toolName,
+		Params:            normalizedParams,
+		UserID:            userID,
+		SessionID:         session.SessionIDFromContext(ctx),
+		State:             e.approvedSet,
 	}
 	return e.admissionChain.Preflight(req)
 }
@@ -328,7 +357,8 @@ func (e *Executor) Execute(ctx context.Context, toolName string, params map[stri
 	// dynamic registration) so an externally-resolved tool is governed at the
 	// same seam as a local one. A Deny returns the permission_denied Result
 	// without running the tool body.
-	req, admRes, denied := e.admit(ctx, toolName, normalizedParams)
+	//
+	req, admRes, denied := e.admit(ctx, tool.Name(), toolName, normalizedParams)
 	adm = admRes
 	if denied != nil {
 		return denied, nil
@@ -403,7 +433,7 @@ func (e *Executor) ExecuteWithTool(ctx context.Context, tool Tool, params map[st
 
 	// Admit before execution. A Deny returns the permission_denied Result
 	// without running the tool body.
-	req, admRes, denied := e.admit(ctx, tool.Name(), normalizedParams)
+	req, admRes, denied := e.admit(ctx, tool.Name(), tool.Name(), normalizedParams)
 	adm = admRes
 	if denied != nil {
 		return denied, nil
@@ -687,6 +717,43 @@ func toLowerUnderscore(s string) string {
 // This enables agents to use tools they discover via tool_search without explicit registration.
 // Returns the registered tool, or nil if registration fails or tool not found.
 func (e *Executor) tryDynamicRegistration(ctx context.Context, toolName string) (Tool, error) {
+	// Fast path: the tool may already be registered locally under its
+	// server-qualified name (e.g., "teradata-aiop-mcp-server:base_readQuery")
+	// while the LLM called it using either:
+	//   - the plain unprefixed name ("base_readQuery"), because the ROM or
+	//     tool_search result returned the unprefixed form, or
+	//   - the LLM-sanitized qualified name ("teradata-aiop-mcp-server_base_readQuery"),
+	//     since some providers reject ':' in tool names (see llm.SanitizeToolName)
+	//     and the caller re-derived the sanitized form from an earlier turn
+	//     instead of using the provider's reverse-mapped original name.
+	// Scan the local registry first before hitting the external tool registry.
+	suffix := ":" + toolName
+	var matches []Tool
+	for _, t := range e.registry.ListTools() {
+		name := t.Name()
+		if strings.HasSuffix(name, suffix) || strings.ReplaceAll(name, ":", "_") == toolName {
+			matches = append(matches, t)
+		}
+	}
+	sort.Slice(matches, func(i, j int) bool { return matches[i].Name() < matches[j].Name() })
+	if len(matches) == 1 {
+		// Register an alias so subsequent calls skip this scan.
+		if e.registry.RegisterAlias(toolName, matches[0]) {
+			return matches[0], nil
+		}
+		if registered, ok := e.registry.Get(toolName); ok {
+			return registered, nil
+		}
+		return nil, fmt.Errorf("failed to register alias %q", toolName)
+	}
+	if len(matches) > 1 {
+		names := make([]string, len(matches))
+		for i, match := range matches {
+			names[i] = match.Name()
+		}
+		return nil, fmt.Errorf("ambiguous tool name %q matches %s", toolName, strings.Join(names, ", "))
+	}
+
 	// Check if tool registry is configured
 	if e.toolRegistry == nil {
 		return nil, fmt.Errorf("tool registry not configured")
@@ -731,6 +798,82 @@ func (e *Executor) tryDynamicRegistration(ctx context.Context, toolName string) 
 	default:
 		return nil, fmt.Errorf("unknown tool source: %v", toolInfo.Source)
 	}
+}
+
+// ResolveAndRegister resolves a tool by EXACT name from the dynamic registry
+// and registers it, returning the registered tool. It is the on-demand form of
+// the Execute-time fallback (tryDynamicRegistration), but differs in two ways
+// that make it safe to drive from skill manifests:
+//
+//   - Exact-name match. tryDynamicRegistration takes the top fuzzy FTS hit;
+//     here a required-tool name that isn't indexed fails cleanly instead of
+//     silently mounting the nearest tool.
+//   - Server binding. When servers is non-empty, MCP resolution is restricted
+//     to those servers, so a bare name (execute_sql) is bound to the server the
+//     skill declared rather than resolved non-deterministically across servers.
+func (e *Executor) ResolveAndRegister(ctx context.Context, name string, servers []string) (Tool, error) {
+	if e.toolRegistry == nil {
+		return nil, fmt.Errorf("tool registry not configured")
+	}
+	// A name already registered is returned as-is, never rebound. Two skills
+	// can declare the same bare name (execute_sql is the obvious one), and
+	// silently replacing the first skill's tool with the second's gives the
+	// model a tool whose behaviour changed under it — and makes the first
+	// skill's unmount remove a tool the second is still using. First claim
+	// wins; the caller gets the live tool and a nil error, because the name
+	// it asked for is mounted.
+	if existing, ok := e.registry.Get(name); ok {
+		return existing, nil
+	}
+	resp, err := e.toolRegistry.Search(ctx, &loomv1.SearchToolsRequest{
+		Query:         name,
+		Mode:          loomv1.SearchMode_SEARCH_MODE_FAST,
+		MaxResults:    10,
+		IncludeSchema: true,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to search tool registry: %w", err)
+	}
+	match := exactToolMatch(resp.Results, name, servers)
+	if match == nil {
+		return nil, fmt.Errorf("no exact-name match for %q in declared servers %v", name, servers)
+	}
+	switch match.Source {
+	case loomv1.ToolSource_TOOL_SOURCE_MCP:
+		return e.registerMCPTool(ctx, match)
+	case loomv1.ToolSource_TOOL_SOURCE_BUILTIN:
+		return e.registerBuiltinTool(ctx, match)
+	case loomv1.ToolSource_TOOL_SOURCE_CUSTOM:
+		return nil, fmt.Errorf("custom tools not supported for dynamic registration")
+	default:
+		return nil, fmt.Errorf("unknown tool source: %v", match.Source)
+	}
+}
+
+// exactToolMatch returns the first indexed tool whose Name equals name exactly.
+// When servers is non-empty, an MCP result must also belong to one of those
+// servers; non-MCP results ignore the server filter.
+func exactToolMatch(results []*loomv1.ToolSearchResult, name string, servers []string) *loomv1.IndexedTool {
+	for _, r := range results {
+		ti := r.GetTool()
+		if ti == nil || ti.GetName() != name {
+			continue
+		}
+		if len(servers) > 0 && ti.GetSource() == loomv1.ToolSource_TOOL_SOURCE_MCP {
+			matched := false
+			for _, s := range servers {
+				if s == ti.GetMcpServer() {
+					matched = true
+					break
+				}
+			}
+			if !matched {
+				continue
+			}
+		}
+		return ti
+	}
+	return nil
 }
 
 // registerMCPTool dynamically registers an MCP tool from the tool registry.

@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -44,6 +45,7 @@ import (
 	skilltasks "github.com/teradata-labs/loom/pkg/skills/tasks"
 	"github.com/teradata-labs/loom/pkg/storage"
 	"github.com/teradata-labs/loom/pkg/task"
+	"github.com/teradata-labs/loom/pkg/taskctx"
 	"github.com/teradata-labs/loom/pkg/types"
 	"go.uber.org/zap"
 )
@@ -222,8 +224,9 @@ func NewAgent(backend fabric.ExecutionBackend, llmProvider LLMProvider, opts ...
 		// Default-on memory compression: wire an LLM-backed compressor so L2
 		// compaction preserves decisions and approvals-with-scope via the
 		// registry-sourced compaction prompt. Requires both an LLM (dedicated
-		// compressor LLM preferred) and a prompt registry; without either, the
-		// heuristic summariser remains the fallback.
+		// compressor LLM preferred) and a prompt registry; without either, no
+		// compressor is wired and the fold drops old turns with an
+		// "(unsummarized)" marker instead of summarising them.
 		compressorLLM := a.llm
 		if a.compressorLLM != nil {
 			compressorLLM = a.compressorLLM
@@ -293,6 +296,55 @@ func NewAgent(backend fabric.ExecutionBackend, llmProvider LLMProvider, opts ...
 		a.skillTaskEmitter = skilltasks.NewEmitter(a.taskManager, a.taskDecomposer)
 	}
 
+	// Auto-wire the implicit task emitter whenever the task subsystem is
+	// configured, mirroring the skill emitter above. Without this, implicit
+	// recording only happened where a host explicitly passed
+	// WithImplicitTaskEmitter — so registry-built agents, and every subagent
+	// spawned through them, minted nothing.
+	//
+	// This wires the EMITTER, which is what registry-built agents lacked. It does
+	// not make SUBAGENT_SPAWN fire: the runtime passes TOOL_CALL (dispatchOneCall)
+	// and HUMAN_REQUEST (maybeParkBatch) and nothing else — task.RuntimeFiredTriggers
+	// is the authoritative list — so SUBAGENT_SPAWN, SKILL_ACTIVATION and
+	// WORKFLOW_STEP remain unused and no subagent-spawn task is minted from that
+	// trigger. Said plainly because the previous wording read as though this
+	// change had closed that too.
+	//
+	// The policy is resolved from the agent's OWN task board config. Passing nil
+	// here — the hardcoded default — made every knob the proto advertises inert
+	// on this path: mode, triggers, excluded_triggers and max_per_session were
+	// all ignored, so `mode: DISABLED` still minted a task. A feature that
+	// writes durable rows by default needs an off switch that works. It also
+	// split one policy in two, because buildTaskContext resolves the real config
+	// for ExcludedCreatedVia — emitter and renderer could disagree about the
+	// same setting.
+	//
+	// Reading it here needs no reordering: options are applied at the top of
+	// NewAgent, so taskBoardConfig is already final, and GetImplicitTasks is the
+	// generated nil-safe getter. An agent that says nothing about tasks still
+	// resolves to the opt-out default — recording on, capped per session, and
+	// the resulting tasks excluded from the agent's own task queries so they
+	// cost no context. A host that wants something the proto cannot express
+	// passes WithImplicitTaskEmitter explicitly, which preempts this.
+	//
+	// Cost is bounded by construction: EnsureForTurn memoizes on
+	// (session, turn) behind an in-memory check that runs before any query, so
+	// this is at most one task minted per turn that calls a tool, and nothing
+	// at all on turns that don't.
+	if a.implicitTasks == nil && a.taskManager != nil {
+		policy := task.ResolveImplicitPolicy(a.taskBoardConfig.GetImplicitTasks())
+		if policy.Enabled && !policy.CanFire() {
+			// Every knob parsed and validated, and nothing will ever be
+			// recorded: the configured triggers are ones the runtime does not
+			// fire yet. Said once, here, rather than discovered from an empty
+			// board.
+			zap.L().Warn("implicit_tasks is enabled but no configured trigger is fired by the runtime; nothing will be recorded",
+				zap.String("agent", a.config.Name),
+				zap.Strings("fired_by_runtime", triggerNames(task.RuntimeFiredTriggers())))
+		}
+		a.implicitTasks = task.NewImplicitEmitter(a.taskManager, policy, a.tracer, zap.L())
+	}
+
 	// Install the sticky-while-open-tasks checker on the orchestrator
 	// when both the skill subsystem and the task subsystem are present.
 	// Eviction will treat any active skill with non-DONE+non-CANCELLED
@@ -334,7 +386,7 @@ func NewAgent(backend fabric.ExecutionBackend, llmProvider LLMProvider, opts ...
 			a.taskManager,
 			hygiene.WithEnforcerTracer(a.tracer),
 			hygiene.WithEnforcerLogger(zap.L()),
-			hygiene.WithAgentID(a.id),
+			hygiene.WithAgentID(a.GetID()),
 		)
 	}
 
@@ -731,7 +783,7 @@ func (a *Agent) registerSessionTool(sessionID string, name string) {
 		return
 	}
 	if sessionID == "" {
-		sessionID = a.id
+		sessionID = a.GetID()
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -755,7 +807,7 @@ func (a *Agent) registerSessionTool(sessionID string, name string) {
 func (a *Agent) advertisedTools(ctx context.Context, session *Session) []shuttle.Tool {
 	all := a.tools.ListTools()
 
-	sessionID := a.id
+	sessionID := a.GetID()
 	if session != nil && session.ID != "" {
 		sessionID = session.ID
 	}
@@ -807,30 +859,27 @@ func (a *Agent) enforceRequiredSkillTools(sessionID string) {
 		}
 		for _, name := range as.Skill.Tools.RequiredTools {
 			if !a.tools.IsRegistered(name) {
-				tool := builtin.ByName(name)
-				if tool == nil {
-					zap.L().Warn("skill required tool not available; skipping",
+				if tool := builtin.ByName(name); tool != nil {
+					a.tools.Register(tool)
+					zap.L().Debug("skill required tool auto-registered (builtin)",
 						zap.String("skill", as.Skill.Name),
 						zap.String("tool", name))
+				} else if err := a.resolveSkillTool(name, as.Skill.Tools.MCPServers); err != nil {
+					// A non-builtin (MCP/registry) tool that does not
+					// resolve is logged and skipped; the turn continues
+					// without it.
+					zap.L().Warn("skill required tool not resolvable; skipping",
+						zap.String("skill", as.Skill.Name),
+						zap.String("tool", name),
+						zap.Strings("mcp_servers", as.Skill.Tools.MCPServers),
+						zap.Error(err))
 					continue
 				}
-				a.tools.Register(tool)
-				zap.L().Debug("skill required tool auto-registered",
-					zap.String("skill", as.Skill.Name),
-					zap.String("tool", name))
 			}
 			// Advertise the required tool into THIS session even when another
 			// session registered the definition first. Base tools are ignored
 			// by registerSessionTool, so requiring one never hides it elsewhere.
 			a.registerSessionTool(sessionID, name)
-		}
-		// Surface MCP-server requests so operators see when a skill has
-		// declared servers that aren't yet honored. Logged once per turn
-		// per skill rather than per server to avoid log spam.
-		if len(as.Skill.Tools.MCPServers) > 0 {
-			zap.L().Debug("skill declares mcp_servers; activation not yet supported",
-				zap.String("skill", as.Skill.Name),
-				zap.Int("count", len(as.Skill.Tools.MCPServers)))
 		}
 	}
 }
@@ -887,7 +936,7 @@ func (a *Agent) applySkillExcludedTools(in []shuttle.Tool, session *Session) []s
 	}
 	sessionID := session.ID
 	if sessionID == "" {
-		sessionID = a.id
+		sessionID = a.GetID()
 	}
 	active := a.skillOrchestrator.GetActiveSkills(sessionID)
 	if len(active) == 0 {
@@ -1061,6 +1110,42 @@ func (a *Agent) SetToolRegistryForDynamicDiscovery(toolRegistry shuttle.ToolRegi
 // GetDescription returns the agent description from configuration.
 func (a *Agent) GetDescription() string {
 	return a.config.Description
+}
+
+// SetSkillMCPResolver installs a host resolver for skill-declared MCP tools.
+// The host (e.g. the cloud runtime) owns MCP resolution — per-user auth,
+// endpoint routing — which loom cannot perform itself. Safe to call after
+// construction, once the host's accessible-server map is built. When unset,
+// enforceRequiredSkillTools falls back to the executor's own resolver.
+func (a *Agent) SetSkillMCPResolver(fn func(ctx context.Context, name string, servers []string) error) {
+	a.skillMCPResolverMu.Lock()
+	defer a.skillMCPResolverMu.Unlock()
+	a.skillMCPResolver = fn
+}
+
+// skillMCPResolverFn reads the installed resolver under the lock. The host may
+// install it after construction while turns are already running, so the field
+// is never read bare.
+func (a *Agent) skillMCPResolverFn() func(ctx context.Context, name string, servers []string) error {
+	a.skillMCPResolverMu.RLock()
+	defer a.skillMCPResolverMu.RUnlock()
+	return a.skillMCPResolver
+}
+
+// resolveSkillTool mounts a non-builtin skill-required tool by name, bounded to
+// the skill's declared mcp_servers. A host resolver, if installed, owns
+// resolution; otherwise loom's executor resolves the tool from the dynamic tool
+// registry. Uses a background context: resolution is an index lookup plus a
+// cached MCP client, with no request-scoped cancellation to honor.
+func (a *Agent) resolveSkillTool(name string, servers []string) error {
+	if fn := a.skillMCPResolverFn(); fn != nil {
+		return fn(context.Background(), name, servers)
+	}
+	if a.executor == nil {
+		return fmt.Errorf("no skill tool resolver available")
+	}
+	_, err := a.executor.ResolveAndRegister(context.Background(), name, servers)
+	return err
 }
 
 // GetConfig returns a copy of the agent configuration.
@@ -1308,15 +1393,29 @@ func (a *Agent) skillMenuPromptSupplement() string {
 	var b strings.Builder
 	b.WriteString("\n\n---\n\n# Available skills\n\n")
 	b.WriteString("Bound to this agent. Load with manage_skills to bring instructions into the conversation; until then, only the name + description below are in context.\n\n")
+	listed := 0
 	for _, rb := range resolved {
 		if rb.Skill == nil {
 			continue
 		}
+		// MANUAL skills are the user's to invoke, so they are not on the menu:
+		// manage_skills(load) refuses them, and naming one here would only
+		// invite the call that gets refused. The user's slash command activates
+		// them directly (Agent.loadSkillFromSlashCommand).
+		if isManualSkill(rb.Skill) {
+			continue
+		}
+		listed++
 		if rb.Skill.Description != "" {
 			b.WriteString(fmt.Sprintf("- %s — %s\n", rb.Skill.Name, rb.Skill.Description))
 		} else {
 			b.WriteString(fmt.Sprintf("- %s\n", rb.Skill.Name))
 		}
+	}
+	// An all-MANUAL binding set leaves a heading over an empty list, which reads
+	// as a menu with nothing on it. Render nothing instead.
+	if listed == 0 {
+		return ""
 	}
 	return b.String()
 }
@@ -1370,7 +1469,7 @@ func (a *Agent) checkAndRegisterTaskBoardTool() {
 		return
 	}
 
-	tbTool := NewTaskBoardTool(a.taskManager, a.taskDecomposer, a.id, a.llm, a.taskBoardConfig)
+	tbTool := NewTaskBoardTool(a.taskManager, a.taskDecomposer, a.GetID(), a.llm, a.taskBoardConfig)
 	a.tools.Register(tbTool)
 }
 
@@ -1391,6 +1490,18 @@ func (a *Agent) checkAndRegisterManageSkillsTool() {
 		return
 	}
 
+	a.tools.Register(a.newManageSkillsTool())
+}
+
+// newManageSkillsTool builds the manage_skills tool with this agent's skill
+// wiring. Two callers share it: the registration above, and the slash-command
+// load (Agent.loadSkillFromSlashCommand), which drives the same load path the
+// model uses so both routes activate, wire tools and emit tasks identically.
+// Returns nil when the orchestrator or its library is missing.
+func (a *Agent) newManageSkillsTool() *ManageSkillsTool {
+	if a.skillOrchestrator == nil || a.skillOrchestrator.GetLibrary() == nil {
+		return nil
+	}
 	tool := NewManageSkillsTool(
 		a.skillOrchestrator,
 		a.skillOrchestrator.GetLibrary(),
@@ -1398,7 +1509,12 @@ func (a *Agent) checkAndRegisterManageSkillsTool() {
 		a.enforceRequiredSkillTools,
 	)
 	tool.ctxDebug = a.ctxDebug
-	a.tools.Register(tool)
+	// Task emission on load. A method value, not the emitter itself, so the
+	// wiring is independent of construction order: this runs before NewAgent
+	// auto-wires a.skillTaskEmitter, and emitSkillTasksAsync reads that field
+	// at call time. An agent with no emitter is a no-op at the same place.
+	tool.emitSkillTasks = a.emitSkillTasksAsync
+	return tool
 }
 
 // checkAndRegisterLoadPatternTool registers the load_pattern builtin whenever a
@@ -1441,12 +1557,25 @@ func (a *Agent) buildTaskContext(ctx context.Context) string {
 
 	boardID := a.taskBoardConfig.DefaultBoardId
 
+	// Hide runtime-minted tasks from the agent's own view of its work.
+	//
+	// This is the guard on context growth. Implicit tasks are created once per
+	// working turn, and this block is rebuilt into the system prompt EVERY
+	// turn. Without the exclusion, a long conversation would inject a growing
+	// list of its own past turns — most visibly through the "recent
+	// completions" query below, whose three slots would be permanently occupied
+	// by the last three turns' bookkeeping.
+	//
+	// Empty unless an operator sets implicit_tasks.agent_visible.
+	excludeVia := task.ResolveImplicitPolicy(a.taskBoardConfig.GetImplicitTasks()).ExcludedCreatedVia()
+
 	// Query current claimed tasks for this agent.
 	claimed, _, err := a.taskManager.ListTasks(ctx, task.ListTasksOpts{
-		AssigneeAgentID: a.id,
-		Status:          loomv1.TaskStatus_TASK_STATUS_IN_PROGRESS,
-		BoardID:         boardID,
-		Limit:           5,
+		AssigneeAgentID:   a.GetID(),
+		Status:            loomv1.TaskStatus_TASK_STATUS_IN_PROGRESS,
+		BoardID:           boardID,
+		Limit:             5,
+		ExcludeCreatedVia: excludeVia,
 	})
 	if err != nil {
 		zap.L().Warn("task context: failed to list claimed tasks", zap.Error(err))
@@ -1454,26 +1583,34 @@ func (a *Agent) buildTaskContext(ctx context.Context) string {
 
 	// Query ready front.
 	ready, err := a.taskManager.GetReadyFront(ctx, boardID, task.ReadyFrontOpts{
-		MaxResults: 5,
+		MaxResults:        5,
+		ExcludeCreatedVia: excludeVia,
 	})
 	if err != nil {
 		zap.L().Warn("task context: failed to get ready front", zap.Error(err))
 	}
 
-	// Query board stats.
-	allTasks, total, err := a.taskManager.ListTasks(ctx, task.ListTasksOpts{
-		BoardID: boardID,
-		Limit:   1000,
+	// Query board stats with a single aggregate.
+	//
+	// This used to fetch up to 1000 full task rows — every column, several JSON
+	// payloads each — only to increment per-status counters, on a path that runs
+	// before every LLM call. It also truncated silently: a board with more than
+	// 1000 tasks reported wrong numbers to the agent.
+	counts, err := a.taskManager.CountByStatus(ctx, task.CountByStatusOpts{
+		BoardID:           boardID,
+		ExcludeCreatedVia: excludeVia,
 	})
 	if err != nil {
-		zap.L().Warn("task context: failed to list board tasks", zap.Error(err))
+		zap.L().Warn("task context: failed to count board tasks", zap.Error(err))
 	}
+	total := counts.Total
 
 	// Query recent completions (last 3 closed tasks for momentum/context).
 	recentDone, _, _ := a.taskManager.ListTasks(ctx, task.ListTasksOpts{
-		BoardID: boardID,
-		Status:  loomv1.TaskStatus_TASK_STATUS_DONE,
-		Limit:   3,
+		BoardID:           boardID,
+		Status:            loomv1.TaskStatus_TASK_STATUS_DONE,
+		Limit:             3,
+		ExcludeCreatedVia: excludeVia,
 	})
 
 	// If no tasks exist anywhere, skip the context block entirely.
@@ -1481,10 +1618,15 @@ func (a *Agent) buildTaskContext(ctx context.Context) string {
 		return ""
 	}
 
-	// Compute stats.
-	stats := map[string]int{"total": total}
-	for _, t := range allTasks {
-		stats[task.StatusName(t.Status)]++
+	// Stats come straight from the aggregate; no per-row loop.
+	stats := map[string]int{
+		"total": counts.Total,
+		task.StatusName(loomv1.TaskStatus_TASK_STATUS_OPEN):        counts.Open,
+		task.StatusName(loomv1.TaskStatus_TASK_STATUS_IN_PROGRESS): counts.InProgress,
+		task.StatusName(loomv1.TaskStatus_TASK_STATUS_BLOCKED):     counts.Blocked,
+		task.StatusName(loomv1.TaskStatus_TASK_STATUS_DONE):        counts.Done,
+		task.StatusName(loomv1.TaskStatus_TASK_STATUS_DEFERRED):    counts.Deferred,
+		task.StatusName(loomv1.TaskStatus_TASK_STATUS_CANCELLED):   counts.Cancelled,
 	}
 
 	var b strings.Builder
@@ -1658,12 +1800,17 @@ func formatWorkflowCommunicationInstructions(ctx *WorkflowCommunicationContext) 
 // getGuidanceMessage loads a guidance message from PromptRegistry or returns default.
 // Used for user-facing messages like error recovery, max turns, etc.
 func (a *Agent) getGuidanceMessage(ctx context.Context, key string, vars map[string]interface{}) string {
-	// Try loading from PromptRegistry
+	// Try loading from PromptRegistry. The guidance files register their entries
+	// under guidance.self_correction.<id> (prompts/guidance/self_correction.yaml),
+	// so try that namespace too; the plain key stays first for callers that
+	// register one directly. A rendered message that still holds a placeholder
+	// (a variable the caller did not pass) is never shown: the fallback runs.
 	if a.prompts != nil {
-		fullKey := "guidance." + key
-		msg, err := a.prompts.Get(ctx, fullKey, vars)
-		if err == nil && msg != "" {
-			return msg
+		for _, fullKey := range []string{"guidance." + key, "guidance.self_correction." + key} {
+			msg, err := a.prompts.Get(ctx, fullKey, vars)
+			if err == nil && msg != "" && !strings.Contains(msg, "{{") {
+				return msg
+			}
 		}
 	}
 
@@ -1680,6 +1827,15 @@ func (a *Agent) getGuidanceMessage(ctx context.Context, key string, vars map[str
 			}
 		}
 		return "The tool execution failed. Let me try a different approach."
+	case "repeated_tool_call":
+		count, name := "several", "this tool"
+		if c, ok := vars["count"].(string); ok && c != "" {
+			count = c
+		}
+		if n, ok := vars["tool_name"].(string); ok && n != "" {
+			name = n
+		}
+		return fmt.Sprintf("(note: this is call %s in a row to %s with identical arguments. Read this result before calling again: change the arguments, try a different approach, or finish. Calling again is fine when the data can change between calls, for example when polling a job that is still running.)", count, name)
 	default:
 		return "An unexpected situation occurred. Please try again."
 	}
@@ -1711,20 +1867,6 @@ func (a *Agent) getErrorMessage(ctx context.Context, category string, errorType 
 		}
 	}
 	return fmt.Sprintf("Error in %s: %s", category, errorType)
-}
-
-// maxPreviewLen is the maximum number of runes recorded in span preview attributes
-// (message.preview / response.preview). Capping prevents unbounded trace payload sizes
-// and avoids leaking full conversation content into observability backends.
-const maxPreviewLen = 200
-
-// truncatePreview returns up to maxPreviewLen runes of s, appending "…" when truncated.
-func truncatePreview(s string) string {
-	runes := []rune(s)
-	if len(runes) <= maxPreviewLen {
-		return s
-	}
-	return string(runes[:maxPreviewLen]) + "…"
 }
 
 // Chat processes a user message and returns a response.
@@ -1803,6 +1945,19 @@ func hasTextBlock(blocks []ContentBlock) bool {
 		}
 	}
 	return false
+}
+
+// maxPreviewLen is the maximum number of runes recorded in span preview attributes
+// to avoid bloating OTLP traces with large message bodies.
+const maxPreviewLen = 200
+
+// truncatePreview returns up to maxPreviewLen runes of s, appending "…" when truncated.
+func truncatePreview(s string) string {
+	runes := []rune(s)
+	if len(runes) <= maxPreviewLen {
+		return s
+	}
+	return string(runes[:maxPreviewLen]) + "…"
 }
 
 // chat runs the full conversation lifecycle — span setup, user-message
@@ -1922,21 +2077,19 @@ func (a *Agent) chat(ctx context.Context, sessionID string, userMessage string, 
 		Role:          "user",
 		Content:       userMessage,
 		ContentBlocks: p.contentBlocks,
-		AgentID:       a.id, // Track which agent received this message
+		AgentID:       a.GetID(), // Track which agent received this message
 		Timestamp:     time.Now(),
 	}, true)
-	_ = userMsg
 
-	// Fire graph memory extraction on the incoming user message immediately,
-	// in parallel with the LLM processing it. The user message is where the
-	// information lives — extract entities/facts before the response comes back.
-	if a.enableGraphMemoryExtraction {
-		a.graphExtractionWG.Add(1)
-		go func() {
-			defer a.graphExtractionWG.Done()
-			a.extractGraphMemoryAsync(ctx, sessionID)
-		}()
-	}
+	// A leading slash command is the user activating a skill. It runs here,
+	// after their message is on the record and before the model reads the
+	// conversation, so the skill's instructions are already in context for the
+	// turn that asked for them — and, for a MANUAL skill, this is the only
+	// route in. A message that names no known command is left alone.
+	a.loadSkillFromSlashCommand(ctx, session, userMessage)
+
+	// Graph memory extraction of this message starts in runConversationLoop,
+	// after recall, so the turn's own facts are never recalled as past memory.
 
 	// Store progressCallback in context so nested operations (tools, backends) can access it.
 	// This enables sub-agent progress reporting (e.g., weaver's sub-agents).
@@ -1944,16 +2097,60 @@ func (a *Agent) chat(ctx context.Context, sessionID string, userMessage string, 
 		ctx = ContextWithProgressCallback(ctx, p.progressCallback)
 	}
 
+	// Install this turn's task binding.
+	//
+	// The runtime — not the model — decides whether a turn gets a task. The
+	// binding is an empty slot now; it is filled deterministically on the first
+	// qualifying event (see maybeRecordImplicitTask), so a turn that only talks
+	// leaves no board row while a turn that does work always gets one. Nothing
+	// here asks the agent's permission and nothing depends on the agent electing
+	// to call task_board.
+	//
+	// It must be installed BEFORE agentCtx is built: writers that capture the
+	// context before the task exists read through the binding, so they observe
+	// the attribution as soon as it is set.
+	ctx, taskBinding := taskctx.ContextWithBinding(ctx)
+	turnIndex := userMsg.Turn
+
 	// Create agent context (a nil progressCallback is fine — no events emitted)
 	agentCtx := &agentContext{
 		Context:          ctx,
 		session:          session,
 		tracer:           a.tracer,
 		progressCallback: p.progressCallback,
+		taskBinding:      taskBinding,
+		turnIndex:        turnIndex,
+		userMessage:      userMessage,
 	}
 
 	// Run conversation loop
 	response, err := a.runConversationLoop(agentCtx)
+
+	// Close the turn's recorded task, if the runtime recorded one. Deferred
+	// until after the loop so the task spans the whole turn, and run even on
+	// error — a turn that failed still finished, and leaving the row IN_PROGRESS
+	// would misreport it as still running.
+	//
+	// A PARK is the exception, and the exception lives HERE, at the call site,
+	// rather than inside completeImplicitTask. A parked turn has not finished:
+	// it is waiting for a human, and the action they were asked to approve has
+	// not run. Closing it here reported the opposite twice over — the row went
+	// DONE, and implicitCloseReason reads TurnParkedError as a failure, so the
+	// board said "Turn ended with an error." about work that had not started.
+	// ResumeChat closes the turn when it actually terminates.
+	//
+	// Placing the exception at the call site is what preserves
+	// completeImplicitTask's own rule that it releases the per-turn memo FIRST
+	// and unconditionally. That rule is about its own early returns, which ask
+	// whether there is a task to CLOSE and never whether the turn ended; a park
+	// is the latter question, so the honest answer is not to call the function
+	// at all. Withholding the memo is required in its own right: the memo is
+	// what the resume rebinds through, so a turn that keeps running keeps its
+	// entry until the turn that finishes releases it.
+	var parkedHere *TurnParkedError
+	if !errors.As(err, &parkedHere) {
+		defer a.completeImplicitTask(ctx, taskBinding, session.ID, int(turnIndex), implicitCloseReason(response, err), err != nil)
+	}
 
 	a.checkAndRegisterGraphMemoryTool()
 	a.checkAndRegisterTaskBoardTool()
@@ -2014,9 +2211,12 @@ func (a *Agent) chat(ctx context.Context, sessionID string, userMessage string, 
 
 	// Add assistant response to history
 	a.appendMessage(ctx, session, Message{
-		Role:       "assistant",
+		Role: "assistant",
+		// Turn-ending message: thinking text rides for persistence; blocks
+		// would be stripped by the next turn's compile, so none are carried.
 		Content:    response.Content,
-		AgentID:    a.id, // Track which agent generated this response
+		Thinking:   response.Thinking,
+		AgentID:    a.GetID(), // Track which agent generated this response
 		Timestamp:  time.Now(),
 		TokenCount: response.Usage.TotalTokens,
 		CostUSD:    response.Usage.CostUSD,
@@ -2042,10 +2242,12 @@ func (a *Agent) chat(ctx context.Context, sessionID string, userMessage string, 
 	span.SetAttribute("conversation.turns", turns)
 	span.SetAttribute("conversation.tool_executions", toolExecs)
 	span.SetAttribute("conversation.duration_ms", duration.Milliseconds())
-	span.SetAttribute("conversation.tokens.total", response.Usage.TotalTokens)
-	span.SetAttribute("conversation.tokens.input", response.Usage.InputTokens)
-	span.SetAttribute("conversation.tokens.output", response.Usage.OutputTokens)
-	span.SetAttribute("conversation.cost.usd", response.Usage.CostUSD)
+	// Conversation-level figures are the TURN total (every LLM call), not
+	// the final call's share — see Response.TurnUsage.
+	span.SetAttribute("conversation.tokens.total", response.TurnUsage.TotalTokens)
+	span.SetAttribute("conversation.tokens.input", response.TurnUsage.InputTokens)
+	span.SetAttribute("conversation.tokens.output", response.TurnUsage.OutputTokens)
+	span.SetAttribute("conversation.cost.usd", response.TurnUsage.CostUSD)
 	span.SetAttribute("conversation.stop_reason", response.Metadata["stop_reason"])
 	span.SetAttribute("response.length", len(response.Content))
 	span.SetAttribute("response.preview", truncatePreview(response.Content))
@@ -2063,8 +2265,8 @@ func (a *Agent) chat(ctx context.Context, sessionID string, userMessage string, 
 		"duration_ms":     duration.Milliseconds(),
 		"turns":           turns,
 		"tool_executions": toolExecs,
-		"cost_usd":        response.Usage.CostUSD,
-		"tokens":          response.Usage.TotalTokens,
+		"cost_usd":        response.TurnUsage.CostUSD,
+		"tokens":          response.TurnUsage.TotalTokens,
 	})
 
 	a.recordConversationMetrics(sessionID, response, duration)
@@ -2098,13 +2300,44 @@ func (a *Agent) recordConversationMetrics(sessionID string, response *Response, 
 		observability.AttrSessionID: sessionID,
 	})
 
-	a.tracer.RecordMetric("agent.cost.usd", response.Usage.CostUSD, map[string]string{
+	// Agent-level cost/tokens describe the whole turn (every LLM call it
+	// made), so they read TurnUsage; Usage is the final call's share only.
+	a.tracer.RecordMetric("agent.cost.usd", response.TurnUsage.CostUSD, map[string]string{
 		observability.AttrSessionID: sessionID,
 	})
 
-	a.tracer.RecordMetric("agent.tokens.total", float64(response.Usage.TotalTokens), map[string]string{
+	a.tracer.RecordMetric("agent.tokens.total", float64(response.TurnUsage.TotalTokens), map[string]string{
 		observability.AttrSessionID: sessionID,
 	})
+}
+
+// addUsage folds one LLM call's usage into a running turn total.
+func addUsage(dst *Usage, u Usage) {
+	// RateLimitTokens stays zero until some call sets it (so a turn of calls
+	// that never set it still equals their plain sum); once any call does, it
+	// carries every call's metered figure, falling back to TotalTokens for the
+	// calls that did not. Computed before dst's TotalTokens is advanced.
+	if dst.RateLimitTokens > 0 || u.RateLimitTokens > 0 {
+		dst.RateLimitTokens = dst.ThroughputTokens() + u.ThroughputTokens()
+	}
+	dst.InputTokens += u.InputTokens
+	dst.OutputTokens += u.OutputTokens
+	dst.TotalTokens += u.TotalTokens
+	dst.CacheReadInputTokens += u.CacheReadInputTokens
+	dst.CacheCreationInputTokens += u.CacheCreationInputTokens
+	dst.CostUSD += u.CostUSD
+}
+
+// observePromptUsage feeds a successful call's provider-reported prompt size
+// into the session's relief calibration. The whole prompt is input + cache
+// read + cache write (types.Usage). Call before appending the response, so the
+// compiled context still matches what was sent.
+func (a *Agent) observePromptUsage(session *Session, u Usage) {
+	segMem, ok := session.SegmentedMem.(*SegmentedMemory)
+	if !ok || segMem == nil {
+		return
+	}
+	segMem.ObservePromptTokens(u.InputTokens + u.CacheReadInputTokens + u.CacheCreationInputTokens)
 }
 
 // appendMessage is the arrival seam (HLD §1): it stamps the message's turn,
@@ -2147,8 +2380,18 @@ type Response struct {
 	// Content is the text response
 	Content string
 
-	// Usage tracks token usage and cost
+	// Usage is the token usage and cost of the FINAL LLM call of the turn —
+	// the call that produced Content. It is what the persisted assistant
+	// message carries as its own TokenCount/CostUSD, so it must stay per-call:
+	// each tool-calling assistant row in the loop already carries its own.
 	Usage Usage
+
+	// TurnUsage is the sum over EVERY successful LLM call the turn made —
+	// the tool loop's calls, the empty-response and hygiene retries, and the
+	// final synthesis — i.e. what the provider actually billed for this turn.
+	// An embedder metering a turn must read this, not Usage: a turn that ran
+	// N tool-loop iterations has N−1 calls that Usage does not represent.
+	TurnUsage Usage
 
 	// ToolExecutions contains tools that were executed
 	ToolExecutions []ToolExecution
@@ -2327,6 +2570,7 @@ func (a *Agent) runConversationLoop(ctx Context) (*Response, error) {
 	turnCount := 0
 	toolExecutionCount := 0
 	var allToolExecutions []ToolExecution
+	var turnUsage Usage                         // sum of every successful LLM call this turn → Response.TurnUsage
 	emptyRetried := false                       // one-shot flag: retry empty LLM response at most once per conversation
 	hygieneRetries := 0                         // capped count of REQUIRE_FIX retries the end-of-turn auditor has triggered
 	var hygieneLast *hygiene.EnforcementOutcome // last outcome, surfaced into Response.Metadata
@@ -2367,6 +2611,18 @@ func (a *Agent) runConversationLoop(ctx Context) (*Response, error) {
 	// the turn carrying the human-approved action with no recall at all.
 	if !isResumedTurn(ctx) || !hasGraphMemoryContext(session) {
 		a.injectGraphMemoryContext(ctx, session)
+	}
+
+	// Extract the incoming user message only after recall, in parallel with the LLM
+	// call. A resume has no new user message, so it must not extract again.
+	// WithoutCancel: the turn may return before extraction ends; its own timeout bounds it.
+	if a.enableGraphMemoryExtraction && !isResumedTurn(ctx) {
+		extractCtx := context.WithoutCancel(ctx)
+		a.graphExtractionWG.Add(1)
+		go func() {
+			defer a.graphExtractionWG.Done()
+			a.extractGraphMemoryAsync(extractCtx, session.ID)
+		}()
 	}
 
 	// Conversation loop
@@ -2415,6 +2671,13 @@ func (a *Agent) runConversationLoop(ctx Context) (*Response, error) {
 			}
 		}
 
+		// The repeat-call note from the last tool batch rides this provider call
+		// only (see withReminder). The orchestrator is per turn, so an unsent note
+		// cannot reach a later turn.
+		if note := recovery.takeRepeatHint(); note != "" {
+			softReminder = strings.TrimSpace(softReminder + "\n" + note)
+		}
+
 		// Emit LLM generation progress
 		emitProgress(ctx, StageLLMGeneration, 20+clampInt32(turnCount*10), fmt.Sprintf("Generating response (turn %d)", turnCount), "")
 
@@ -2461,21 +2724,61 @@ func (a *Agent) runConversationLoop(ctx Context) (*Response, error) {
 				tools = recovery.activeTools(tools)
 				segMem.SetAdvertisedToolsBytes(advertisedToolsBytes(tools))
 			}
+			// Relief has nothing left to shed and the turn's own stubs still
+			// hold the context over the start mark: every further send is a
+			// near-limit loop toward MaxTurns and a preview-backed synthesis.
+			// End the turn with an error the user can act on instead.
+			if o, over := segMem.CurrentTurnOverflow(); over {
+				cause := fmt.Errorf("turn produced too many tool results to fit the context window: "+
+					"%d of %d results are already offloaded to stubs and the turn alone is still %d tokens "+
+					"against a relief start mark of %d; split the work into smaller batches across turns",
+					o.StubbedResults, o.ToolResults, o.FloorTokens, o.StartTokens)
+				zap.L().Error("current turn overflow: turn ends",
+					zap.String("session_id", session.ID),
+					zap.Int("turn", turnCount),
+					zap.Int("floor_tokens", o.FloorTokens),
+					zap.Int("start_tokens", o.StartTokens),
+					zap.Int("stubbed_results", o.StubbedResults),
+					zap.Int("tool_results", o.ToolResults))
+				span.AddEvent("turn.current_turn_overflow", map[string]interface{}{
+					"turn":            turnCount,
+					"floor_tokens":    o.FloorTokens,
+					"start_tokens":    o.StartTokens,
+					"stubbed_results": o.StubbedResults,
+					"tool_results":    o.ToolResults,
+				})
+				return nil, recovery.buildRecoverableError("current_turn_overflow", cause, "",
+					map[string]any{
+						"floor_tokens":    o.FloorTokens,
+						"start_tokens":    o.StartTokens,
+						"stubbed_results": o.StubbedResults,
+						"tool_results":    o.ToolResults,
+					})
+			}
 		}
 
-		// withReminder appends the turn's soft reminder as a trailing system
-		// message on a copy — transient, past every cache breakpoint, never
-		// stored — so both the normal send and the recovery resend carry it.
-		// The request context (WeaveRequest.context, e.g. the caller's local
-		// time) is applied the same way: transient, every call of the turn.
+		// withReminder appends the transient tail — the turn's soft reminder —
+		// as one trailing message on a copy: transient, past every cache
+		// breakpoint, never stored, carried by both the normal send and the
+		// recovery resend. The request context (WeaveRequest.context, e.g. the
+		// caller's local time) is applied first, transient on every call of the
+		// turn as well.
 		withReminder := func(msgs []Message) []Message {
 			msgs = withRequestContext(ctx, msgs)
-			if softReminder == "" {
+			tail := strings.TrimSpace(softReminder)
+			if tail == "" {
 				return msgs
 			}
 			out := make([]Message, len(msgs), len(msgs)+1)
 			copy(out, msgs)
-			return append(out, Message{Role: "system", Content: strings.TrimSpace(softReminder)})
+			// USER role, never system: gateways fold trailing system-role
+			// messages into the Anthropic system parameter at the HEAD of the
+			// request, where this mutating block would invalidate every cache
+			// segment on every call. A trailing user message stays in place —
+			// after the till-NOW breakpoint, outside every cached segment.
+			// The reminder tag marks it as harness state, not a user ask.
+			return append(out, Message{Role: "user",
+				Content: "<system-reminder>\n" + tail + "\n</system-reminder>"})
 		}
 
 		// Call LLM. Relief is proactive (above) — loom keeps the context under its
@@ -2483,7 +2786,22 @@ func (a *Agent) runConversationLoop(ctx Context) (*Response, error) {
 		// context-too-long still comes back (loom's estimate under-counted), shed
 		// and resend once; a second refusal ends the turn with the recoverable
 		// context_exhausted error.
-		llmResp, err := a.chatWithRetry(ctx, withReminder(messages), tools)
+		//
+		// Generation-free replay (WeaveRequest.replay_assistant_message): when a
+		// scripted assistant turn is threaded through the context, substitute it
+		// for the provider call. Relief/compression (above), context compilation,
+		// and graph extraction on the incoming user turn have all already run, so
+		// the memory pipeline is exercised exactly as a live turn — only
+		// generation is skipped. The scripted text carries no tool calls, so the
+		// loop finalizes this turn at the no-tool-calls branch below. An empty
+		// override is ignored (falls through to a normal provider call).
+		var llmResp *LLMResponse
+		var err error
+		if scripted, ok := scriptedResponseFromContext(ctx); ok && strings.TrimSpace(scripted) != "" {
+			llmResp = &LLMResponse{Content: scripted, StopReason: "end_turn"}
+		} else {
+			llmResp, err = a.chatWithRetry(ctx, withReminder(messages), tools)
+		}
 		if err != nil && errors.Is(err, llm.ErrContextTooLong) {
 			if segMem, ok := session.SegmentedMem.(*SegmentedMemory); ok && segMem != nil {
 				_, estimate, target := segMem.ReleasePressure(ctx, pressureRecoveryPenalty)
@@ -2519,6 +2837,8 @@ func (a *Agent) runConversationLoop(ctx Context) (*Response, error) {
 			})
 			return nil, fmt.Errorf("LLM call failed: %w", err)
 		}
+		addUsage(&turnUsage, llmResp.Usage)
+		a.observePromptUsage(session, llmResp.Usage)
 
 		// Record LLM response on conversation_loop span
 		llmEvent := map[string]interface{}{
@@ -2681,9 +3001,9 @@ func (a *Agent) runConversationLoop(ctx Context) (*Response, error) {
 				// One-shot retry: nudge the LLM to produce a response.
 				emptyRetried = true
 				a.appendMessage(ctx, session, Message{
-					Role:      "user",
+					Role:      "empty_response_retry",
 					Content:   "Your previous response was empty. Please provide a response summarizing what you found or explaining what went wrong.",
-					AgentID:   a.id,
+					AgentID:   a.GetID(),
 					Timestamp: time.Now(),
 				}, false)
 				continue // re-enter conversation loop for one more LLM call
@@ -2701,13 +3021,13 @@ func (a *Agent) runConversationLoop(ctx Context) (*Response, error) {
 				"tool_executions": toolExecutionCount,
 				"stop_reason":     llmResp.StopReason,
 				"response_length": len(content),
-				"total_tokens":    llmResp.Usage.TotalTokens,
-				"cost_usd":        llmResp.Usage.CostUSD,
+				"total_tokens":    turnUsage.TotalTokens,
+				"cost_usd":        turnUsage.CostUSD,
 			})
 			span.SetAttribute("conversation.turns", turnCount)
 			span.SetAttribute("conversation.tool_executions", toolExecutionCount)
 			span.SetAttribute("conversation.stop_reason", llmResp.StopReason)
-			span.SetAttribute("conversation.total_tokens", llmResp.Usage.TotalTokens)
+			span.SetAttribute("conversation.total_tokens", turnUsage.TotalTokens)
 
 			// End-of-turn hygiene check for skill-emitted tasks. Audits the
 			// active skill's tasks and either injects a fixup message and
@@ -2743,6 +3063,7 @@ func (a *Agent) runConversationLoop(ctx Context) (*Response, error) {
 			return &Response{
 				Content:        content,
 				Usage:          llmResp.Usage,
+				TurnUsage:      turnUsage,
 				ToolExecutions: allToolExecutions,
 				Thinking:       llmResp.Thinking,
 				Metadata:       meta,
@@ -2751,13 +3072,15 @@ func (a *Agent) runConversationLoop(ctx Context) (*Response, error) {
 
 		// Add assistant message with tool calls to history FIRST (required by Anthropic API)
 		_, assistantPersisted := a.appendMessage(ctx, session, Message{
-			Role:       "assistant",
-			Content:    llmResp.Content,
-			ToolCalls:  llmResp.ToolCalls,
-			AgentID:    a.id, // Track which agent generated this response
-			TokenCount: llmResp.Usage.TotalTokens,
-			CostUSD:    llmResp.Usage.CostUSD,
-			Timestamp:  time.Now(),
+			Role:           "assistant",
+			Content:        llmResp.Content,
+			ToolCalls:      llmResp.ToolCalls,
+			Thinking:       llmResp.Thinking,
+			ThinkingBlocks: llmResp.ThinkingBlocks,
+			AgentID:        a.GetID(), // Track which agent generated this response
+			TokenCount:     llmResp.Usage.TotalTokens,
+			CostUSD:        llmResp.Usage.CostUSD,
+			Timestamp:      time.Now(),
 		}, false)
 
 		// HITL park pre-scan (park.go): with park enabled and the batch's
@@ -2771,7 +3094,7 @@ func (a *Agent) runConversationLoop(ctx Context) (*Response, error) {
 		// assistantPersisted alone reports success for a batch that was never
 		// written anywhere — exactly the stranding this gate exists to stop.
 		if a.hitlPark != nil && assistantPersisted && a.memory.HasStore() {
-			if parkErr := a.maybeParkBatch(ctx, session, llmResp); parkErr != nil {
+			if parkErr := a.maybeParkBatch(ctx, session, llmResp, turnUsage); parkErr != nil {
 				return nil, parkErr
 			}
 		}
@@ -2833,7 +3156,7 @@ func (a *Agent) runConversationLoop(ctx Context) (*Response, error) {
 	// If we hit max turns/executions, make one final LLM call to synthesize results
 	// This ensures the agent provides meaningful output instead of a generic error message
 	emitProgress(ctx, StageSynthesis, 90, "Synthesizing tool execution results", "")
-	return a.synthesizeFinalResponse(ctx, session, turnCount, toolExecutionCount, allToolExecutions)
+	return a.synthesizeFinalResponse(ctx, session, turnCount, toolExecutionCount, allToolExecutions, turnUsage)
 }
 
 // batchState carries the loop-level state the per-call dispatch body reads
@@ -2886,7 +3209,7 @@ func (a *Agent) dispatchOneCall(ctx Context, session *Session, toolCall ToolCall
 					Message: fmt.Sprintf("per-turn tool call limit (%d) reached — call %d of %d skipped", st.maxPerTurn, i+1, st.batchLen),
 				},
 			},
-			AgentID:   a.id,
+			AgentID:   a.GetID(),
 			Timestamp: time.Now(),
 		}, false)
 		*st.toolExecutionCount++
@@ -2901,7 +3224,7 @@ func (a *Agent) dispatchOneCall(ctx Context, session *Session, toolCall ToolCall
 			Content:    a.formatToolResult(ctx, session.ID, toolCall.Name, cachedResult, nil) + "\n(deduplicated — reused result from identical call in this turn)",
 			ToolUseID:  toolCall.ID,
 			ToolResult: cachedResult,
-			AgentID:    a.id,
+			AgentID:    a.GetID(),
 			Timestamp:  time.Now(),
 		}, false)
 		*st.allToolExecutions = append(*st.allToolExecutions, ToolExecution{
@@ -2919,6 +3242,17 @@ func (a *Agent) dispatchOneCall(ctx Context, session *Session, toolCall ToolCall
 
 	// Check if this is a HITL request (contact_human tool)
 	if toolCall.Name == "contact_human" {
+		// Record this turn's task before the human is asked, on the trigger that
+		// names what is happening. This is the NON-PARKED path — a registered
+		// in-turn resolver answers inside the turn, so maybeParkBatch never ran
+		// and its HUMAN_REQUEST emission never fired. Without this, a supported
+		// HITL configuration never fires the default HUMAN_REQUEST trigger at
+		// all, and a turn whose FIRST action asks a human records nothing — the
+		// same first-action gap the park path had. No race with the TOOL_CALL
+		// emission below: that is the other branch of this if, and the emitter
+		// memoizes per turn regardless.
+		a.maybeRecordImplicitTask(ctx, loomv1.ImplicitTaskTrigger_IMPLICIT_TASK_TRIGGER_HUMAN_REQUEST)
+
 		// Extract HITL request details from tool input
 		hitlInfo := extractHITLInfo(toolCall.Input)
 
@@ -2937,6 +3271,15 @@ func (a *Agent) dispatchOneCall(ctx Context, session *Session, toolCall ToolCall
 		// Emit HITL-specific progress event
 		emitProgressWithHITL(ctx, StageHumanInTheLoop, hitlStageProgress, "Waiting for human response", toolCall.Name, hitlInfo)
 	} else {
+		// Record this turn's task before the tool runs, so the tool's own
+		// message rows are already attributable. Fixed rule, not a model
+		// decision; a no-op after the first call in a turn.
+		//
+		// Stays on the non-HITL branch after #382 moved this body into
+		// dispatchOneCall: a turn that parks at a human decision records its
+		// task from the HUMAN_REQUEST trigger instead, so emitting here too
+		// would race the two triggers for the same turn's first mint.
+		a.maybeRecordImplicitTask(ctx, loomv1.ImplicitTaskTrigger_IMPLICIT_TASK_TRIGGER_TOOL_CALL)
 		// Emit tool-started progress event
 		emitToolStarted(ctx, 50+clampInt32(*st.toolExecutionCount*5), toolCall)
 	}
@@ -3108,13 +3451,28 @@ func (a *Agent) commitToolRow(ctx Context, session *Session, toolCall ToolCall, 
 		formattedResult = formatToolResultWithEscalation(formattedResult, err, escalationMsg)
 	}
 
+	// Advisory note after repeated identical calls (the call itself already ran).
+	// The note goes to the next provider call only, never into this row: a row
+	// that carries it stops parsing as JSON or tabular data, and it would be
+	// stored and replayed in later turns. A failed call gets no note; "failed"
+	// is the same test the success metric below uses, since a tool-reported
+	// failure arrives with err == nil.
+	toolOK := err == nil && (result == nil || result.Success)
+	if n, hint := st.recovery.noteToolCall(dedupKey); hint && toolOK {
+		msg := a.getGuidanceMessage(ctx, "repeated_tool_call", map[string]interface{}{
+			"count": strconv.Itoa(n), "tool_name": toolCall.Name,
+		})
+		st.recovery.setRepeatHint(strings.Join(strings.Fields(msg), " "))
+		span.AddEvent("recovery.repeat_hint", map[string]interface{}{"tool_name": toolCall.Name, "count": n})
+	}
+
 	// Add tool result to conversation
 	a.appendMessage(ctx, session, Message{
 		Role:       "tool",
 		Content:    formattedResult,
 		ToolUseID:  toolCall.ID, // Store ID for Bedrock/Anthropic format conversion
 		ToolResult: result,
-		AgentID:    a.id, // Track which agent executed this tool
+		AgentID:    a.GetID(), // Track which agent executed this tool
 		Timestamp:  time.Now(),
 	}, false)
 
@@ -3126,9 +3484,9 @@ func (a *Agent) commitToolRow(ctx Context, session *Session, toolCall ToolCall, 
 	if result != nil && result.Metadata != nil {
 		if textBody, ok := result.Metadata["text_body"].(string); ok && textBody != "" {
 			st.pendingSidecars = append(st.pendingSidecars, Message{
-				Role:      "user",
+				Role:      "skill_body",
 				Content:   textBody,
-				AgentID:   a.id,
+				AgentID:   a.GetID(),
 				Timestamp: time.Now(),
 			})
 		}
@@ -3154,25 +3512,51 @@ func (a *Agent) commitToolRow(ctx Context, session *Session, toolCall ToolCall, 
 // conversation loop exhausts its turn/execution budget, so the agent yields
 // meaningful output instead of a generic limit error. Moved verbatim from
 // the loop tail when the batch body was extracted into dispatchOneCall.
-func (a *Agent) synthesizeFinalResponse(ctx Context, session *Session, turnCount, toolExecutionCount int, allToolExecutions []ToolExecution) (*Response, error) {
+func (a *Agent) synthesizeFinalResponse(ctx Context, session *Session, turnCount, toolExecutionCount int, allToolExecutions []ToolExecution, turnUsage Usage) (*Response, error) {
 	// Add a synthesis request to the conversation
 	// Include explicit format instructions since they may have been compressed in context
 	synthesisPrompt := "You must provide your final answer NOW with whatever information you have gathered so far. Summarize your findings: what actions were taken, what results were produced, and any remaining steps the user would need to complete manually. Be concise and actionable. You MUST respond with text — do not return an empty response."
 	a.appendMessage(ctx, session, Message{
-		Role:      "user",
+		Role:      "synthesis_prompt",
 		Content:   synthesisPrompt,
-		AgentID:   a.id, // Track which agent created this synthesis request
+		AgentID:   a.GetID(), // Track which agent created this synthesis request
 		Timestamp: time.Now(),
 	}, false)
 
-	// Make final LLM call WITHOUT tools to force synthesis
+	// Make final LLM call WITHOUT tools to force synthesis. It reaches here
+	// exactly when the loop ran out of budget — the turn is at its largest —
+	// so it gets the same relief as a loop send: advertise no tool bytes (this
+	// call carries none), shed before the send, and on a provider refusal shed
+	// deeper and resend once.
+	segMem, _ := session.SegmentedMem.(*SegmentedMemory)
+	if segMem != nil {
+		segMem.SetAdvertisedToolsBytes(0)
+		if shed, estimate, target := segMem.ReleasePressure(ctx, 0); shed {
+			zap.L().Info("relief: shed before synthesis",
+				zap.String("session_id", session.ID),
+				zap.Int("estimate_tokens", estimate),
+				zap.Int("target_tokens", target))
+		}
+	}
 	finalResp, err := a.chatWithRetry(ctx, withRequestContext(ctx, session.GetMessages()), nil)
+	if err != nil && errors.Is(err, llm.ErrContextTooLong) && segMem != nil {
+		_, estimate, target := segMem.ReleasePressure(ctx, pressureRecoveryPenalty)
+		zap.L().Info("context too long at synthesis: relief pass complete, resending once",
+			zap.String("session_id", session.ID),
+			zap.Int("estimate_tokens", estimate),
+			zap.Int("target_tokens", target))
+		finalResp, err = a.chatWithRetry(ctx, withRequestContext(ctx, session.GetMessages()), nil)
+	}
+	if err == nil {
+		a.observePromptUsage(session, finalResp.Usage)
+	}
 	if err != nil {
 		// Only fall back to guidance message if synthesis fails
 		maxTurnsMessage := a.getGuidanceMessage(ctx, "max_turns_reached", nil)
 		return &Response{
 			Content:        maxTurnsMessage,
 			Usage:          Usage{},
+			TurnUsage:      turnUsage, // the loop's calls were still billed
 			ToolExecutions: allToolExecutions,
 			Metadata: map[string]interface{}{
 				"turns":           turnCount,
@@ -3190,9 +3574,11 @@ func (a *Agent) synthesizeFinalResponse(ctx Context, session *Session, turnCount
 		content = fmt.Sprintf("Completed %d tool executions across %d turns.", toolExecutionCount, turnCount)
 	}
 
+	addUsage(&turnUsage, finalResp.Usage)
 	return &Response{
 		Content:        content,
 		Usage:          finalResp.Usage,
+		TurnUsage:      turnUsage,
 		ToolExecutions: allToolExecutions,
 		Thinking:       finalResp.Thinking,
 		Metadata: map[string]interface{}{
@@ -3270,7 +3656,7 @@ func (a *Agent) executeToolWithSelfCorrection(ctx Context, toolName string, inpu
 
 	// Execute with circuit breaker if enabled
 	if a.circuitBreakers != nil {
-		breaker := a.circuitBreakers.GetBreaker(toolName)
+		breaker := a.circuitBreakers.GetBreaker(a.executor.CanonicalToolName(toolName))
 		cbErr := breaker.Execute(func() error {
 			result, err = a.executor.Execute(ctxWithAgent, toolName, input)
 			return err
@@ -3911,6 +4297,13 @@ func (a *Agent) DeleteSession(sessionID string) {
 	// Retire the session's resource leases: a leaked ledger entry on a
 	// deleted session would pin RESOURCE_HOLDER priority forever.
 	a.leases.forget(sessionID)
+	// Drop the implicit emitter's per-session state — its cap counter, any
+	// remaining per-turn memo, and its board entry. Like the approved set
+	// above, those maps stay bounded by live sessions only because every
+	// retirement path frees them. No nil guard: ForgetSession is
+	// nil-receiver-safe, and a.implicitTasks is nil until a task manager is
+	// wired.
+	a.implicitTasks.ForgetSession(sessionID)
 }
 
 // ApprovedSet returns the executor's approved-set accessor; nil until one is
@@ -3939,6 +4332,18 @@ func (a *Agent) ClearAllSessions() {
 	if as := a.executor.ApprovedSet(); as != nil {
 		for _, s := range a.memory.ListSessions() {
 			as.ForgetSession(s.ID)
+		}
+	}
+	// The implicit emitter's per-session maps are bounded the same way, so this
+	// sibling of DeleteSession must retire them too. Also before ClearAll: after
+	// it ListSessions is empty and there is no id left to free by.
+	//
+	// The nil check is not for safety — ForgetSession is nil-receiver-safe — it
+	// avoids walking every live session to no purpose when no task manager is
+	// wired and there is nothing to free.
+	if a.implicitTasks != nil {
+		for _, s := range a.memory.ListSessions() {
+			a.implicitTasks.ForgetSession(s.ID)
 		}
 	}
 	a.memory.ClearAll()
@@ -4066,6 +4471,39 @@ func (a *Agent) GetLLMForRole(role loomv1.LLMRole) LLMProvider {
 		// Fall through to return main LLM
 	}
 	return a.llm
+}
+
+// GetLLMForRoleStrict returns the LLM explicitly configured for a role and
+// reports whether one exists. Unlike GetLLMForRole it does not fall back to the
+// main agent LLM, so a caller can tell "this role has its own model" from "this
+// role would be served by the agent's own model".
+//
+// It exists for capability-leveling ladder resolution: a ladder rung naming a
+// role is asking for a different model than the primary, and silently resolving
+// it to the primary's own LLM would build a ladder whose rungs are all the same
+// model — escalation that spends a call and cannot improve anything. Callers
+// wanting the fallback should keep using GetLLMForRole.
+//
+// AGENT and UNSPECIFIED name the agent's own LLM rather than a role LLM, so
+// they resolve to the main LLM when one is set.
+func (a *Agent) GetLLMForRoleStrict(role loomv1.LLMRole) (LLMProvider, bool) {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+
+	var llm LLMProvider
+	switch role {
+	case loomv1.LLMRole_LLM_ROLE_JUDGE:
+		llm = a.judgeLLM
+	case loomv1.LLMRole_LLM_ROLE_ORCHESTRATOR:
+		llm = a.orchestratorLLM
+	case loomv1.LLMRole_LLM_ROLE_CLASSIFIER:
+		llm = a.classifierLLM
+	case loomv1.LLMRole_LLM_ROLE_COMPRESSOR:
+		llm = a.compressorLLM
+	case loomv1.LLMRole_LLM_ROLE_AGENT, loomv1.LLMRole_LLM_ROLE_UNSPECIFIED:
+		llm = a.llm
+	}
+	return llm, llm != nil
 }
 
 // SetLLMProviderForRole sets the LLM provider for a specific role.
@@ -4335,4 +4773,45 @@ func (a *Agent) SetProviderPool(pool map[string]LLMProvider, active string, allo
 		return a.SetActiveProvider(active)
 	}
 	return nil
+}
+
+// WithImplicitTaskEmitter enables deterministic, runtime-driven task recording.
+//
+// With this set, the runtime records a task the first time a turn does something
+// worth recording — a tool call today — instead of waiting for the model to
+// decide it wants one. That is the difference between a board users can rely on
+// and a board that fills only when an LLM remembers to ask.
+//
+// Independent of WithTaskBoard: an agent can record tasks for the timeline while
+// never seeing the task_board tool, which is the common configuration.
+func WithImplicitTaskEmitter(e *task.ImplicitEmitter) Option {
+	return func(a *Agent) {
+		a.implicitTasks = e
+	}
+}
+
+// implicitCloseReason summarises how a turn ended, for the recorded task's
+// close reason. Kept short: this is a board-row caption, not a log line.
+func implicitCloseReason(resp *Response, err error) string {
+	if err != nil {
+		return "Turn ended with an error."
+	}
+	if resp != nil && resp.Metadata != nil {
+		if n, ok := resp.Metadata["tool_executions"].(int); ok && n > 0 {
+			if n == 1 {
+				return "Turn completed — 1 tool call."
+			}
+			return fmt.Sprintf("Turn completed — %d tool calls.", n)
+		}
+	}
+	return "Turn completed."
+}
+
+// triggerNames renders trigger enums as their bare YAML names for log lines.
+func triggerNames(trs []loomv1.ImplicitTaskTrigger) []string {
+	out := make([]string, 0, len(trs))
+	for _, tr := range trs {
+		out = append(out, strings.ToLower(strings.TrimPrefix(tr.String(), "IMPLICIT_TASK_TRIGGER_")))
+	}
+	return out
 }

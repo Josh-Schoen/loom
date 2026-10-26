@@ -12,7 +12,7 @@
 -- See the License for the specific language governing permissions and
 -- limitations under the License.
 
--- 000009_graph_entities_per_user.down.sql
+-- 000010_graph_entities_per_user.down.sql
 -- Restores UNIQUE(agent_id, name) on graph_entities.
 --
 -- This fails (and the migrator rolls the transaction back, leaving the

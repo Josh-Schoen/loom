@@ -42,9 +42,15 @@ jobs:
           cache: true
 
       - name: Install Just (Windows)
+        shell: pwsh
         run: |
-          choco install just -y
-          just --version
+          # Download just directly from GitHub Releases — avoids flaky Chocolatey CDN.
+          $version = "1.40.0"
+          $url = "https://github.com/casey/just/releases/download/$version/just-$version-x86_64-pc-windows-msvc.zip"
+          Invoke-WebRequest -Uri $url -OutFile "$env:TEMP\just.zip" -UseBasicParsing
+          Expand-Archive -Path "$env:TEMP\just.zip" -DestinationPath "$env:TEMP\just-bin" -Force
+          echo "$env:TEMP\just-bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          & "$env:TEMP\just-bin\just.exe" --version
 
       - name: Cache buf modules
         uses: ./.github/actions/buf-cache
@@ -188,7 +194,7 @@ jobs:
 
       - name: Upload installation logs
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: windows-installation-logs
           path: |

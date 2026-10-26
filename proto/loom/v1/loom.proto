@@ -445,6 +445,45 @@ service LoomService {
     option (google.api.http) = {get: "/v1/workflows/schedules/{schedule_id}/history"};
   }
 
+  // CancelScheduledExecution stops a scheduled execution that is in flight.
+  //
+  // Pausing a schedule prevents future runs but does nothing about one already
+  // in flight, and max_execution_seconds only detects a stuck run after the
+  // fact. This is the operator's stop button: without it a workflow that hangs
+  // holds its schedule's slot until the timeout expires, and skip_if_running
+  // silently skips every run in the meantime.
+  //
+  // Scope: this cancels executions minted by the scheduler — the IDs reported
+  // in ScheduledWorkflow.current_execution_id and in the response to
+  // TriggerScheduledWorkflow. Execution IDs from ExecuteWorkflow and
+  // StreamWorkflow live in a different namespace (the one GetWorkflowExecution
+  // and ListWorkflowExecutions read) and cannot be canceled here; passing one
+  // returns NOT_FOUND.
+  //
+  // NOT_FOUND means no scheduled execution with that ID exists, neither in
+  // flight nor in the schedule's history. A response with canceled = false and
+  // a message means the execution was found but had already reached its verdict
+  // before the request arrived; that is deliberately not an error, because a
+  // caller stopping a run that just finished got the state it asked for.
+  //
+  // Cancellation is cooperative — the execution's context is canceled and the
+  // run is recorded as canceled once it unwinds. Work already committed by
+  // earlier stages is not rolled back.
+  //
+  // Authorization: like the sibling schedule RPCs (PauseSchedule,
+  // ResumeSchedule, DeleteScheduledWorkflow, TriggerScheduledWorkflow), this
+  // performs no ownership check — the scheduled_workflows table has no owner
+  // column, so there is nothing to check against. Any caller that reaches the
+  // service can stop any scheduled execution. Adding ownership is a follow-up
+  // for the whole schedule surface rather than something this one RPC can
+  // solve; it is recorded here so the gap is not mistaken for an oversight.
+  rpc CancelScheduledExecution(CancelScheduledExecutionRequest) returns (CancelScheduledExecutionResponse) {
+    option (google.api.http) = {
+      post: "/v1/workflows/schedules/executions/{execution_id}:cancel"
+      body: "*"
+    };
+  }
+
   // Tri-Modal Communication RPCs
 
   // Broadcast Bus (Pub/Sub) Operations
@@ -778,6 +817,26 @@ message WeaveRequest {
   // it unset.
   google.protobuf.Timestamp occurred_at = 11;
 
+  // Generation-free replay: when set, the agent does NOT call the LLM to
+  // generate a response. Instead it records this text verbatim as the
+  // assistant's turn and runs the full turn pipeline exactly as a live turn
+  // would — context compilation, memory compression (relief/fold),
+  // graph-memory extraction, and salience updates. Only generation is skipped.
+  //
+  // This replays a pre-written conversation turn-by-turn while preserving the
+  // ground-truth assistant content (never inventing the assistant's side), so
+  // the memory system is exercised under realistic accumulation. It is used by
+  // the LongMemEval conversation-replay harness and is typically paired with
+  // occurred_at to anchor each turn at its historical time.
+  //
+  // Gated by its own server.allow_assistant_override switch
+  // (FAILED_PRECONDITION when disabled) — separate from occurred_at's
+  // server.allow_time_override, so operators who enabled timestamp anchoring
+  // have not implicitly accepted caller-supplied assistant content.
+  // Whitespace-only values are rejected (INVALID_ARGUMENT). Live
+  // conversations leave it unset.
+  string replay_assistant_message = 12;
+
   // Tools the caller executes itself (optional). Each definition is offered to
   // the agent for this call only, alongside its server-side tools. When the
   // agent calls one, the server does not execute it: it emits a WeaveProgress
@@ -792,19 +851,19 @@ message WeaveRequest {
   // the stream; Weave rejects a non-empty list (INVALID_ARGUMENT). Names must
   // be unique and must not collide with the agent's own tools
   // (INVALID_ARGUMENT).
-  repeated ToolDefinition client_tools = 12;
+  repeated ToolDefinition client_tools = 13;
 
   // How long the server waits for each client tool result, in seconds
   // (default: 300). Servers may cap this value. A call that times out is
   // returned to the agent as a failed tool result with error code
   // CLIENT_TOOL_TIMEOUT.
-  int32 client_tool_timeout_seconds = 13;
+  int32 client_tool_timeout_seconds = 14;
 
   // Fold the conversation so far into its summary before processing this
   // message, keeping the most recent turns as they are ("make room").
   // Unlike reset_context, nothing is forgotten: older turns live on in the
   // summary. No effect when there is nothing old enough to fold.
-  bool compact_context = 14;
+  bool compact_context = 15;
 }
 
 // WeaveResponse contains the execution result.
@@ -918,17 +977,30 @@ message WeaveProgress {
   // Tool execution duration in milliseconds (when is_tool_completed)
   int64 tool_duration_ms = 19;
 
-  // Unique identifier correlating started/completed events for the same tool call
+  // Unique identifier correlating started/completed events for the same tool
+  // call; also set on is_tool_input_stream events so they match the later
+  // started event.
   string tool_call_id = 20;
 
   // Context window state (included in completion event)
   ContextState context_state = 21;
 
+  // True while the model is still writing a tool call's arguments. Carries no
+  // argument content; tool_name, tool_call_id and tool_input_bytes identify the
+  // call when the provider reports them.
+  bool is_tool_input_stream = 22;
+
+  // Bytes of tool-call argument JSON received so far (when is_tool_input_stream).
+  // Events are throttled, so the last value can lag the final size. A bare pulse
+  // from a provider that does not report sizes has no tool_call_id or tool_name
+  // and a size of 0; with either set, 0 means no arguments have arrived yet.
+  int64 tool_input_bytes = 23;
+
   // Set when the agent called one of the request's client_tools. The turn is
   // held until the caller posts SubmitClientToolResult for
   // client_tool_call.tool_call_id or the call times out. Consumers that did
   // not declare client tools never receive this field.
-  ClientToolCall client_tool_call = 22;
+  ClientToolCall client_tool_call = 24;
 }
 
 // ClientToolCall is a tool call the server hands to the client for execution.
@@ -2277,6 +2349,42 @@ message GetScheduleHistoryResponse {
   repeated ScheduleExecution executions = 1;
 }
 
+// CancelScheduledExecutionRequest stops a scheduled execution that is in
+// flight.
+//
+// The ID must be one the scheduler minted. IDs returned by ExecuteWorkflow and
+// StreamWorkflow belong to a different namespace and yield NOT_FOUND.
+message CancelScheduledExecutionRequest {
+  // Execution ID to cancel, as reported by ScheduledWorkflow.current_execution_id
+  // or by the response to TriggerScheduledWorkflow. An ID that names no
+  // scheduled execution — in flight or in history — returns NOT_FOUND.
+  string execution_id = 1;
+
+  // Optional human-readable reason, recorded in the execution history so the
+  // record distinguishes an operator stop from a crash.
+  string reason = 2;
+}
+
+// CancelScheduledExecutionResponse reports what the cancellation did.
+//
+// Reaching this message at all means the execution exists in the scheduler's
+// namespace; an unknown ID is a NOT_FOUND error instead.
+message CancelScheduledExecutionResponse {
+  // True when the execution was in flight and its context was canceled; the
+  // run is recorded as canceled once it unwinds. False means the execution had
+  // already reached its verdict before the request arrived, so nothing was
+  // signaled and the recorded outcome stands — not an error, since a caller
+  // stopping a run that just completed got the state it asked for.
+  //
+  // Cancellation is cooperative: true says the signal was delivered, not that
+  // the run has stopped yet, and work already committed is not rolled back.
+  bool canceled = 1;
+
+  // Human-readable outcome, suitable for showing directly. It is the only thing
+  // that distinguishes "signaled" from "already finished" beyond the boolean.
+  string message = 2;
+}
+
 // ScheduleExecution represents a single execution of a scheduled workflow.
 message ScheduleExecution {
   // Execution ID
@@ -2288,7 +2396,9 @@ message ScheduleExecution {
   // Completed at timestamp (Unix seconds)
   int64 completed_at = 3;
 
-  // Status: "success", "failed", "skipped"
+  // Status: "success", "failed", "skipped", "canceled"
+  // The US spelling matches WorkflowStatus "canceled" in the workflow-execution
+  // namespace, so both surfaces report the same word for the same outcome.
   string status = 4;
 
   // Error message (if failed)
@@ -2848,6 +2958,12 @@ message Artifact {
 
   // Soft delete timestamp (Unix seconds, optional)
   int64 deleted_at = 16;
+
+  // Session this artifact belongs to. Empty for artifacts created outside a
+  // session (user uploads, pre-session tooling). The store has recorded this
+  // since sessions were introduced; it was simply never put on the wire, which
+  // left remote clients unable to tell whose files they were looking at.
+  string session_id = 17;
 }
 
 // ListArtifactsRequest lists artifacts with optional filtering.
@@ -2869,6 +2985,13 @@ message ListArtifactsRequest {
 
   // Include soft-deleted artifacts
   bool include_deleted = 6;
+
+  // Filter to artifacts belonging to one session (optional). Unset means no
+  // session filtering, preserving existing behaviour. This is what lets a
+  // remote surface render "the files this session produced" — the local
+  // artifact store has always supported it (artifacts.Filter.SessionID); the
+  // request message could not express it.
+  string session_id = 7;
 }
 
 // ListArtifactsResponse returns a list of artifacts.
@@ -2887,6 +3010,12 @@ message GetArtifactRequest {
 
   // Artifact name (alternative lookup if ID not provided)
   string name = 2;
+
+  // Session to scope a name lookup to (optional). Names are only unique within
+  // a session, so a bare name lookup from a remote client is ambiguous without
+  // this. Ignored when id is set. Unset falls back to the session carried in
+  // the call context, preserving existing behaviour for in-session callers.
+  string session_id = 3;
 }
 
 // GetArtifactResponse returns artifact metadata.

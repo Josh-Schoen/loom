@@ -232,9 +232,9 @@ Enforcement differs by backend:
 Background work that runs without a user identity (for example, the skill-eviction
 salience boost, which uses `context.Background()`) operates on `default-user` rows only.
 
-Migrations: SQLite `000009_graph_entities_per_user` rebuilds `graph_entities` to
+Migrations: SQLite `000010_graph_entities_per_user` rebuilds `graph_entities` to
 change `UNIQUE(agent_id, name)` to `UNIQUE(agent_id, user_id, name)`; PostgreSQL
-`000024_graph_entities_per_user` swaps the constraint in place. Rolling either back
+`000025_graph_entities_per_user` swaps the constraint in place. Rolling either back
 fails if two users under one agent have an entity with the same name.
 
 

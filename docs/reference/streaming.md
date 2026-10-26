@@ -125,8 +125,10 @@ message WeaveProgress {
   string tool_error = 17;             // Error message if tool failed (when is_tool_completed)
   bool tool_success = 18;             // Whether tool succeeded (when is_tool_completed)
   int64 tool_duration_ms = 19;        // Tool execution duration in ms (when is_tool_completed)
-  string tool_call_id = 20;           // Unique ID correlating started/completed events
+  string tool_call_id = 20;           // Unique ID correlating started/completed and tool-input stream events
   ContextState context_state = 21;    // Context window state (included in completion event)
+  bool is_tool_input_stream = 22;     // True while the model is still writing a tool call's arguments
+  int64 tool_input_bytes = 23;        // Argument bytes received so far (when is_tool_input_stream)
 }
 ```
 
@@ -333,10 +335,12 @@ Tool execution duration in milliseconds.
 #### tool_call_id
 
 **Type**: `string`
-**Required**: No (only on tool lifecycle events)
-**Available since**: v1.2.0
+**Required**: No (only on tool lifecycle events and `is_tool_input_stream` events)
+**Available since**: v1.2.0 (on `is_tool_input_stream` events: unreleased, after v1.4.0)
 
 Unique identifier that correlates `is_tool_started` and `is_tool_completed` events for the same tool call. Clients can use this to track individual tool executions.
+
+The same ID also appears on `is_tool_input_stream` events, before the tool starts. A non-empty `tool_call_id` therefore does **not** mean the tool has started: check `is_tool_started` for that.
 
 
 #### context_state
@@ -369,6 +373,28 @@ A tool call the server hands to the caller for execution. The turn is held until
 - `arguments_json` (string): Model-produced arguments as a JSON object.
 - `session_id` (string): Session the call belongs to. Set even when the request named no session.
 - `timeout_seconds` (int32): Seconds the server waits for the result.
+
+
+#### is_tool_input_stream
+
+**Type**: `bool`
+**Required**: No
+**Available since**: unreleased (after v1.4.0)
+
+True while the model is still writing a tool call's arguments, before `is_tool_started`. The event carries no argument content. `tool_name` and `tool_call_id` identify the call when the provider reports them; a provider that does not report them sends a bare liveness pulse with both empty.
+
+The first event for a call, and the event that first supplies its name or id, are sent immediately. Later events are throttled to about one per second per call.
+
+
+#### tool_input_bytes
+
+**Type**: `int64`
+**Required**: No (only when `is_tool_input_stream` is true)
+**Available since**: unreleased (after v1.4.0)
+
+Bytes of tool-call argument JSON received so far. Because events are throttled, the last value a client sees can lag the final size until `is_tool_started` arrives.
+
+A value of 0 with no `tool_call_id` and no `tool_name` means the provider does not report sizes (a bare pulse). With either set, 0 means no arguments have arrived yet.
 
 
 ## Execution Stages
@@ -1247,7 +1273,7 @@ message SessionStatusUpdate {
 Sent when a new message is added to the session conversation (e.g., from a sub-agent response, tool result, or user input).
 
 **Fields**:
-- `role`: Message role - `user`, `assistant`, or `tool` (only these roles are sent)
+- `role`: Message role - `user`, `assistant`, `tool`, `skill_body`, `hygiene_injection`, `empty_response_retry`, or `synthesis_prompt` (only these roles are sent). `skill_body`, `hygiene_injection`, `empty_response_retry`, and `synthesis_prompt` are synthetic, agent-authored roles — a loaded skill's instructions, a hygiene-retry nudge, an empty-response retry nudge, and a forced-final-answer synthesis prompt, respectively — persisted separately from the literal end user; see `pkg/agent/llm_retry.go`'s `IsSyntheticWireUserRole`.
 - `content`: The message text
 - `message_timestamp`: When the message was created (Unix timestamp)
 - `tool_name`: 🚧 Defined in proto but not yet populated by the server implementation

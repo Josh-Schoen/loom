@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -808,6 +809,10 @@ func (c *Client) ChatStream(ctx context.Context, messages []llmtypes.Message,
 	toolCallMap := make(map[int]*llmtypes.ToolCall)
 
 	scanner := bufio.NewScanner(httpResp.Body)
+	// A gateway may coalesce a whole response (or an error echoing the request)
+	// into one SSE line; the Scanner default 64KB line cap aborts the stream.
+	// Grown on demand, so steady-state memory is unchanged.
+	scanner.Buffer(make([]byte, 0, 64<<10), 8<<20)
 	for scanner.Scan() {
 		line := scanner.Text()
 
@@ -842,6 +847,9 @@ func (c *Client) ChatStream(ctx context.Context, messages []llmtypes.Message,
 			}
 
 			if len(choice.Delta.ToolCalls) > 0 {
+				// Tool-call deltas never reach tokenCallback (text only);
+				// report them as stream activity.
+				llmtypes.NotifyStreamActivity(ctx)
 				for _, tcDelta := range choice.Delta.ToolCalls {
 					idx := tcDelta.Index
 					if _, exists := toolCallMap[idx]; !exists {
@@ -884,6 +892,9 @@ func (c *Client) ChatStream(ctx context.Context, messages []llmtypes.Message,
 	}
 
 	if err := scanner.Err(); err != nil {
+		if errors.Is(err, bufio.ErrTooLong) {
+			return nil, fmt.Errorf("error reading stream: SSE line exceeded the 8MB cap: %w", err)
+		}
 		return nil, fmt.Errorf("error reading stream: %w", err)
 	}
 
