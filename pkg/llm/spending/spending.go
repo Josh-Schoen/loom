@@ -17,7 +17,8 @@
 // for the current calendar month and saves it to a file; Wrap puts a provider
 // behind it. Once the month's total reaches the limit, new turns are refused
 // (Admit) and calls outside an admitted turn fail with a *LimitError, until
-// the month changes or the limit is raised.
+// the month changes or the limit is raised. Providers that cost nothing (see
+// IsFree), such as a model on the server's own computer, are never refused.
 //
 // A turn admitted while under the limit runs to the end, so the total can
 // pass the limit by the cost of the turns in progress when it was reached.

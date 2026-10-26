@@ -7,7 +7,8 @@ weight: 47
 
 A monthly limit on the estimated cost of a `looms serve` process's LLM calls.
 When the month's total reaches the limit, new turns are refused until the
-month changes or the limit is raised.
+month changes or the limit is raised. Providers that cost nothing (local
+Ollama models) are never refused.
 
 **Status**: ✅ Implemented (`pkg/llm/spending`, `looms serve`;
 `MultiAgentServer` Weave and StreamWeave).
@@ -81,9 +82,10 @@ ledger), so a provider shared by several agents is counted once per call.
 
 ### Turns
 
-`Weave` and `StreamWeave` check the ledger after validating the request and
-before running the agent (`MultiAgentServer.admitTurn`). Over the limit they
-return:
+`Weave` and `StreamWeave` check the ledger after resolving the agent and
+before running it (`MultiAgentServer.admitTurn`). Over the limit they
+return the error below, unless the agent's main LLM costs nothing (see
+[Free providers](#free-providers)):
 
 ```
 code: RESOURCE_EXHAUSTED
@@ -119,6 +121,20 @@ Calls not started from an admitted turn (scheduled workflows, judges,
 background agents) fail with a `*spending.LimitError`
 (`errors.Is(err, spending.ErrLimitReached)`) once the limit is reached.
 Provider health checks are never refused.
+
+### Free providers
+
+A provider that implements `CostsNothing() bool` returning `true`, itself or
+anywhere in its `Unwrap()` chain, is free (`spending.IsFree`). Implemented by
+`ollama.Client`.
+
+- Calls to a free provider are never refused, inside or outside a turn.
+- A turn whose agent's main LLM (`GetLLMForRole(LLM_ROLE_UNSPECIFIED)`) is
+  free runs over the limit. Its context is not admitted, so a paid provider
+  it calls during that turn (a cloud `compressor_llm`, judge or classifier)
+  still fails with `*spending.LimitError`.
+- Free calls still pass through `Record`; they report `CostUSD` 0, so they
+  add nothing.
 
 ---
 

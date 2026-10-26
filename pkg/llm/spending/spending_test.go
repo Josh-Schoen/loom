@@ -180,3 +180,28 @@ func TestConcurrentRecords(t *testing.T) {
 	wg.Wait()
 	assert.InDelta(t, 0.5, l.Status().SpentUSD, 1e-9)
 }
+
+// freeProvider costs nothing to call, like a local Ollama model.
+type freeProvider struct{ fakeProvider }
+
+func (*freeProvider) CostsNothing() bool { return true }
+
+// Over the limit a provider that costs nothing still answers, outside an
+// admitted turn too; a paid one is refused.
+func TestFreeProviderRunsOverLimit(t *testing.T) {
+	l, err := Open(filepath.Join(t.TempDir(), "spending.json"), 1.0)
+	require.NoError(t, err)
+	require.NoError(t, l.Record(1.0))
+
+	free := &freeProvider{}
+	assert.True(t, IsFree(free))
+	_, err = Wrap(free, l).Chat(context.Background(), nil, nil)
+	require.NoError(t, err)
+	assert.Equal(t, 1, free.calls)
+
+	paid := &fakeProvider{cost: 0.1}
+	assert.False(t, IsFree(paid))
+	_, err = Wrap(paid, l).Chat(context.Background(), nil, nil)
+	assert.ErrorIs(t, err, ErrLimitReached)
+	assert.Zero(t, paid.calls)
+}

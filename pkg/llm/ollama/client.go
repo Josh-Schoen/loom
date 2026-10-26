@@ -171,6 +171,11 @@ func (c *Client) Model() string {
 	return c.model
 }
 
+// CostsNothing reports that Ollama calls have no per-call cost (Usage.CostUSD
+// is always 0), so a monthly spending limit does not apply to them (see
+// spending.IsFree).
+func (c *Client) CostsNothing() bool { return true }
+
 // supportsNativeTools checks if the model supports native tool calling.
 // In auto mode it first tries a dynamic probe via Ollama's /api/show endpoint,
 // falling back to a static model list if the probe fails.
