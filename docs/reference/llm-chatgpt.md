@@ -156,7 +156,7 @@ From the stream, loom reads:
 
 A stream that ends without `response.completed` or `response.incomplete` is an error.
 
-Usage is mapped as follows. `InputTokens` excludes `input_tokens_details.cached_tokens`, which become `CacheReadInputTokens`. `RateLimitTokens` is the reported `total_tokens`.
+Usage is mapped as follows. `InputTokens` excludes `input_tokens_details.cached_tokens`, which become `CacheReadInputTokens`.
 
 ---
 

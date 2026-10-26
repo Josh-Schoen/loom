@@ -150,10 +150,7 @@ func (c *Client) ChatStream(ctx context.Context, messages []llmtypes.Message, to
 	defer func() { _ = resp.Body.Close() }()
 	var onText func(string)
 	if tokenCallback != nil {
-		onText = func(s string) {
-			llmtypes.NotifyStreamActivity(ctx)
-			tokenCallback(s)
-		}
+		onText = func(s string) { tokenCallback(s) }
 	}
 	out, err := readStream(resp.Body, names, onText)
 	if err != nil {

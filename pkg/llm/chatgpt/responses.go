@@ -344,7 +344,6 @@ func readStream(body io.Reader, names map[string]string, onText func(string)) (*
 			OutputTokens:         u.OutputTokens,
 			TotalTokens:          u.InputTokens - cached + u.OutputTokens,
 			CacheReadInputTokens: cached,
-			RateLimitTokens:      u.TotalTokens,
 		}
 	}
 	return resp, nil
