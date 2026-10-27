@@ -416,6 +416,15 @@ Uses multiplicative combination (`CombineScores` in `pkg/memory/salience.go:122`
 3. Format result via `EntityRecall.Format()` into structured text
 4. Return the note `[Graph Memory Context]\n{formatted_recall}`, which every LLM call of the turn carries in its trailing `<system-reminder>` user message (`withTransientTail`, with the request context and soft reminder). It is never added to the session, so it is not persisted and a resumed turn recalls again. It is not a system message: the Anthropic client moves system messages into the request's `system` field, ahead of the conversation, where a note that changes every turn would miss the prompt cache on every call.
 
+   Measured by `TestGraphMemoryRecall_PromptCache` (`pkg/agent/graph_memory_prompt_cache_test.go`): eight messages in a row, each recalling the facts of the ones before it, sent by the Anthropic client to a stub endpoint and replayed through a model of Anthropic's prefix cache (markers write the prefix ending at their block; a request reads the longest written prefix at or up to 20 blocks before one of its markers; sizes in bytes as a stand-in for tokens). Messages 2-8, all sent within the cache lifetime:
+
+   | Recall note placement | From cache | Not from cache | Recall notes in message 8's request |
+   |---|---|---|---|
+   | System message (before) | 79,422 of 126,245 bytes (63%) | 46,823 bytes | 7 |
+   | Trailing `<system-reminder>` (now) | 107,548 of 120,561 bytes (89%) | 13,013 bytes | 1 |
+
+   Two effects show: as a system message the note sat ahead of the conversation, so each message's first call re-sent the conversation uncached; and each turn's note stayed in segmented memory, so a request carried every earlier turn's note as well. The model is an approximation and assumes replies within the cache lifetime (5 minutes by default); after it expires, neither placement reads from the cache.
+
 **Token Budget**: Controlled by config. Default: 20% of context window (200K * 20% = 40K tokens). Can be overridden with absolute `max_context_tokens`. Within `ContextFor()`, the budget is allocated in three phases: entity profile (200 tokens reserved), graph neighborhood (300 tokens reserved), and remaining budget for ranked memories via `AllocateMemoryBudget()` in `pkg/memory/budget.go`.
 
 **Tool Guidance**: The `graph_memory` tool's own description carries its usage guidance. The system prompt gets no graph-memory supplement — the ROM slot is byte-stable for the life of a session (ContextCompilation HLD §3), so per-feature prompt injection is not a channel.
