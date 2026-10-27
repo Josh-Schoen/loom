@@ -343,7 +343,7 @@ spec:
 | **Progressively disclosed** (registered dynamically after triggering conditions) | `get_error_details` (after first error), `conversation_memory` (after first L2 swap), `session_memory` (after 3+ sessions), `query_tool_result` (after first large result or first tool result returned by reference) |
 | **Workflow-injected** (auto-added for workflow agents) | `send_message`, `publish`, `shared_memory_read`, `shared_memory_write`, `top_n_query`, `group_by_query` |
 
-The server's tool policy withholds some of these from the model while their subsystems keep running: `tools.minimal` suppresses `graph_memory` and `task_board`; `tools.none` additionally suppresses `conversation_memory`, `session_memory`, `get_error_details`, `query_tool_result`, the workflow-injected tools, and `manage_ephemeral_agents`. `manage_skills` and `load_pattern` are not suppressed by either policy. Under `tools.none`, `shell_execute` and `workspace` are not auto-registered, communication tools are not registered, and UI app tools are registered only for agents that declare one in their YAML tools (then always offered); the agent's tool list is what its YAML declares.
+The server's tool policy withholds some of these from the model while their subsystems keep running: `tools.minimal` suppresses `graph_memory` and `task_board`; `tools.none` additionally suppresses `conversation_memory`, `session_memory`, `get_error_details`, `query_tool_result`, and the workflow-injected tools. `manage_skills` and `load_pattern` are not suppressed by either policy. `manage_ephemeral_agents` is not suppressed by `tools.none`; see the manage_ephemeral_agents section for opt-in/opt-out details. Under `tools.none`, `shell_execute` and `workspace` are not auto-registered, communication tools are not registered, and UI app tools are registered only for agents that declare one in their YAML tools (then always offered); the agent's tool list is what its YAML declares.
 
 `agents.install_bundled` (server config, default `true`): when `false`, `looms serve` does not copy the bundled `weaver` and `guide` agents and the weaver skills into `$LOOM_DATA_DIR`. Copies already there are not removed. Use it with `tools.none: true` for a server whose users only talk to their own assistant (for example a personal assistant reached from paired phones), so no agent on it can run shell commands or create agents.
 
@@ -415,6 +415,13 @@ Under `spec.memory` (k8s-style) or `agent.memory` (legacy).
 | `max_tool_results` | `int` | `5` | Max tool results kept in conversation kernel |
 | `memory_compression` | object | optional | See [Memory Compression](#memory-compression-configuration) |
 | `graph_memory` | object | optional | See [Graph Memory](#graph-memory-configuration) |
+
+Single-agent lifecycle RPCs (`CreateAgentFromConfig`, `GetAgent`, `StartAgent`,
+`StopAgent`, and `ReloadAgent`) return `AgentInfo.config` with a nonempty
+`memory.dsn` replaced by `[REDACTED]`; the HTTP gateway exposes the same
+redacted `AgentInfo`. `ListAgents` omits `config` entirely. Agent YAML is
+environment-expanded before loading; arbitrary fields such as `system_prompt`
+and metadata are not secret-filtered, so do not embed credentials there.
 
 **Large tool results**: a result always enters the conversation whole — offload is a render condition of context compilation, not an arrival event. When a tool row's content is strictly over the threshold, the copy compiled for the LLM is replaced by a stub. In the producing turn this is the offload stub — tool name, estimated token figure, a 160-byte preview, and a `query_tool_result(message_id=…)` door (`sql=` for tabular payloads); `query_tool_result` resolves only within that turn, and every return is bounded at the same threshold. In later turns, and for rows evicted by memory-pressure relief, it is the evicted stub, whose only door is re-running the call. Rows are persisted truncated to a bounded core plus tail at the same threshold. A session without a persistent store has no `message_id` to print, so its current-turn oversize results render the evicted stub.
 
@@ -496,11 +503,18 @@ Under `spec.memory.memory_compression`.
 
 | Profile | L1 token target | min_l1 | warning | critical | batch (N/W/C) | Use case |
 |---|---|---|---|---|---|---|
-| `balanced` | 6400 | 4 | 60% | 75% | 3/5/7 | General-purpose agents |
-| `data_intensive` | 4000 | 3 | 50% | 70% | 2/4/6 | SQL, large file operations |
-| `conversational` | 9600 | 6 | 70% | 85% | 4/6/8 | Chat-heavy, minimal tool usage |
+| `balanced` | 6400 | 4 | 60% | 90% | 3/5/7 | General-purpose agents |
+| `data_intensive` | 4000 | 3 | 45% | 80% | 2/4/6 | SQL, large file operations |
+| `conversational` | 9600 | 6 | 70% | 92% | 4/6/8 | Chat-heavy, minimal tool usage |
 
-The L1 token target is a reporting figure only; `warning` is the value that triggers compression.
+The two percentages are the relief water marks, as percentages of usable context
+(window minus reserved): `critical` is the high mark where relief begins, and
+`warning` is the low mark it sheds down to. The band between them decides how
+often relief runs and how much each pass sheds — `data_intensive` starts early
+and sheds deep because one tool result can add tens of points in a single call,
+while `conversational` starts late and sheds shallow to keep recency.
+
+The L1 token target is a reporting figure only.
 
 ---
 
@@ -614,6 +628,8 @@ spec:
 ### Ephemeral Agents
 
 Defined in proto as `AgentConfig.ephemeral_agents`. Policies for dynamically spawning agents at runtime.
+
+Dynamic spawning is opt-in. The agent must explicitly include `manage_ephemeral_agents` in `spec.tools`; otherwise the server does not register the spawning tool for that agent, even when ephemeral-agent policies are present. The `personal_assistant`, `task_automator`, and `coordinator` built-in presets include this tool. Programmatic `MultiAgentServer` embedders without an agent registry can opt in per agent with `SetAgentSpawnEnabled(agentID, true)`. Other agents should add it only when their instructions require runtime delegation.
 
 > **Note**: Ephemeral agent policies are defined in the proto schema but are **not currently parsed from YAML** by the config loader. They must be set programmatically via the Go API or gRPC. The YAML example below shows the proto schema for reference.
 
@@ -824,8 +840,14 @@ health_check:
 
 ## Environment Variable Expansion
 
-Agent YAML files support `${VAR}` and `$VAR` syntax. Variables are expanded from the process
-environment at load time via `os.Expand`.
+Agent YAML loading supports `${VAR}` and `$VAR` syntax. Variables are expanded
+from the process environment at load time via `os.Expand`.
+
+Trusted server-startup settings for LLM, MCP, and OTLP values use a stricter
+single-pass expander: only `${VAR}` is expanded, bare dollar signs are
+preserved, `$$` emits one literal dollar sign, and an unresolved placeholder is
+preserved for diagnostics. Runtime management APIs do not expand
+caller-supplied configuration.
 
 ```yaml
 spec:

@@ -9,6 +9,115 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`WeaveRequest.context` keeps the prompt cache valid.** The request-context note (e.g. the caller's local time) was a trailing system message; the Anthropic client moves system messages into the system prompt at the head of the request, so a note that changed with every request kept the conversation from being read from the prompt cache. It is now part of the turn's trailing `<system-reminder>` user message (with the soft reminder), after every cache breakpoint. `types.IsSystemReminder` recognizes such notes; the scripted provider skips them when finding the newest turn.
+
+### Added
+
+#### HITL park: tools other than `contact_human` can park as questions
+- **`shuttle.ParkableQuestion`** lets a tool whose result is a human's answer park the turn as a `question` item, like `contact_human`. `ParkQuestion(ctx, input)` reports whether the call parks and the question text; `ParkAnswerResult(ctx, input, answer)` builds the tool result on an approved resume. With park enabled (`WithHITLPark`) `Execute` does not run for a parked call. The call's input is under `params` in the descriptor, subject to the usual `params_truncated` bound. `Execute` still runs when `ParkQuestion` returns `ok=false`, when the call ID is empty or duplicated in the batch, or when park is disabled. Resume uses the kind recorded on the park row rather than calling `ParkQuestion` again; a policy `Deny` is never lifted and a policy `Ask` yields only the question card. A rejected resume synthesizes `permission_denied`, an empty answer `MISSING_ANSWER`, and a nil `ParkAnswerResult` `internal_error`. See `docs/architecture/hitl-park-and-resume.md`.
+
+#### Tool-call progress while arguments stream
+- **Providers can report which tool call is being written, and how much.** `types.ToolInputProgress` (index, id, name, argument bytes so far) is reported through `types.WithToolInputProgress` / `NotifyToolInputProgress`, alongside the existing content-free stream-activity pulse. Every streaming provider reports it: the OpenAI-compatible client (so LiteLLM, Mistral and HuggingFace too) per tool-call delta, Anthropic and Bedrock's Claude path per `input_json_delta`, Azure OpenAI per tool-call delta, and Ollama and Gemini once per complete tool call they deliver in a single chunk. `chatWithStreaming` emits it as `ProgressEvent.IsToolInputStream` with `ToolCallID`, `ToolName` and the new `ToolInputBytes`: the first delta of each call, and the delta that first supplies its name or id, immediately, later ones at most once a second per call.
+- **`WeaveProgress` carries it to gRPC clients.** New fields `is_tool_input_stream` (22) and `tool_input_bytes` (23); `tool_call_id` is now also set on these events, so a non-empty `tool_call_id` no longer implies the tool started. See `docs/reference/streaming.md`.
+
+#### Tool repeat-call hint
+- **Opt-in hint after repeated identical tool calls.** Off by default. An agent turns it on with `behavior.repeat_call_hint: true` in its YAML. When on, the hint fires after 3, then 5, then 8 identical consecutive executed tool calls (same name and canonical input; a call rejected before execution neither counts nor resets the run) and names the count and tool in the next provider request as a transient `<system-reminder>`. The note is never written into a tool result, so offloaded, tabular and JSON rows stay exactly as the tool returned them, and it is not stored or replayed in later turns. A failed call gets no note. Thresholds are fixed at 3/5/8 (`RecoveryConfig.RepeatHintThresholds` is still settable in Go). See `docs/reference/self-correction.md`.
+- **Guidance messages load from `prompts/guidance/self_correction.yaml`.** The lookup tries `guidance.self_correction.<id>`, the namespace the file registers under; before, every YAML entry was unreachable and the hard-coded text always ran. A rendered message that still holds a placeholder falls back to the hard-coded text.
+
+### Fixed
+
+#### Server: `ListAgents` reports `total_count`
+- **`ListAgentsResponse.total_count` was always 0.** The proto documents it as the number of agents, but `ListAgents` never set it, so a client that read it (for example to show how many agents a server serves) reported none. It is now the number of agents returned.
+
+#### Relief: a turn whose own tool results exceed the window is shed, not refused
+- **Relief never touched the current turn, so a turn that was itself too large ended on the provider's refusal.** Every evict and fold rung stops at T−1, and a current-turn result renders whole unless it is over the offload threshold. A single response fanning out hundreds of parallel calls, each result under the threshold, therefore left the pass with nothing to shed: in production a Bedrock Sonnet session reached ~1.46M tokens with a relief estimate of 1.17M after the pass, and the turn ended `context_exhausted`. Relief now has a last-resort rung, taken only after every prior-turn evict and fold has failed to reach the release mark: it renders the current turn's results as §5.5 offload stubs, oldest first, on the same halving ladder (keep the newest n/2, n/4 … 0 whole). Nothing is lost within the turn — each stub carries its `query_tool_result` door and the payload stays in L1 — and nothing is persisted: the set is render state scoped to the turn, so once the turn advances the rows are ordinary prior-turn rows for the evict ladder. The rung overrides `SetOffloadExemptTools`, since the alternative is a turn that cannot be sent; storeless rows (no durable id) fall back to the evicted stub. A `releasePressure: offload current turn` warning names the rows offloaded.
+- **`releasePressure: start` logs each pass's starting estimate.** The per-operation lines log only post-op estimates, so two consecutive passes read as one operation inflating the estimate.
+- **No lossy fold when the current turn alone is over target.** No prior-turn operation can bring the estimate below the current turn's own floor (ROM + summary + turn T), so a fold there was a compressor call that summarized history away for nothing — in production it ran on every turn while the post-fold estimate kept climbing (186K → 382K). When the floor is over target, the lossless current-turn offload now runs before any fold, and a fold runs only if it can then reach target or the estimate is still at or over the start mark (`releasePressure: fold skipped` otherwise).
+- **The final synthesis call gets relief.** `synthesizeFinalResponse` runs exactly when the loop exhausted its budget — the turn at its largest — but sent without a relief pass or the refusal backstop. It now advertises no tool bytes (the call carries none), sheds before the send, and on a context-too-long refusal sheds with the recovery penalty and resends once before falling back to the guidance message.
+- **The estimate is calibrated to the provider's own count.** The tiktoken estimate counted Claude prompts ~25% low (1.17M estimated vs 1.46M billed), so relief fired late and under-shed. After each successful call the provider-reported prompt (input + cache read + cache write) is compared with loom's count of the same compiled context, and an EWMA of the ratio scales both estimate tiers. The factor never drops below 1.0 (relief never fires later than before), is capped at 2.0 (a skewed sample, e.g. uncounted image blocks, cannot run away), and ignores prompts under 2,000 tokens. `SegmentedMemory.ObservePromptTokens` / `EstimateCalibration` expose it. The factor is per memory instance: an embedder that rebuilds memory per request starts each request at 1.0 and calibrates from its first call.
+
+#### Skills: a fold no longer deactivates a skill reloaded after it, and a turn's skills survive deactivation
+- **A fold deactivated a skill by name even when it had been loaded again since.** Folding a region deactivates every skill whose `manage_skills` load pair lies in it, and deactivation keys on the name — so folding an OLD load pair also killed a reload from the very turn that asked for it, leaving the skill's body in context but the skill off the active set (and its required tools out of the next compile). A skill whose load pair also appears after the folded region is now neither deactivated nor added to the folded-skill note, and a reload drops the note an earlier fold left for it, matching the note's documented "deactivated and not yet reloaded" meaning.
+- **`Orchestrator.SkillsActiveSince(sessionID, since)`** reports every skill that was active at any moment from `since` to now — including skills deactivated, evicted or replaced in that window, which `GetActiveSkills` forgets. One entry per skill name (its latest activation), ordered by activation time. An embedder attributing a turn to the skills that shaped it passes the turn's start time. Backed by a per-session activation log bounded at 256 records (oldest ended records dropped first, open ones never) and cleared by `CleanupSession`.
+
+#### Skills: trigger modes are enforced, and a slash command loads a skill
+- **`trigger.mode: MANUAL` now means the user activates the skill and the model does not.** The mode was stored, shown and read by nothing on a turn — every bound skill was named with its description on the system-prompt menu and loadable through `manage_skills`, so a model routed to MANUAL skills on its own. A MANUAL skill is now left off the menu and out of `manage_skills list`, and a model-issued `load` is refused with a message naming the skill's slash command. A MANUAL skill the user has already activated loads again freely: the rule withholds a skill, not a session.
+- **A leading slash command loads the named skill**, before the model reads the turn — the user's route in, and the only one that reaches a MANUAL skill. It runs the same load path `manage_skills` uses (activation, required-tool wiring, task emission) and writes the same three conversation rows, so restore replay, folding and any embedder's tool timeline see a load indistinguishable from the model's own. A command matching no bound skill is left alone as ordinary text. `Orchestrator.MatchSkills` and `Discovery.Discover` are unchanged and remain off the conversation loop: nothing else activates a skill.
+- **`manage_skills list` reports the session's real library.** It read the index of the search paths and embedded FS, so skills an embedder injected with `Register` — database-backed, marketplace, or an admin's draft under test — were missing from it, which for an embedder that registers everything meant an empty answer. It now merges both stores and returns a stable, sorted list.
+
+#### Graph memory
+- Task-completion memories now honor the owning agent's `memory.graph_memory.enabled: false`. The task manager is server-wide and wrote an `experience` memory (salience 0.75, plus an async entity-salience boost) into the owner agent's partition on every closed task — including the implicit per-turn task, so an agent that opted out of graph memory still accrued one memory per turn. `task.Manager.SetGraphMemoryPolicy` routes the write through the registry's per-agent view (`Registry.GraphMemoryEnabledFor`: on unless explicitly disabled, matching the subsystem wiring rule); `looms serve` installs it whenever a graph store is present.
+
+#### MCP tool adapter
+- The schema-lookup result cache no longer stores an empty answer (`{"columns":[]}`, `[]`, or an object whose array fields are all empty). A `describe_table` that found nothing — because the server was handed a name it could not resolve — was cached and then served to every later caller with the same arguments, so one bad lookup became "a table with no columns" for a whole fleet. The empty answer is still returned to the caller that got it; the next caller reaches the server again.
+
+### Breaking Changes
+
+- **An undeclared `trigger.mode` now loads as `HYBRID`, not `MANUAL`.** With the mode enforced, the old default would have withheld from the model every skill that omits the field — in practice nearly all of them, since nothing read the mode before and no author chose `MANUAL` by writing nothing. `HYBRID` preserves how those skills behave today (the model may pull them; a slash command also invokes them). An embedder that wants a skill withheld must now declare `mode: MANUAL` on it.
+
+#### Usage and cost accounting
+- `catalog.LookupPricing` now consults the registered default `Source` (via `catalog.Register`) before the static built-in table, so an embedder's DB- or gateway-backed catalog prices models at the rates it actually pays. Previously only the static table was read, and every provider client's `calculateCost` fell to its hardcoded default for any id the static table did not list — on the OpenAI client that is the gpt-4o rate, applied to every OpenAI-compatible gateway alias regardless of model.
+- `openai.Config.CatalogProvider` selects the catalog namespace the OpenAI client prices under (default `"openai"`), so a client fronting a gateway (LiteLLM, vLLM, …) can be pointed at the provider key the embedder registered the gateway's ids under.
+- `agent.Response.TurnUsage` and `agent.TurnParkedError.TurnUsage` report the sum of every LLM call the turn made (tool-loop iterations, empty-response and hygiene retries, final synthesis). `Response.Usage` keeps its final-call meaning — it is what the persisted assistant row carries as its own token count and cost — so embedders metering a turn should read `TurnUsage`. The conversation span attributes (`conversation.tokens.*`, `conversation.cost.usd`) and the `agent.cost.usd` / `agent.tokens.total` metrics now report the turn total instead of the final call's share.
+
+#### MCP client negotiation
+- The streamable-HTTP transport routes a 4xx JSON-RPC error body as a protocol message **only when its `id` matches the request it answers**. A server that refuses a request at the HTTP layer can reply with a synthetic id — teradata-mcp-server answers the `server/discover` probe's `MCP-Protocol-Version: 2026-07-28` with HTTP 400 and `"id":"server-error"` — and routing that left the pending request waiting for a response that never came, so `client.Connect` ran out its deadline instead of falling back to the `initialize` handshake. The body now surfaces as `HTTPStatusError`, which `isLegacyServerSignal` already classifies (a 400 without a modern error code is a legacy server), and negotiation proceeds in one round trip.
+
+### Breaking Changes
+
+- **2 new database migrations** (SQLite `000009_task_created_via`, Postgres `000024_task_attribution`) apply automatically on first start of the upgraded server. They add `tasks.created_via`, `messages.task_id` and `human_requests.task_id`. The SQLite session store's own schema pass additionally adds `sessions.incarnation` (surfaced as the new exported field `Session.Incarnation`); Postgres does not persist it yet, and sessions without it fall back to a CreatedAt-derived epoch. Back up databases before upgrading.
+- **Implicit task recording is ON by default** for every agent with a task subsystem: one task row per turn that calls a tool or asks a human, excluded from the agent's own task queries. Disable with `memory.task_board.implicit_tasks.mode: disabled`.
+- **`manage_ephemeral_agents` is no longer suppressed by `tools.none`** — the tool now requires explicit opt-in via `tools.builtin` configuration or must be individually disabled (`tools.permissions.disabled_tools: [manage_ephemeral_agents]`). Deployments that relied on `tools.none` to prevent agents from spawning sub-agents must add `manage_ephemeral_agents` to `tools.permissions.disabled_tools` explicitly.
+
+### Added
+
+- **Task attribution and timeline read model (#378)** — `taskctx.Attribution` on the context stamps `task_id` onto messages and human requests on both backends; `TimelineReader` merges `messages`, `task_history` and `human_requests` projections for a task (no RPC yet). `ImplicitTaskConfig` (`TaskBoardConfig` field 7) tunes runtime recording: `mode`, `triggers`, `excluded_triggers`, `max_per_session`, `agent_visible`; unparseable values fail closed.
+- **`Task.created_via` on the wire** (`task.proto` field 29) so API and UI consumers of `ListTasks`/`GetBoard` can tell runtime-minted tasks from an agent's own. Tasks created over the `CreateTask` RPC without an explicit value are stamped `user`.
+- **`task.TaskCanceller`** optional store capability: a status-guarded cancel, implemented by the SQLite and Postgres stores, so a cancel racing a close is decided at the row and never flips a DONE task to CANCELLED. Stores without it take a guarded read-modify-write fallback.
+- `task.StatusCounter` optional store capability and `Manager.CountByStatus`, so `GetBoard` stats are exact past 1,000 rows.
+
+#### MCP Streamable-HTTP Session & 202 Handling
+- Capture the `Mcp-Session-Id` header from MCP streamable-HTTP server responses and thread it into subsequent requests for the same session, fixing tools that require session continuity.
+- Handle HTTP 202 Accepted (async MCP responses) correctly for non-request messages; for JSON-RPC requests, 202 is now treated as an error since the spec requires a response body.
+- Forward the `DELETE` verb (session teardown) with the correct headers.
+
+#### OpenAI Client Transport Hardening
+- Automatic single-retry on EOF/connection-reset transport errors so transient proxy disconnects don't fail a completion mid-stream.
+- Sanitise empty tool-call entries from the provider response before unmarshalling to avoid downstream nil-pointer panics.
+
+#### SSE Server Improvements (StreamWeave HTTP path)
+- Periodic 15-second heartbeat SSE comments to prevent upstream proxy idle-timeout kills during long LLM thinking stages.
+- Preserve the existing `encoding/json` SSE wire format (snake_case fields and numeric enum values) for compatibility with current clients.
+
+#### LiteLLM Health Checks
+- Probe LiteLLM's `/health/liveliness` endpoint without issuing a model completion.
+- Expand `${VAR}` placeholders in `litellm_model`, including Tera runtime artifacts that inject the selected model as `LITELLM_MODEL`.
+
+#### OTLP Runtime Integration
+- `looms serve` and `looms workflow` resolve standard OTLP endpoint and header variables after `mode: otel` or `observability.otlp_endpoint` explicitly selects OTLP; generic cluster OTEL variables never replace Hawk or embedded tracing.
+- In-process parent-linkage test added to the OTLP test suite.
+
+#### Runtime Image and Configuration
+- Multi-architecture `teradata/loom-runtime` image build recipes for Linux amd64 and arm64, with only the `looms` server, runtime patterns, and built-in skills included.
+- Trusted startup configuration supports single-pass `${VAR}` expansion; bare dollar signs are preserved, `$$` emits a literal dollar sign, and unresolved placeholders remain visible for diagnostics.
+
+### Changed
+
+- The default implicit trigger set is now exactly the set the runtime fires (`tool_call`, `human_request`); `subagent_spawn` was in the default while nothing fired it. An enabled policy whose triggers cannot fire is logged at agent wiring.
+- The agent config loader warns when a `task_board` block is written anywhere other than `memory.task_board`, where it is silently ignored.
+- Both task stores order list pages on a unique tiebreak, so offset paging no longer double-counts or drops rows.
+- `GetBoard` returns `Internal` on a count failure instead of silently reporting zeros.
+
+### Fixed
+
+- Postgres `CloseTask` on an already-terminal task returned no row with its sentinel, which the `task_board close` tool dereferenced.
+- Postgres never read `messages.task_id` back, so `Message.TaskID` was always empty there.
+- Every read of the agent id in `pkg/agent` now goes through the locked accessor; several stamped identity onto rows without the lock while `SetID` could run.
+- An int32-overflowing `implicit_tasks.max_per_session` failed open to the default cap instead of disabling emission.
+- Fork-join and swarm stage titles showed raw agent UUIDs; stage output copied into task notes could split a multi-byte rune and fail proto marshalling.
+
+### Changed
+
 - **`tools.none` keeps declared UI app tools** — under `tools.none: true`, an agent that lists a UI app tool in its YAML now gets the UI app tools (always offered); previously `tools.none` removed them from every agent, contradicting "the agent's tool list is what its YAML declares". Agents that do not declare them still get none.
 - **`agents.install_bundled`** (default `true`) — `false` stops `looms serve` from installing the bundled `weaver` and `guide` agents and weaver skills, for servers whose users should only reach their own assistant (no shell access, no agent creation). With `tools.none: true`, a personal-assistant server exposes only the tools its agents declare.
 
@@ -44,7 +153,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **HTTP request bodies are capped at 4 MiB**, gRPC's default receive limit. Bodies were read before authentication with no limit.
 
 - **Graph memory is now scoped per user on SQLite.** The SQLite graph memory store did not write or filter `user_id`, so when several people shared one agent, facts extracted from one person's conversations were recalled into another person's conversations, and ID-based operations (`Forget`, `Supersede`, `Consolidate`, `TouchMemories`, `Unrelate`, `GetLineage`, `Neighbors`, edge listing) acted on any user's rows. Every statement now writes and filters the caller's user ID (`types.UserIDFromContext`; an empty ID means `default-user`, so existing single-user data stays reachable). `Relate` and `Remember` reject links to another user's entities.
-- **Graph entity names are unique per user.** `UNIQUE(agent_id, name)` on `graph_entities` becomes `UNIQUE(agent_id, user_id, name)` on both backends, so two people sharing an agent can each have an entity such as "mom". New migrations: SQLite `000009_graph_entities_per_user` (rebuilds `graph_entities`, keeping rows, edges, memory links, indexes and FTS triggers) and PostgreSQL `000024_graph_entities_per_user`. Rolling back fails while two users under one agent share an entity name.
+- **Graph entity names are unique per user.** `UNIQUE(agent_id, name)` on `graph_entities` becomes `UNIQUE(agent_id, user_id, name)` on both backends, so two people sharing an agent can each have an entity such as "mom". New migrations: SQLite `000010_graph_entities_per_user` (rebuilds `graph_entities`, keeping rows, edges, memory links, indexes and FTS triggers) and PostgreSQL `000025_graph_entities_per_user`. Rolling back fails while two users under one agent share an entity name.
 - **PostgreSQL graph memory store matches the same contract.** It already relied on RLS; it now also carries explicit `user_id` predicates, checks entity ownership before creating edges or memory links (foreign-key checks bypass RLS), and creates referenced entities under a fresh ID when the requested ID belongs to another user.
 - `Forget`, `Supersede`, `GetMemory` and `Consolidate` return the new sentinel `memory.ErrNotFound` (wrapped) for a memory that does not exist or belongs to another user, instead of succeeding without effect.
 - SQLite now stores `graph_memories.expires_at` in the same text format as `datetime('now')`. A TTL set through `Memory.ExpiresAt` that had passed earlier the same day was treated as still active.

@@ -25,16 +25,16 @@ func TestLoadMigrations(t *testing.T) {
 	require.NoError(t, err)
 	require.NotEmpty(t, migrations, "should have embedded migrations")
 
-	// Verify we have all 24 migrations.
+	// Verify we have all 25 migrations.
 	// Bumped from 11 by 000012_skill_index and 000013_task_idempotency
 	// (skills overhaul Phases 4 and 8), then 000014_analytics_views,
 	// 000015_rls_infrastructure_tables, 000016_rls_honor_jwt_sub,
 	// 000017_graph_rls_honor_jwt, 000018_tool_outcomes_policy_denied,
 	// 000019_context_compilation, 000020_tool_exec_admission_decision,
 	// 000021_human_request_kind_summary, 000022_human_request_params,
-	// then 000023_tool_outcomes_admission_decision, then
-	// 000024_graph_entities_per_user.
-	assert.Len(t, migrations, 24, "should have 24 migration versions")
+	// 000023_tool_outcomes_admission_decision, 000024_task_attribution,
+	// then 000025_graph_entities_per_user.
+	assert.Len(t, migrations, 25, "should have 25 migration versions")
 
 	// Verify ordering
 	for i := 1; i < len(migrations); i++ {
@@ -75,7 +75,8 @@ func TestLoadMigrations_SpecificVersions(t *testing.T) {
 		{8, "tool_exec_snapshot_user_id", "ALTER TABLE tool_executions ADD COLUMN"},
 		{9, "session_name", "ADD COLUMN IF NOT EXISTS name"},
 		{10, "graph_memory", "graph_entities"},
-		{24, "graph_entities_per_user", "UNIQUE (agent_id, user_id, name)"},
+		{24, "task_attribution", "ADD COLUMN IF NOT EXISTS created_via"},
+		{25, "graph_entities_per_user", "UNIQUE (agent_id, user_id, name)"},
 	}
 
 	for _, tt := range tests {

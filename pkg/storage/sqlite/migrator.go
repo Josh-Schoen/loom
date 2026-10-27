@@ -109,6 +109,10 @@ func (m *Migrator) MigrateUp(ctx context.Context) error {
 		span.RecordError(err)
 		return err
 	}
+	if err := m.repairRenumbered(ctx); err != nil {
+		span.RecordError(err)
+		return err
+	}
 
 	// Refuse to proceed if any embedded migration at or below the current
 	// version is missing from schema_migrations. Silently skipping such

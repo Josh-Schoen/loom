@@ -18,30 +18,33 @@ func TestModelRegistry_GetModelsForProvider(t *testing.T) {
 	// new Mistral dated IDs, llama4/gemma4/phi4-mini/qwen3.5), then for Claude
 	// Opus 5.5 and Haiku 5.5 (added with the monthly spending limit).
 	tests := []struct {
-		provider      string
-		expectedCount int
+		provider string
 	}{
-		{"anthropic", 9},
-		{"openai", 16},
-		{"gemini", 7},
-		{"bedrock", 8},
-		{"ollama", 14},
-		{"mistral", 13},
-		{"azure-openai", 8},
+		{"anthropic"},
+		{"openai"},
+		{"gemini"},
+		{"bedrock"},
+		{"ollama"},
+		{"mistral"},
+		{"azure-openai"},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.provider, func(t *testing.T) {
 			models := reg.GetModelsForProvider(tt.provider)
-			require.NotNil(t, models, "provider %s should have models", tt.provider)
-			assert.Len(t, models, tt.expectedCount, "provider %s model count", tt.provider)
+			// The catalog grows whenever a model ships; a hard-coded tally only
+			// records who edited it last, so assert the properties that must
+			// hold for every entry instead.
+			require.NotEmpty(t, models, "provider %s should have models", tt.provider)
 
-			// Verify all models have the correct provider set
+			seen := make(map[string]bool, len(models))
 			for _, m := range models {
 				assert.Equal(t, tt.provider, m.Provider)
 				assert.NotEmpty(t, m.Id)
 				assert.NotEmpty(t, m.Name)
 				assert.Greater(t, m.ContextWindow, int32(0))
+				assert.False(t, seen[m.Id], "duplicate model id %q under provider %s", m.Id, tt.provider)
+				seen[m.Id] = true
 			}
 		})
 	}
@@ -56,8 +59,24 @@ func TestModelRegistry_GetModelsForProvider_HuggingFaceRemoved(t *testing.T) {
 func TestModelRegistry_GetAllModels_TotalCount(t *testing.T) {
 	reg := NewModelRegistry()
 	all := reg.GetAllModels()
-	// anthropic(9) + openai(16) + gemini(7) + bedrock(8) + ollama(14) + mistral(13) + azure-openai(8) = 75
-	assert.Len(t, all, 75)
+	// GetAllModels must be exactly the union of the per-provider views — no
+	// entry stranded under a provider the registry does not enumerate, none
+	// counted twice. Checked as an identity rather than a fixed total, which
+	// would only need editing again with the next model launch.
+	require.NotEmpty(t, all)
+
+	sum := 0
+	for _, provider := range []string{"anthropic", "openai", "gemini", "bedrock", "ollama", "mistral", "azure-openai"} {
+		sum += len(reg.GetModelsForProvider(provider))
+	}
+	assert.Equal(t, sum, len(all), "GetAllModels must equal the sum of every provider's models")
+
+	seen := make(map[string]bool, len(all))
+	for _, m := range all {
+		key := m.Provider + "/" + m.Id
+		assert.False(t, seen[key], "duplicate model %s across the registry", key)
+		seen[key] = true
+	}
 }
 
 func TestModelRegistry_NewFields(t *testing.T) {

@@ -123,15 +123,16 @@ func (r *Rule) respond(data TemplateData, messages []types.Message) *types.LLMRe
 func conversationState(messages []types.Message) (TemplateData, bool) {
 	var data TemplateData
 	for i := len(messages) - 1; i >= 0; i-- {
-		if messages[i].Role == "user" {
+		if messages[i].Role == "user" && !types.IsSystemReminder(messages[i]) {
 			data.UserMessage = messageText(messages[i])
 			break
 		}
 	}
-	// Trailing system messages are notes for this call (request context, soft
-	// reminders), not turns: the newest turn is the last message before them.
+	// Trailing system messages and <system-reminder> notes are for this call
+	// (request context, soft reminders), not turns: the newest turn is the
+	// last message before them.
 	last := len(messages) - 1
-	for last >= 0 && messages[last].Role == "system" {
+	for last >= 0 && (messages[last].Role == "system" || types.IsSystemReminder(messages[last])) {
 		last--
 	}
 	if last < 0 || messages[last].Role != "tool" {

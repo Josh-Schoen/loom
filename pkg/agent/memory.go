@@ -60,7 +60,7 @@ type Memory struct {
 	maxContextTokens     int                        // Context window size for new sessions (0 = use defaults)
 	reservedOutputTokens int                        // Reserved tokens for output (0 = use defaults)
 	compressionProfile   *CompressionProfile        // Optional compression profile for new sessions (nil = use defaults)
-	compressor           MemoryCompressor           // Optional LLM compressor for L2 compaction (nil = heuristic fallback)
+	compressor           MemoryCompressor           // Optional LLM compressor for L2 compaction (nil = fold drops with an "(unsummarized)" marker)
 	thresholdBytes       int64                      // Offload / row / page bound in bytes (0 = default; HLD §5.1)
 	offloadExemptTools   []string                   // Tool names whose current-turn results render whole (§5.2 step 6 carve-out)
 
@@ -418,6 +418,7 @@ func (m *Memory) GetOrCreateSessionWithAgent(ctx context.Context, sessionID, age
 		Context:         make(map[string]interface{}),
 		CreatedAt:       time.Now(),
 		UpdatedAt:       time.Now(),
+		Incarnation:     time.Now().UnixNano(),
 		SegmentedMem:    segMem,
 		FailureTracker:  newConsecutiveFailureTracker(),
 	}
@@ -738,6 +739,10 @@ func (m *Memory) PersistMessage(ctx context.Context, sessionID string, msg *Mess
 		}
 		stored := *msg
 		stored.ToolCalls = filtered
+		// Thinking blocks never persist (signatures are turn-scoped replay
+		// material); the plain Thinking text rides the stored copy for
+		// display (thinking_content).
+		stored.ThinkingBlocks = nil
 		if err := m.store.SaveMessage(ctx, sessionID, &stored, turnStart); err != nil {
 			return err
 		}
@@ -862,7 +867,8 @@ func (m *Memory) GetStore() SessionStorage {
 
 // SetCompressor sets the LLM-powered compressor for L2 compaction across all
 // sessions (existing and future). With a compressor present, compaction routes
-// through it; sessions without one fall back to the heuristic summariser.
+// through it; without one, the fold drops old turns with an "(unsummarized)"
+// marker instead of summarising them.
 func (m *Memory) SetCompressor(compressor MemoryCompressor) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -983,4 +989,13 @@ func (m *Memory) notifyObservers(agentID string, sessionID string, msg Message) 
 			obs.OnMessageAdded(agentID, sessionID, msg)
 		}(observer)
 	}
+}
+
+// Store returns the configured persistent session storage, or nil when the
+// memory is storeless. Read-only accessor: callers must not swap the store.
+func (m *Memory) Store() SessionStorage {
+	if m == nil {
+		return nil
+	}
+	return m.store
 }

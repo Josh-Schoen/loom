@@ -7,6 +7,7 @@ package server
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"testing"
 
@@ -18,18 +19,18 @@ import (
 	"github.com/teradata-labs/loom/pkg/shuttle"
 )
 
-// noteRecordingLLM records the system messages of every Chat call.
+// noteRecordingLLM records the <system-reminder> notes of every Chat call.
 type noteRecordingLLM struct {
-	mu      sync.Mutex
-	systems []string
+	mu    sync.Mutex
+	notes []string
 }
 
 func (m *noteRecordingLLM) Chat(_ context.Context, messages []llmtypes.Message, _ []shuttle.Tool) (*llmtypes.LLMResponse, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for _, msg := range messages {
-		if msg.Role == "system" {
-			m.systems = append(m.systems, msg.Content)
+		if llmtypes.IsSystemReminder(msg) {
+			m.notes = append(m.notes, msg.Content)
 		}
 	}
 	return &llmtypes.LLMResponse{Content: "ok", Usage: llmtypes.Usage{InputTokens: 1, OutputTokens: 1}}, nil
@@ -58,10 +59,10 @@ func TestWeaveRequestContextReachesTheModel(t *testing.T) {
 	llm.mu.Lock()
 	defer llm.mu.Unlock()
 	var found bool
-	for _, s := range llm.systems {
-		if s == "Context sent with this message (applies to this message only):\n- local_time: 2026-10-18T07:05:00-05:00\n- time_zone: America/Chicago" {
+	for _, s := range llm.notes {
+		if strings.Contains(s, "Context sent with this message (applies to this message only):\n- local_time: 2026-10-18T07:05:00-05:00\n- time_zone: America/Chicago") {
 			found = true
 		}
 	}
-	assert.True(t, found, "system messages sent: %q", llm.systems)
+	assert.True(t, found, "notes sent: %q", llm.notes)
 }

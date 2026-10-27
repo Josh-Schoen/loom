@@ -90,6 +90,11 @@ func (m *Migrator) MigrateUp(ctx context.Context) error {
 		return err
 	}
 
+	if err := m.repairRenumbered(ctx); err != nil {
+		span.RecordError(err)
+		return err
+	}
+
 	// Refuse to proceed if any embedded migration at or below max(applied)
 	// is missing from schema_migrations. The MigrateUp loop only applies
 	// versions > currentVersion, so a missing earlier migration would

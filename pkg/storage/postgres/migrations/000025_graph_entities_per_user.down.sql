@@ -3,7 +3,7 @@
 -- Licensed under the Apache License, Version 2.0 (the "License");
 -- you may not use this file except in compliance with the License.
 
--- 000024_graph_entities_per_user.down.sql
+-- 000025_graph_entities_per_user.down.sql
 -- Restores UNIQUE(agent_id, name) on graph_entities.
 --
 -- Adding the constraint fails if two users under the same agent have an

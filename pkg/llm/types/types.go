@@ -16,9 +16,26 @@ import (
 // Code that imports pkg/llm/types will continue to work.
 type ToolCall = types.ToolCall
 type Message = types.Message
+type ThinkingBlock = types.ThinkingBlock
 type Usage = types.Usage
 type LLMResponse = types.LLMResponse
 type LLMProvider = types.LLMProvider
 type HealthChecker = types.HealthChecker
 type TokenCallback = types.TokenCallback
 type StreamingLLMProvider = types.StreamingLLMProvider
+
+// ToolInputProgress describes a tool call whose arguments are still streaming.
+type ToolInputProgress = types.ToolInputProgress
+
+// Stream-activity hook for deltas that never reach TokenCallback (tool-input
+// JSON). See types.WithStreamActivity.
+var (
+	WithStreamActivity      = types.WithStreamActivity
+	NotifyStreamActivity    = types.NotifyStreamActivity
+	WithToolInputProgress   = types.WithToolInputProgress
+	NotifyToolInputProgress = types.NotifyToolInputProgress
+)
+
+// IsSystemReminder reports whether a message is a transient
+// <system-reminder> note rather than a turn. See types.IsSystemReminder.
+var IsSystemReminder = types.IsSystemReminder

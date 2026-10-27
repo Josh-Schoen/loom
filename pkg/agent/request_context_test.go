@@ -22,6 +22,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	llmtypes "github.com/teradata-labs/loom/pkg/llm/types"
+	"github.com/teradata-labs/loom/pkg/types"
 )
 
 func TestRequestContextNote(t *testing.T) {
@@ -80,7 +81,8 @@ func TestRequestContextReachesTheModelOnly(t *testing.T) {
 	sent := llm.lastMessages()
 	require.NotEmpty(t, sent)
 	last := sent[len(sent)-1]
-	assert.Equal(t, "system", last.Role)
+	assert.Equal(t, "user", last.Role, "a trailing user note, not a system message: the prompt cache stays valid")
+	assert.True(t, types.IsSystemReminder(last), "tagged as harness state: %q", last.Content)
 	assert.Contains(t, last.Content, "local_time: 2026-10-18T07:05:00-05:00")
 	assert.Contains(t, last.Content, "time_zone: America/Chicago")
 
@@ -98,12 +100,30 @@ func TestRequestContextReachesTheModelOnly(t *testing.T) {
 	}
 }
 
-func TestWithRequestContextLeavesMessagesAlone(t *testing.T) {
+func TestWithTransientTail(t *testing.T) {
 	msgs := []llmtypes.Message{{Role: "user", Content: "hi"}}
-	assert.Equal(t, msgs, withRequestContext(context.Background(), msgs), "no context: unchanged")
+	assert.Equal(t, msgs, withTransientTail(context.Background(), msgs, "", ""), "nothing to add: unchanged")
 
 	ctx := WithRequestContext(context.Background(), map[string]string{"local_time": "now"})
-	out := withRequestContext(ctx, msgs)
-	assert.Len(t, out, 2)
+	out := withTransientTail(ctx, msgs, "", "")
+	require.Len(t, out, 2)
 	assert.Len(t, msgs, 1, "the input slice is not changed")
+	assert.Equal(t, "user", out[1].Role)
+	assert.Equal(t, "<system-reminder>\nContext sent with this message (applies to this message only):\n- local_time: now\n</system-reminder>", out[1].Content)
+
+	// The request context and the soft reminder share one note.
+	out = withTransientTail(ctx, msgs, "", "  Finish the page before starting another.  ")
+	require.Len(t, out, 2)
+	assert.Contains(t, out[1].Content, "- local_time: now\n\nFinish the page before starting another.\n</system-reminder>")
+	assert.True(t, types.IsSystemReminder(out[1]))
+
+	only := withTransientTail(context.Background(), msgs, "", "Remember the budget.")
+	assert.Equal(t, "<system-reminder>\nRemember the budget.\n</system-reminder>", only[1].Content)
+
+	// The graph memory recall note sits between the request context and the
+	// soft reminder, in the same note.
+	all := withTransientTail(ctx, msgs, "[Graph Memory Context]\n- User has a dog named Max", "Remember the budget.")
+	require.Len(t, all, 2)
+	assert.Equal(t, "<system-reminder>\nContext sent with this message (applies to this message only):\n- local_time: now\n\n"+
+		"[Graph Memory Context]\n- User has a dog named Max\n\nRemember the budget.\n</system-reminder>", all[1].Content)
 }

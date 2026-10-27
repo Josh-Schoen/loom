@@ -176,9 +176,9 @@ func (p *InstrumentedProvider) Chat(ctx context.Context, messages []llmtypes.Mes
 		span.SetAttribute("llm.tool_calls.names", toolCallNames)
 	}
 
-	// Response content — maps to gen_ai.completion → Opik output column.
-	if resp.Content != "" {
-		span.SetAttribute("response.preview", truncatePreview(resp.Content))
+	// Bounded response preview — maps to gen_ai.completion → Opik output column.
+	if preview := truncatePreview(resp.Content); preview != "" {
+		span.SetAttribute("response.preview", preview)
 	}
 
 	// Capture content length (for analysis)
@@ -380,6 +380,17 @@ func (p *InstrumentedProvider) ChatStream(ctx context.Context, messages []llmtyp
 	span.SetAttribute("llm.ttft_ms", ttft.Milliseconds())
 	span.SetAttribute("llm.streaming.chunks", tokenCount)
 
+	// The client's own stamps are ground truth: the callback-based ttft above
+	// only fires on text deltas, so tool-call turns report 0. Client metadata
+	// covers every chunk type and adds the prep/generation split.
+	if resp.Metadata != nil {
+		for _, key := range []string{"ttft_ms", "prep_ms", "gen_ms", "sse_chunks"} {
+			if v, ok := resp.Metadata[key]; ok {
+				span.SetAttribute("llm.client."+key, v)
+			}
+		}
+	}
+
 	// Capture cache token metrics for observability
 	if resp.Usage.CacheReadInputTokens > 0 {
 		span.SetAttribute("llm.tokens.cache_read", resp.Usage.CacheReadInputTokens)
@@ -410,9 +421,9 @@ func (p *InstrumentedProvider) ChatStream(ctx context.Context, messages []llmtyp
 		span.SetAttribute("llm.tool_calls.names", toolCallNames)
 	}
 
-	// Response content — maps to gen_ai.completion → Opik output column.
-	if resp.Content != "" {
-		span.SetAttribute("response.preview", truncatePreview(resp.Content))
+	// Bounded response preview — maps to gen_ai.completion → Opik output column.
+	if preview := truncatePreview(resp.Content); preview != "" {
+		span.SetAttribute("response.preview", preview)
 	}
 
 	// Capture content length (for analysis)
@@ -495,23 +506,19 @@ func (p *InstrumentedProvider) ChatStream(ctx context.Context, messages []llmtyp
 	return resp, nil
 }
 
-// maxPreviewRunes is the maximum number of runes stored in message.preview /
-// response.preview span attributes. Capping prevents unbounded trace payloads
-// and avoids leaking full conversation content into observability backends.
-// Must match the constant in pkg/agent/agent.go (maxPreviewLen = 200).
 const maxPreviewRunes = 200
 
-// truncatePreview truncates s to maxPreviewRunes runes, appending "…" when cut.
-func truncatePreview(s string) string {
-	runes := []rune(s)
+// truncatePreview bounds content exported to observability backends.
+func truncatePreview(content string) string {
+	runes := []rune(content)
 	if len(runes) <= maxPreviewRunes {
-		return s
+		return content
 	}
 	return string(runes[:maxPreviewRunes]) + "…"
 }
 
-// lastUserMessagePreview returns the content of the last user message, truncated
-// to maxPreviewRunes runes. For multi-modal messages it concatenates text blocks.
+// lastUserMessagePreview returns a bounded preview of the last user message.
+// For multi-modal messages it concatenates text blocks, skipping image blocks.
 func lastUserMessagePreview(messages []llmtypes.Message) string {
 	for i := len(messages) - 1; i >= 0; i-- {
 		m := messages[i]

@@ -66,12 +66,26 @@ type Server struct {
 	// grounding, so honoring them is an explicit operator decision
 	// (server.allow_time_override). Set via SetAllowTimeOverride.
 	allowTimeOverride bool
+
+	// allowAssistantOverride accepts WeaveRequest.replay_assistant_message
+	// (generation-free conversation replay — the caller supplies the
+	// assistant's turn verbatim). Default false (server.allow_assistant_override).
+	// Set via SetAllowAssistantOverride.
+	allowAssistantOverride bool
 }
 
 // SetAllowTimeOverride configures whether WeaveRequest.occurred_at is honored
 // (server.allow_time_override). See applyOccurredAt for the gate semantics.
 func (s *Server) SetAllowTimeOverride(allow bool) {
 	s.allowTimeOverride = allow
+}
+
+// SetAllowAssistantOverride configures whether
+// WeaveRequest.replay_assistant_message is honored
+// (server.allow_assistant_override). See applyReplayAssistant for the gate
+// semantics.
+func (s *Server) SetAllowAssistantOverride(allow bool) {
+	s.allowAssistantOverride = allow
 }
 
 // SetJudgeServer wires an in-memory JudgeServer so that ABTest can resolve req.JudgeId.
@@ -133,6 +147,12 @@ func (s *Server) Weave(ctx context.Context, req *loomv1.WeaveRequest) (*loomv1.W
 	// Request facts the model sees for this turn only (e.g. the caller's
 	// local time); see agent.WithRequestContext.
 	ctx = agent.WithRequestContext(ctx, req.GetContext())
+	// Generation-free replay: a scripted assistant turn substitutes for the LLM
+	// call while the memory pipeline still runs (see applyReplayAssistant).
+	ctx, err = applyReplayAssistant(ctx, req, s.allowAssistantOverride)
+	if err != nil {
+		return nil, err
+	}
 
 	// Get or create session
 	sessionID := req.SessionId
@@ -222,6 +242,12 @@ func (s *Server) StreamWeave(req *loomv1.WeaveRequest, stream loomv1.LoomService
 	// Request facts the model sees for this turn only (e.g. the caller's
 	// local time); see agent.WithRequestContext.
 	ctx = agent.WithRequestContext(ctx, req.GetContext())
+	// Generation-free replay: a scripted assistant turn substitutes for the LLM
+	// call while the memory pipeline still runs (see applyReplayAssistant).
+	ctx, err = applyReplayAssistant(ctx, req, s.allowAssistantOverride)
+	if err != nil {
+		return err
+	}
 
 	// Generate session ID if not provided
 	sessionID := req.SessionId
@@ -307,6 +333,7 @@ func (s *Server) StreamWeave(req *loomv1.WeaveRequest, stream loomv1.LoomService
 
 			// Include tool lifecycle fields if present
 			applyToolLifecycleFields(protoProgress, event)
+			applyToolInputStreamFields(protoProgress, event)
 
 			// Send to client
 			if err := stream.Send(protoProgress); err != nil {
@@ -441,6 +468,18 @@ func sanitizeUTF8(s string) string {
 		return s
 	}
 	return strings.ToValidUTF8(s, "\uFFFD")
+}
+
+// applyToolInputStreamFields marks a tool-input stream event and carries the
+// call's id and argument bytes so far, so clients can show the tool before it starts.
+func applyToolInputStreamFields(proto *loomv1.WeaveProgress, event agent.ProgressEvent) {
+	if !event.IsToolInputStream {
+		return
+	}
+
+	proto.IsToolInputStream = true
+	proto.ToolCallId = event.ToolCallID
+	proto.ToolInputBytes = event.ToolInputBytes
 }
 
 func applyToolLifecycleFields(proto *loomv1.WeaveProgress, event agent.ProgressEvent) {
@@ -673,7 +712,10 @@ func (s *Server) GetTrace(ctx context.Context, req *loomv1.GetTraceRequest) (*lo
 	return nil, status.Error(codes.Unimplemented, "trace retrieval not yet implemented")
 }
 
-// GetHealth performs a health check by pinging each configured LLM provider.
+// GetHealth performs a health check against each configured LLM provider,
+// preferring each provider's lightweight HealthCheck (see pingProvider in
+// health.go) over a real chat completion so transient LLM latency/rate
+// limits don't falsely report a live agent as unhealthy.
 // Returns per-component status in the components map with keys like "llm.agent", "llm.judge", etc.
 // Overall status is "healthy" if all pass, "degraded" if some fail, "unhealthy" if all fail.
 func (s *Server) GetHealth(ctx context.Context, req *loomv1.GetHealthRequest) (*loomv1.HealthStatus, error) {
@@ -688,9 +730,7 @@ func (s *Server) GetHealth(ctx context.Context, req *loomv1.GetHealthRequest) (*
 
 		// Send minimal health check with short timeout
 		checkCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		_, err := llmProvider.Chat(checkCtx, []types.Message{
-			{Role: "user", Content: "ping"},
-		}, nil)
+		err := pingProvider(checkCtx, llmProvider)
 		cancel()
 
 		latency := time.Since(start).Milliseconds()

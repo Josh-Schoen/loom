@@ -125,8 +125,10 @@ message WeaveProgress {
   string tool_error = 17;             // Error message if tool failed (when is_tool_completed)
   bool tool_success = 18;             // Whether tool succeeded (when is_tool_completed)
   int64 tool_duration_ms = 19;        // Tool execution duration in ms (when is_tool_completed)
-  string tool_call_id = 20;           // Unique ID correlating started/completed events
+  string tool_call_id = 20;           // Unique ID correlating started/completed and tool-input stream events
   ContextState context_state = 21;    // Context window state (included in completion event)
+  bool is_tool_input_stream = 22;     // True while the model is still writing a tool call's arguments
+  int64 tool_input_bytes = 23;        // Argument bytes received so far (when is_tool_input_stream)
 }
 ```
 
@@ -333,10 +335,12 @@ Tool execution duration in milliseconds.
 #### tool_call_id
 
 **Type**: `string`
-**Required**: No (only on tool lifecycle events)
-**Available since**: v1.2.0
+**Required**: No (only on tool lifecycle events and `is_tool_input_stream` events)
+**Available since**: v1.2.0 (on `is_tool_input_stream` events: unreleased, after v1.4.0)
 
 Unique identifier that correlates `is_tool_started` and `is_tool_completed` events for the same tool call. Clients can use this to track individual tool executions.
+
+The same ID also appears on `is_tool_input_stream` events, before the tool starts. A non-empty `tool_call_id` therefore does **not** mean the tool has started: check `is_tool_started` for that.
 
 
 #### context_state
@@ -369,6 +373,34 @@ A tool call the server hands to the caller for execution. The turn is held until
 - `arguments_json` (string): Model-produced arguments as a JSON object.
 - `session_id` (string): Session the call belongs to. Set even when the request named no session.
 - `timeout_seconds` (int32): Seconds the server waits for the result.
+
+
+#### is_tool_input_stream
+
+**Type**: `bool`
+**Required**: No
+**Available since**: unreleased (after v1.4.0)
+
+True while the model is still writing a tool call's arguments, before `is_tool_started`. The event carries no argument content. `tool_name` and `tool_call_id` identify the call when the provider reports them; a provider that does not report them sends a bare liveness pulse with both empty.
+
+All streaming providers report the call identity: OpenAI-compatible (OpenAI, Azure OpenAI, LiteLLM, Mistral, HuggingFace), Anthropic and Bedrock's Claude path stream it per argument delta; Ollama and Gemini deliver each tool call complete in one chunk and report it once with the full size.
+
+Gemini has no call IDs: `tool_call_id` repeats the function name, so two parallel calls to the same tool share one ID. Clients that key on `tool_call_id` should key on the event's call index instead (the agent's throttling does).
+
+The first event for a call, and the event that first supplies its name or id, are sent immediately. Later events are throttled to about one per second per call.
+
+
+#### tool_input_bytes
+
+**Type**: `int64`
+**Required**: No (only when `is_tool_input_stream` is true)
+**Available since**: unreleased (after v1.4.0)
+
+Bytes of tool-call argument JSON received so far. Because events are throttled, the last value a client sees can lag the final size until `is_tool_started` arrives.
+
+A value of 0 with no `tool_call_id` and no `tool_name` means the provider does not report sizes (a bare pulse). With either set, 0 means no arguments have arrived yet. Ollama and Gemini report the full argument size in a single event per call; the other providers report it growing per delta.
+
+For Ollama, the size is the raw argument JSON as the model produced it when it arrives as a string; when Ollama pre-parses the arguments into an object, the size is of the re-serialized JSON, which can differ slightly from what the model emitted.
 
 
 ## Execution Stages
@@ -539,15 +571,18 @@ message WeaveRequest {
 **`context` (per-request facts):** key/value facts the model should know for
 this request only, such as a phone app's `local_time`
 (`2026-10-18T07:05:00-05:00`) and `time_zone` (`America/Chicago`), so "tomorrow
-at 5pm" resolves in the person's time zone. The agent adds them as a system
-note ("Context sent with this message ...") to every LLM call of the turn,
-after the conversation; they are never added to the session, persisted, or
-returned by `GetConversationHistory`. At most 16 entries are used (in key
-order); keys are cut to 64 and values to 256 characters, line breaks become
-spaces. On Anthropic the note becomes the last system block: the tools and
-system prompt before it stay cacheable, but conversation messages after it are
-not read from the prompt cache on calls that carry a different note (the
-graph memory recall note behaves the same way).
+at 5pm" resolves in the person's time zone. The agent adds them as a note
+("Context sent with this message ...") to every LLM call of the turn, after
+the conversation: one trailing user-role message wrapped in
+`<system-reminder>` tags, shared with the turn's graph memory recall note and
+soft reminder when there are any. They are never added to the session, persisted, or returned by
+`GetConversationHistory`. At most 16 entries are used (in key order); keys are
+cut to 64 and values to 256 characters, line breaks become spaces. Because the
+note is the last thing in the request, after every cache breakpoint, a note
+that changes on every request (the local time does) leaves the tools, system
+prompt and conversation readable from the prompt cache. The graph memory
+recall note (`[Graph Memory Context]`), which follows each user message, rides
+the same note for the same reason and is likewise never stored.
 
 **`occurred_at` (replay/import only):** when set, every message persisted
 during the call — user turn, assistant reply, tool rows — carries this
@@ -1247,7 +1282,7 @@ message SessionStatusUpdate {
 Sent when a new message is added to the session conversation (e.g., from a sub-agent response, tool result, or user input).
 
 **Fields**:
-- `role`: Message role - `user`, `assistant`, or `tool` (only these roles are sent)
+- `role`: Message role - `user`, `assistant`, `tool`, `skill_body`, `hygiene_injection`, `empty_response_retry`, or `synthesis_prompt` (only these roles are sent). `skill_body`, `hygiene_injection`, `empty_response_retry`, and `synthesis_prompt` are synthetic, agent-authored roles — a loaded skill's instructions, a hygiene-retry nudge, an empty-response retry nudge, and a forced-final-answer synthesis prompt, respectively — persisted separately from the literal end user; see `pkg/agent/llm_retry.go`'s `IsSyntheticWireUserRole`.
 - `content`: The message text
 - `message_timestamp`: When the message was created (Unix timestamp)
 - `tool_name`: 🚧 Defined in proto but not yet populated by the server implementation
