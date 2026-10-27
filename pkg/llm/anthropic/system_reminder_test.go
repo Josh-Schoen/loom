@@ -58,3 +58,43 @@ func TestSystemReminderStaysAfterTheCachedPrefix(t *testing.T) {
 	}
 	assert.Equal(t, 1, marked, "the conversation's breakpoint survives")
 }
+
+// The graph memory recall note changes with every user message. It rides the
+// same trailing <system-reminder> note, so it never reaches the system field
+// and lands after the system prompt's and the conversation's breakpoints.
+func TestGraphMemoryRecallNoteStaysOutOfTheSystemField(t *testing.T) {
+	c := &Client{model: "claude-haiku-5-5"}
+	note := "<system-reminder>\n[Graph Memory Context]\nRelevant memories from past conversations:\n\n- [2026-10-20] User adopted a dog named Max\n</system-reminder>"
+	system, msgs := c.convertMessages([]llmtypes.Message{
+		{Role: "system", Content: "You help one household.", CacheBreakpoint: true},
+		{Role: "user", Content: "I adopted a dog"},
+		{Role: "assistant", Content: "Congratulations!", CacheBreakpoint: true},
+		{Role: "user", Content: "What is my dog's name?"},
+		{Role: "user", Content: note},
+	})
+
+	require.Len(t, system, 1)
+	assert.NotNil(t, system[0].CacheControl, "the system prompt keeps its breakpoint")
+	for _, b := range system {
+		assert.NotContains(t, b.Text, "[Graph Memory Context]", "the recall note is not in the system field")
+	}
+
+	// Find the note and every breakpoint by position in the conversation.
+	notePos, pos, lastMark := -1, 0, -1
+	for _, m := range msgs {
+		for _, b := range m.Content {
+			if b.CacheControl != nil {
+				lastMark = pos
+			}
+			if b.Text == note {
+				notePos = pos
+				assert.Nil(t, b.CacheControl, "the note itself is not cached")
+			}
+			pos++
+		}
+	}
+	require.GreaterOrEqual(t, notePos, 0, "the note is sent")
+	require.GreaterOrEqual(t, lastMark, 0, "the conversation's breakpoint survives")
+	assert.Equal(t, pos-1, notePos, "the note is the request's last content")
+	assert.Less(t, lastMark, notePos, "the note comes after every breakpoint")
+}
