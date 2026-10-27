@@ -238,7 +238,7 @@ func (sm *SegmentedMemory) compilePrefixLocked() ([]Message, [sha256.Size]byte) 
 // assistant message with thinking blocks, the fingerprint of the compiled
 // context the model had just been sent, and compile keeps the blocks on a
 // settled turn only while the context before them still fingerprints the
-// same. The transient tail (withTransientTail) is outside the fingerprint, as
+// same. The transient tail (withSystemReminder) is outside the fingerprint, as
 // it is outside the history within a turn.
 
 // recordThinkingPrefixLocked records the compiled-context fingerprint for an
