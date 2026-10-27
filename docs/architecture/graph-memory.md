@@ -418,6 +418,18 @@ Uses multiplicative combination (`CombineScores` in `pkg/memory/salience.go:122`
 
    `TestGraphMemoryRecall_PromptCacheLive` (`pkg/agent/graph_memory_prompt_cache_live_test.go`, needs `ANTHROPIC_API_KEY`) runs an eight-message conversation against the Anthropic API and logs the cache read, cache write and uncached input tokens the API reports for each call. `TestGraphMemoryRecall_PromptCache` checks the placement offline on every run: one recall note per request, none in the `system` field.
 
+   One run of the live test on 2026-10-27, `claude-haiku-5-5`, with each message sent right after the previous one (inside the 5-minute cache lifetime). "Before" is the same branch with the note back in a system message (bfbae05 reverted). Totals are for every main call after the first; the runs made 15 and 16 main calls in all, because the model chose its own `graph_memory` tool calls.
+
+   | Calls 2 onward | Before | Now |
+   |---|---|---|
+   | Input tokens read from cache | 151,073 (80%) | 186,300 (95%) |
+   | Input tokens written to cache | 20,169 | 7,441 |
+   | Uncached input tokens | 17,769 | 1,505 |
+   | Cost | $0.0075 | $0.0052 |
+   | Recall notes in the last request | 7 | 1 |
+
+   Both runs fail the test's check that each call reads back everything the previous call cached, for a reason unrelated to the note: settled turns render without thinking blocks (`renderLocked` in `pkg/agent/context_compilation.go`), so the first call of each message after one that used tools misses the cache from that earlier message's first assistant message onward. Claude Haiku 5.5, like Opus 4.5 and later and Sonnet 4.6 and later, keeps earlier turns' thinking blocks, so removing them changes the request.
+
 **Token Budget**: Controlled by config. Default: 20% of context window (200K * 20% = 40K tokens). Can be overridden with absolute `max_context_tokens`. Within `ContextFor()`, the budget is allocated in three phases: entity profile (200 tokens reserved), graph neighborhood (300 tokens reserved), and remaining budget for ranked memories via `AllocateMemoryBudget()` in `pkg/memory/budget.go`.
 
 **Tool Guidance**: The `graph_memory` tool's own description carries its usage guidance. The system prompt gets no graph-memory supplement — the ROM slot is byte-stable for the life of a session (ContextCompilation HLD §3), so per-feature prompt injection is not a channel.
