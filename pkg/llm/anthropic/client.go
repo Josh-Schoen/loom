@@ -24,6 +24,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/teradata-labs/loom/pkg/llm"
@@ -41,8 +42,15 @@ const (
 	DefaultMaxTokens = 4096
 	// DefaultTemperature is the default LLM temperature
 	DefaultTemperature = 1.0
-	// DefaultTimeout is the default HTTP timeout
+	// DefaultTimeout is the default HTTP timeout. For a streamed reply it
+	// bounds the wait for the response to start; the reply itself may then
+	// run as long as events keep arriving (StreamIdleTimeout).
 	DefaultTimeout = 60 * time.Second
+	// StreamIdleTimeout is how long a streamed reply may go without any
+	// event (Anthropic sends ping events while the model works) before it is
+	// given up on. A long reply, like a large file written as one tool call,
+	// can take minutes; only silence ends it.
+	StreamIdleTimeout = 2 * time.Minute
 )
 
 // DefaultAnthropicRateLimiterConfig returns safe defaults for Anthropic's API.
@@ -78,6 +86,10 @@ type Client struct {
 	thinkingLevel string
 	rateLimiter   *llm.RateLimiter
 	toolNameMap   map[string]string // sanitized name → original name
+	// streamClient has no overall timeout: a streamed reply is bounded by
+	// the time to its first byte and by streamIdle between events.
+	streamClient *http.Client
+	streamIdle   time.Duration
 }
 
 // Config holds configuration for the Anthropic client.
@@ -140,6 +152,8 @@ func NewClient(config Config) *Client {
 		httpClient: &http.Client{
 			Timeout: config.Timeout,
 		},
+		streamClient: &http.Client{Transport: streamTransport(config.Timeout)},
+		streamIdle:   StreamIdleTimeout,
 	}
 }
 
@@ -690,6 +704,13 @@ func (c *Client) ChatStream(ctx context.Context, messages []llmtypes.Message,
 	// The lambda creates a fresh HTTP request on each attempt so the request body
 	// can be re-read on a 429 retry. A 429 response is converted to an error so
 	// the rate limiter's exponential-backoff retry logic fires automatically.
+	// The reply may run as long as events keep coming; silence for
+	// streamIdle ends it.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	idle := newIdleWatch(c.streamIdle, cancel)
+	defer idle.stop()
+
 	buildStreamReq := func(ctx context.Context) (*http.Request, error) {
 		r, err := http.NewRequestWithContext(ctx, "POST", c.endpoint, bytes.NewReader(body))
 		if err != nil {
@@ -709,7 +730,7 @@ func (c *Client) ChatStream(ctx context.Context, messages []llmtypes.Message,
 			if err != nil {
 				return nil, err
 			}
-			resp, err := c.httpClient.Do(req)
+			resp, err := c.streamHTTPClient().Do(req)
 			if err != nil {
 				return nil, err
 			}
@@ -734,7 +755,7 @@ func (c *Client) ChatStream(ctx context.Context, messages []llmtypes.Message,
 		if err != nil {
 			return nil, err
 		}
-		httpResp, err = c.httpClient.Do(req)
+		httpResp, err = c.streamHTTPClient().Do(req)
 		if err != nil {
 			return nil, fmt.Errorf("HTTP request failed: %w", err)
 		}
@@ -766,7 +787,7 @@ func (c *Client) ChatStream(ctx context.Context, messages []llmtypes.Message,
 	thinkBlocks := make(map[int]*llmtypes.ThinkingBlock)
 	var thinkOrder []int
 
-	scanner := bufio.NewScanner(httpResp.Body)
+	scanner := bufio.NewScanner(idle.reader(httpResp.Body))
 	// A gateway may coalesce a whole response (or an error echoing the request)
 	// into one SSE line; the Scanner default 64KB line cap aborts the stream.
 	// Grown on demand, so steady-state memory is unchanged.
@@ -914,6 +935,9 @@ func (c *Client) ChatStream(ctx context.Context, messages []llmtypes.Message,
 			// Check context cancellation
 			select {
 			case <-ctx.Done():
+				if idle.fired() {
+					return nil, fmt.Errorf("error reading stream: the model sent nothing for %s", c.streamIdle)
+				}
 				return nil, ctx.Err()
 			default:
 			}
@@ -921,6 +945,9 @@ func (c *Client) ChatStream(ctx context.Context, messages []llmtypes.Message,
 	}
 
 	if err := scanner.Err(); err != nil {
+		if idle.fired() {
+			return nil, fmt.Errorf("error reading stream: the model sent nothing for %s", c.streamIdle)
+		}
 		if errors.Is(err, bufio.ErrTooLong) {
 			return nil, fmt.Errorf("error reading stream: SSE line exceeded the 8MB cap: %w", err)
 		}
@@ -1060,3 +1087,58 @@ var _ llmtypes.LLMProvider = (*Client)(nil)
 
 // Ensure Client implements StreamingLLMProvider interface.
 var _ llmtypes.StreamingLLMProvider = (*Client)(nil)
+
+// streamHTTPClient is the client for streamed requests: no overall timeout
+// (see streamClient). A Client built without NewClient falls back to
+// httpClient.
+func (c *Client) streamHTTPClient() *http.Client {
+	if c.streamClient != nil {
+		return c.streamClient
+	}
+	return c.httpClient
+}
+
+// streamTransport waits at most firstByte for a reply to start.
+func streamTransport(firstByte time.Duration) http.RoundTripper {
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	t.ResponseHeaderTimeout = firstByte
+	return t
+}
+
+// idleWatch cancels a streamed reply that has sent nothing for a while.
+type idleWatch struct {
+	timer   *time.Timer
+	after   time.Duration
+	tripped atomic.Bool
+}
+
+func newIdleWatch(after time.Duration, cancel context.CancelFunc) *idleWatch {
+	if after <= 0 {
+		after = StreamIdleTimeout
+	}
+	w := &idleWatch{after: after}
+	w.timer = time.AfterFunc(after, func() {
+		w.tripped.Store(true)
+		cancel()
+	})
+	return w
+}
+
+// reader resets the watch whenever r gives bytes.
+func (w *idleWatch) reader(r io.Reader) io.Reader { return idleReader{r: r, w: w} }
+
+func (w *idleWatch) stop()       { w.timer.Stop() }
+func (w *idleWatch) fired() bool { return w.tripped.Load() }
+
+type idleReader struct {
+	r io.Reader
+	w *idleWatch
+}
+
+func (r idleReader) Read(p []byte) (int, error) {
+	n, err := r.r.Read(p)
+	if n > 0 {
+		r.w.timer.Reset(r.w.after)
+	}
+	return n, err
+}
