@@ -31,6 +31,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 #### Server: `ListAgents` reports `total_count`
 - **`ListAgentsResponse.total_count` was always 0.** The proto documents it as the number of agents, but `ListAgents` never set it, so a client that read it (for example to show how many agents a server serves) reported none. It is now the number of agents returned.
 
+#### LLM: a streamed Anthropic reply ends on silence, not after the HTTP timeout
+- **Long streamed replies were cut off at 60 seconds.** The HTTP client's overall timeout covered the whole stream, so a reply still in progress, such as a large file written as one tool call, failed with `context deadline exceeded`. `ChatStream` now waits up to the configured timeout for the reply to start, then runs while events keep arriving and gives up after `StreamIdleTimeout` (2 minutes) without any event, with an error that says so. Non-streamed calls keep the overall timeout.
+
 #### LLM: no temperature for Claude models that reject sampling parameters
 - **A configured temperature broke current Claude models.** Loom always sends the configured temperature (1.0 by default, and 1 whenever thinking is on). Claude Opus 4.7 and later Opus, Fable, Mythos, Sonnet 5.x and Haiku 5.x restrict sampling parameters, so any other value fails every request with a 400 (`temperature` is deprecated for this model, seen on `claude-opus-5-5` and `claude-haiku-5-5`); Anthropic documents Opus 4.7 and later, Fable and Mythos as rejecting the field outright. `llm.AcceptsSamplingParams` now names the families in one list, like `IsAdaptiveThinkingModel`, and the Anthropic client, both Bedrock clients and the OpenAI-compatible client (Claude behind LiteLLM) leave `temperature` out for them. Older models are unchanged.
 
