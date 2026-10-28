@@ -1121,6 +1121,10 @@ func (s *MultiAgentServer) Weave(ctx context.Context, req *loomv1.WeaveRequest) 
 	if err != nil {
 		return nil, err
 	}
+	blocks, err := weaveContentBlocks(req)
+	if err != nil {
+		return nil, err
+	}
 
 	// Get agent: if no agent_id specified but session_id is, look up which agent owns the session.
 	// This fixes the bug where Weave(session_id=X) without agent_id falls through to the
@@ -1260,7 +1264,12 @@ func (s *MultiAgentServer) Weave(ctx context.Context, req *loomv1.WeaveRequest) 
 	}
 
 	// Execute agent chat
-	resp, err := ag.Chat(ctx, sessionID, req.Query)
+	var resp *agent.Response
+	if len(blocks) > 0 {
+		resp, err = ag.ChatWithContentBlocks(ctx, sessionID, req.Query, blocks, nil)
+	} else {
+		resp, err = ag.Chat(ctx, sessionID, req.Query)
+	}
 	if err != nil {
 		if span != nil {
 			span.RecordError(err)
@@ -1368,6 +1377,10 @@ func (s *MultiAgentServer) StreamWeave(req *loomv1.WeaveRequest, stream loomv1.L
 	// Mirrors Weave — without this, a streaming replay would silently persist a
 	// generated turn where the scripted one belongs.
 	ctx, err = applyReplayAssistant(ctx, req, s.allowAssistantOverride)
+	if err != nil {
+		return err
+	}
+	blocks, err := weaveContentBlocks(req)
 	if err != nil {
 		return err
 	}
@@ -1538,7 +1551,13 @@ func (s *MultiAgentServer) StreamWeave(req *loomv1.WeaveRequest, stream loomv1.L
 
 	// Execute agent with progress callback
 	go func() {
-		resp, err := ag.ChatWithProgress(ctx, sessionID, req.Query, progressCallback)
+		var resp *agent.Response
+		var err error
+		if len(blocks) > 0 {
+			resp, err = ag.ChatWithContentBlocks(ctx, sessionID, req.Query, blocks, progressCallback)
+		} else {
+			resp, err = ag.ChatWithProgress(ctx, sessionID, req.Query, progressCallback)
+		}
 		resultChan <- agentResult{resp: resp, err: err}
 		close(progressChan)
 	}()
