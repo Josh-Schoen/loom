@@ -866,6 +866,21 @@ message WeaveRequest {
   // Unlike reset_context, nothing is forgotten: older turns live on in the
   // summary. No effect when there is nothing old enough to fold.
   bool compact_context = 15;
+
+  // Pictures sent with the query (optional), in order: a photo the person
+  // took, a screenshot. The agent sees them alongside query on providers
+  // that read images; query stays the turn's text for persistence and
+  // memory. At most 10, each at most 5 MiB (INVALID_ARGUMENT otherwise).
+  repeated WeaveImage images = 16;
+}
+
+// WeaveImage is one picture sent with a WeaveRequest.
+message WeaveImage {
+  // "image/jpeg", "image/png", "image/gif" or "image/webp".
+  string media_type = 1;
+
+  // The picture's bytes.
+  bytes data = 2;
 }
 
 // WeaveResponse contains the execution result.

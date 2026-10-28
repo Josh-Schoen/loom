@@ -203,7 +203,9 @@ func (h *HTTPServer) Start(ctx context.Context) error {
 	// SSE handler decodes them), so cap their size: an unauthenticated client
 	// could otherwise stream one body until the server runs out of memory.
 	// gRPC's default receive limit is the same, so no valid request is lost.
-	var handler http.Handler = http.MaxBytesHandler(rootMux, maxRequestBodyBytes)
+	// Weave requests may carry pictures, so they get more room
+	// (MaxRequestBytes, the gRPC server's limit too).
+	var handler http.Handler = limitBodies(rootMux)
 	if h.corsConfig.Enabled {
 		handler = h.corsMiddleware(handler)
 	}
@@ -380,9 +382,22 @@ func (h *HTTPServer) handleOpenAPISpec(w http.ResponseWriter, r *http.Request) {
 // the gateway see it.
 const streamWeaveFullMethod = "/loom.v1.LoomService/StreamWeave"
 
-// maxRequestBodyBytes caps every HTTP request body (gRPC's default
-// maximum receive message size).
+// maxRequestBodyBytes caps every HTTP request body but a weave's (gRPC's
+// default maximum receive message size).
 const maxRequestBodyBytes = 4 << 20
+
+// limitBodies caps request bodies: MaxRequestBytes for weaves, which may
+// carry pictures (WeaveRequest.images), maxRequestBodyBytes for the rest.
+func limitBodies(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		limit := int64(maxRequestBodyBytes)
+		if r.Method == http.MethodPost && (r.URL.Path == "/v1/weave" || r.URL.Path == "/v1/weave:stream") {
+			limit = MaxRequestBytes
+		}
+		r.Body = http.MaxBytesReader(w, r.Body, limit)
+		next.ServeHTTP(w, r)
+	})
+}
 
 // handleStreamWeaveSSE handles SSE streaming for /v1/weave:stream
 func (h *HTTPServer) handleStreamWeaveSSE(w http.ResponseWriter, r *http.Request) {

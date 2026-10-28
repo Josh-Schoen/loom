@@ -2321,6 +2321,9 @@ func runServe(cmd *cobra.Command, args []string) {
 	serverOpts := []grpc.ServerOption{
 		grpc.ChainUnaryInterceptor(unaryInterceptors...),
 		grpc.ChainStreamInterceptor(streamInterceptors...),
+		// Room for the pictures a WeaveRequest may carry (gRPC's default
+		// is 4 MiB).
+		grpc.MaxRecvMsgSize(server.MaxRequestBytes),
 	}
 	if tlsManager != nil {
 		creds := credentials.NewTLS(tlsManager.TLSConfig())

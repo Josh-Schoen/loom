@@ -10735,6 +10735,21 @@
       },
       "description": "WatchSharedMemoryRequest watches for changes to keys in a namespace.\nReturns a stream of SharedMemoryValue as keys are created/updated/deleted."
     },
+    "v1WeaveImage": {
+      "type": "object",
+      "properties": {
+        "mediaType": {
+          "type": "string",
+          "description": "\"image/jpeg\", \"image/png\", \"image/gif\" or \"image/webp\"."
+        },
+        "data": {
+          "type": "string",
+          "format": "byte",
+          "description": "The picture's bytes."
+        }
+      },
+      "description": "WeaveImage is one picture sent with a WeaveRequest."
+    },
     "v1WeaveProgress": {
       "type": "object",
       "properties": {
@@ -10918,6 +10933,14 @@
         "compactContext": {
           "type": "boolean",
           "description": "Fold the conversation so far into its summary before processing this\nmessage, keeping the most recent turns as they are (\"make room\").\nUnlike reset_context, nothing is forgotten: older turns live on in the\nsummary. No effect when there is nothing old enough to fold."
+        },
+        "images": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "$ref": "#/definitions/v1WeaveImage"
+          },
+          "description": "Pictures sent with the query (optional), in order: a photo the person\ntook, a screenshot. The agent sees them alongside query on providers\nthat read images; query stays the turn's text for persistence and\nmemory. At most 10, each at most 5 MiB (INVALID_ARGUMENT otherwise)."
         }
       },
       "description": "WeaveRequest initiates a query execution."
