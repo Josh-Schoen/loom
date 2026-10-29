@@ -18,6 +18,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -586,6 +587,36 @@ func TestClient_SupportsNativeTools_ProbeNoToolTemplate(t *testing.T) {
 	assert.False(t, client.supportsNativeTools(), "should detect no tool support")
 }
 
+func TestClient_SupportsNativeTools_ProbeReadsCapabilities(t *testing.T) {
+	tests := []struct {
+		name         string
+		capabilities []string
+		want         bool
+	}{
+		// Models on Ollama's MLX runner report a bare template but list "tools".
+		{"tools listed", []string{"completion", "vision", "tools", "thinking"}, true},
+		{"tools not listed", []string{"completion", "vision"}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/api/show" {
+					w.Header().Set("Content-Type", "application/json")
+					_ = json.NewEncoder(w).Encode(map[string]any{
+						"template":     `{{ .Prompt }}`,
+						"capabilities": tt.capabilities,
+					})
+				}
+			}))
+			defer server.Close()
+
+			client := NewClient(Config{Endpoint: server.URL, Model: "gemma4:26b"})
+			assert.Equal(t, tt.want, client.supportsNativeTools())
+			assert.True(t, client.nativeToolsProbed, "probe flag should be set")
+		})
+	}
+}
+
 func TestClient_SupportsNativeTools_ProbeFallsBackToStaticList(t *testing.T) {
 	// No server running — probe will fail, should fall back to static list
 	client := NewClient(Config{
@@ -595,6 +626,28 @@ func TestClient_SupportsNativeTools_ProbeFallsBackToStaticList(t *testing.T) {
 	})
 
 	assert.True(t, client.supportsNativeTools(), "qwen3 should match fallback list")
+}
+
+func TestClient_SupportsNativeTools_FailedProbeIsRetried(t *testing.T) {
+	// Ollama answers /api/show with an error first (as when busy), then
+	// lists "tools": the first miss must not stick.
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/show" {
+			if calls.Add(1) == 1 {
+				w.WriteHeader(http.StatusServiceUnavailable)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"capabilities": []string{"completion", "tools"}})
+		}
+	}))
+	defer server.Close()
+
+	client := NewClient(Config{Endpoint: server.URL, Model: "some-unknown-model:14b"})
+	assert.False(t, client.supportsNativeTools(), "probe failed and the model isn't in the fallback list")
+	assert.False(t, client.nativeToolsProbed, "a failed probe isn't cached")
+	assert.True(t, client.supportsNativeTools(), "the next request probes again")
 }
 
 func TestClient_SupportsNativeTools_ExplicitModes(t *testing.T) {

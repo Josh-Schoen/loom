@@ -23,6 +23,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 
@@ -63,6 +64,8 @@ var fallbackToolSupportedModels = map[string]bool{
 	"functionary":   true,
 	"command-r":     true,
 	"phi4":          true,
+	"gemma4":        true,
+	"gpt-oss":       true,
 }
 
 // ToolMode defines how tools are handled.
@@ -230,16 +233,20 @@ func (c *Client) supportsNativeTools() bool {
 		}
 	}
 
-	c.nativeToolsProbed = true
-	c.nativeToolsSupport = false
+	// Not cached: a busy Ollama can miss the probe's deadline, and caching
+	// "no tools" would keep tools from this model for the client's lifetime.
+	// The next request probes again.
 	return false
 }
 
-// probeToolSupport queries Ollama's /api/show endpoint to check if the model
+// probeToolSupport queries Ollama's /api/show endpoint to check whether the
+// model lists the "tools" capability or, on older Ollama, whether its
 // template contains tool-handling directives (e.g. {{- if .Tools }}).
 // Returns (supportsTools, probeSucceeded).
 func (c *Client) probeToolSupport() (bool, bool) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	// Ollama can take several seconds to answer /api/show while a model is
+	// loading or generating.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	body, err := json.Marshal(map[string]string{"name": c.model})
@@ -264,13 +271,21 @@ func (c *Client) probeToolSupport() (bool, bool) {
 	}
 
 	var showResp struct {
-		Template string `json:"template"`
+		Template     string   `json:"template"`
+		Capabilities []string `json:"capabilities"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&showResp); err != nil {
 		return false, false
 	}
 
-	// Ollama models with tool support include tool-handling blocks in their template
+	// Ollama (v0.6.4+) lists what the model can do, "tools" among them. Prefer
+	// it: models on the MLX runner report a bare "{{ .Prompt }}" template
+	// even when they call tools natively.
+	if len(showResp.Capabilities) > 0 {
+		return slices.Contains(showResp.Capabilities, "tools"), true
+	}
+
+	// Older Ollama: models with tool support include tool-handling blocks in their template
 	hasTools := strings.Contains(showResp.Template, ".Tools") ||
 		strings.Contains(showResp.Template, "tools")
 	return hasTools, true
