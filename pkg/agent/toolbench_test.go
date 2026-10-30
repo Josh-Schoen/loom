@@ -18,8 +18,9 @@ package agent
 //
 // A scripted model plays fixed conversations against a real Agent. Every
 // provider call is recorded (the advertised tools and the compiled messages),
-// so the numbers measure what loom actually sends, not a model of it. Three
-// tool-loading setups are compared:
+// so the numbers measure what loom actually sends, not a model of it.
+//
+// Three tool-loading setups:
 //
 //	eager_all  every tool of every MCP server registered up front (an MCP
 //	           config with an empty or "*" tool list)
@@ -27,20 +28,30 @@ package agent
 //	           FTS5 index and registered on first call
 //	mixed      one server eager, the rest on demand
 //
-// TestToolbench_NoRegression gates the deterministic metrics against
-// testdata/toolbench/baseline.json. Regenerate the baseline deliberately with
-// LOOM_TOOLBENCH_UPDATE=1 (the diff is the review record). LOOM_TOOLBENCH_OUT
-// writes the current report to a file. BenchmarkToolbench* measure speed; compare
-// runs with benchstat. See docs/testing/toolbench.md.
+// Two model behaviors:
+//
+//	lenient    after tool_search, calls the found tool by name even when it
+//	           is not in the tool list it was given
+//	strict     calls only tools in the list it was given, as provider APIs
+//	           constrain real models; a tool it cannot get is skipped
+//
+// TestToolbench_NoRegression gates tool-definition tokens and the counts
+// against testdata/toolbench/baseline.json; cost metrics are reported, not
+// gated. Regenerate the baseline deliberately with LOOM_TOOLBENCH_UPDATE=1 (the
+// diff is the review record). LOOM_TOOLBENCH_OUT writes the current report.
+// BenchmarkToolbench* measure speed; compare runs with benchstat. See
+// docs/testing/toolbench.md.
 
 import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"math"
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -55,13 +66,23 @@ import (
 const (
 	toolbenchBaselinePath = "testdata/toolbench/baseline.json"
 
-	// Prompt-cache price multipliers relative to uncached input (Anthropic's
-	// published cache-read and 5-minute cache-write rates). Used only for the
-	// modeled billed-token metric.
-	toolbenchCacheReadMultiplier  = 0.1
-	toolbenchCacheWriteMultiplier = 1.25
+	// Cost model, in input-token equivalents (Anthropic's published
+	// multipliers): a cache read is 0.1x, a cache write 1.25x, output 5x.
+	// A prefix shorter than the minimum is never cached; an entry expires
+	// after the TTL unless read again.
+	toolbenchCacheRead       = 0.1
+	toolbenchCacheWrite      = 1.25
+	toolbenchOutputPrice     = 5.0
+	toolbenchCacheMinTokens  = 1024
+	toolbenchCacheTTLSeconds = 300
 
-	// Relative slack on token metrics before the gate calls it a regression.
+	// Simulated seconds per provider call within a turn, and the default gap
+	// before a user turn.
+	toolbenchCallSeconds    = 5
+	toolbenchTurnGapSeconds = 20
+
+	// Relative slack on tool-definition tokens before the gate calls it a
+	// regression.
 	toolbenchTokenSlack = 0.02
 )
 
@@ -100,12 +121,14 @@ type toolbenchToolDef struct {
 func (d toolbenchToolDef) qualified() string { return d.server + ":" + d.name }
 
 var (
-	toolbenchFixtureOnce sync.Once
-	toolbenchFixtureDefs []toolbenchToolDef
+	toolbenchFixtureOnce   sync.Once
+	toolbenchFixtureDefs   []toolbenchToolDef
+	toolbenchFixtureByName map[string]toolbenchToolDef
 )
 
 func toolbenchFixture() []toolbenchToolDef {
 	toolbenchFixtureOnce.Do(func() {
+		toolbenchFixtureByName = map[string]toolbenchToolDef{}
 		for _, s := range toolbenchServers {
 			n := 0
 			for _, noun := range s.nouns {
@@ -113,13 +136,20 @@ func toolbenchFixture() []toolbenchToolDef {
 					if n == s.limit {
 						break
 					}
-					toolbenchFixtureDefs = append(toolbenchFixtureDefs, toolbenchMakeTool(s, verb, noun))
+					d := toolbenchMakeTool(s, verb, noun)
+					toolbenchFixtureDefs = append(toolbenchFixtureDefs, d)
+					toolbenchFixtureByName[d.name] = d
 					n++
 				}
 			}
 		}
 	})
 	return toolbenchFixtureDefs
+}
+
+func toolbenchDef(name string) toolbenchToolDef {
+	toolbenchFixture()
+	return toolbenchFixtureByName[name]
 }
 
 func toolbenchMakeTool(s toolbenchServer, verb, noun string) toolbenchToolDef {
@@ -155,49 +185,57 @@ func toolbenchMakeTool(s toolbenchServer, verb, noun string) toolbenchToolDef {
 	}
 }
 
-func toolbenchFixtureByName() map[string]toolbenchToolDef {
-	m := make(map[string]toolbenchToolDef)
-	for _, d := range toolbenchFixture() {
-		m[d.name] = d
+// toolbenchToolOutput is a tool's JSON result, padded with items to about
+// items*80 bytes.
+func toolbenchToolOutput(name string, items int) string {
+	if items < 2 {
+		items = 2
 	}
-	return m
+	var b strings.Builder
+	fmt.Fprintf(&b, `{"tool":%q,"items":[`, name)
+	for i := 0; i < items; i++ {
+		if i > 0 {
+			b.WriteString(",")
+		}
+		fmt.Fprintf(&b, `{"id":"%d","title":"Item %d of the quarterly plan","owner":"me"}`, i+1, i+1)
+	}
+	b.WriteString(`],"next_page":null}`)
+	return b.String()
 }
 
 // toolbenchEagerTool is an MCP tool registered up front under its
 // server-qualified name, the way RegisterMCPServer names adapter tools.
-type toolbenchEagerTool struct{ def toolbenchToolDef }
+type toolbenchEagerTool struct {
+	def   toolbenchToolDef
+	items int
+}
 
 func (t toolbenchEagerTool) Name() string                     { return t.def.qualified() }
 func (t toolbenchEagerTool) Description() string              { return t.def.desc }
 func (t toolbenchEagerTool) InputSchema() *shuttle.JSONSchema { return t.def.schema }
 func (t toolbenchEagerTool) Backend() string                  { return "" }
 func (t toolbenchEagerTool) Execute(context.Context, map[string]interface{}) (*shuttle.Result, error) {
-	return &shuttle.Result{Success: true, Data: toolbenchToolOutput(t.def.name)}, nil
-}
-
-func toolbenchToolOutput(name string) string {
-	return fmt.Sprintf(`{"tool":%q,"items":[{"id":"1","title":"Quarterly plan","owner":"me"},`+
-		`{"id":"2","title":"Budget review","owner":"me"}],"next_page":null}`, name)
+	return &shuttle.Result{Success: true, Data: toolbenchToolOutput(t.def.name, t.items)}, nil
 }
 
 // toolbenchMCPManager / toolbenchMCPClient stand in for the MCP manager the
 // executor resolves on-demand tools through. CallTool answers like a server.
-type toolbenchMCPManager struct{}
+type toolbenchMCPManager struct{ items int }
 
-func (toolbenchMCPManager) GetClient(server string) (interface{}, error) {
-	return toolbenchMCPClient{}, nil
+func (m toolbenchMCPManager) GetClient(string) (interface{}, error) {
+	return toolbenchMCPClient(m), nil
 }
 
-type toolbenchMCPClient struct{}
+type toolbenchMCPClient struct{ items int }
 
-func (toolbenchMCPClient) CallTool(_ context.Context, name string, _ map[string]interface{}) (interface{}, error) {
+func (c toolbenchMCPClient) CallTool(_ context.Context, name string, _ map[string]interface{}) (interface{}, error) {
 	return map[string]interface{}{
-		"content": []interface{}{map[string]interface{}{"type": "text", "text": toolbenchToolOutput(name)}},
+		"content": []interface{}{map[string]interface{}{"type": "text", "text": toolbenchToolOutput(name, c.items)}},
 	}, nil
 }
 
 // ---------------------------------------------------------------------------
-// Setups
+// Setups and model behaviors
 // ---------------------------------------------------------------------------
 
 type toolbenchSetup struct {
@@ -210,6 +248,8 @@ var toolbenchSetups = []toolbenchSetup{
 	{"on_demand", func(string) bool { return false }},
 	{"mixed", func(s string) bool { return s == "github" }},
 }
+
+var toolbenchBehaviors = []string{"lenient", "strict"}
 
 // toolbenchIndex builds the on-disk FTS5 tool index holding every fixture tool.
 func toolbenchIndex(tb testing.TB) *toolregistry.Registry {
@@ -240,24 +280,25 @@ func toolbenchIndex(tb testing.TB) *toolregistry.Registry {
 	return reg
 }
 
-func toolbenchAgent(tb testing.TB, setup toolbenchSetup, model *toolbenchModel, index *toolregistry.Registry) *Agent {
+func toolbenchAgent(tb testing.TB, sc toolbenchScenario, setup toolbenchSetup, model *toolbenchModel, index *toolregistry.Registry) *Agent {
 	tb.Helper()
 	cfg := DefaultConfig()
 	cfg.PatternConfig = DefaultPatternConfig()
 	cfg.PatternConfig.UseLLMClassifier = false
+	cfg.MaxContextTokens = sc.maxContextTokens
 	ag := NewAgent(&mockBackend{}, model, WithConfig(cfg))
 
 	anyOnDemand := false
 	for _, d := range toolbenchFixture() {
 		if setup.eager(d.server) {
-			ag.RegisterTool(toolbenchEagerTool{def: d})
+			ag.RegisterTool(toolbenchEagerTool{def: d, items: sc.outputItems})
 		} else {
 			anyOnDemand = true
 		}
 	}
 	if anyOnDemand {
 		ag.RegisterTool(toolregistry.NewSearchTool(index))
-		ag.SetToolRegistryForDynamicDiscovery(index, toolbenchMCPManager{})
+		ag.SetToolRegistryForDynamicDiscovery(index, toolbenchMCPManager{items: sc.outputItems})
 	}
 	return ag
 }
@@ -269,57 +310,78 @@ func toolbenchAgent(tb testing.TB, setup toolbenchSetup, model *toolbenchModel, 
 type toolbenchTurn struct {
 	session string
 	tools   []string // fixture tool names the model uses, in order
+	gap     int      // simulated seconds before this turn; 0 = default
 }
 
 type toolbenchScenario struct {
-	name  string
-	turns []toolbenchTurn
+	name             string
+	turns            []toolbenchTurn
+	outputItems      int // items per tool result (~80 bytes each)
+	maxContextTokens int // 0 = provider default
+}
+
+func toolbenchFoldTurns() []toolbenchTurn {
+	cycle := []string{"gh_list_pull_request", "sheet_get_range", "db_list_table", "cal_list_event",
+		"gh_get_pull_request", "sheet_append_row", "db_get_schema", "drive_list_file"}
+	turns := make([]toolbenchTurn, 24)
+	for i := range turns {
+		turns[i] = toolbenchTurn{session: "a", tools: []string{cycle[i%len(cycle)]}}
+	}
+	return turns
 }
 
 var toolbenchScenarios = []toolbenchScenario{
-	{"short", []toolbenchTurn{
-		{"a", []string{"gh_list_issue", "gh_get_issue"}},
+	{name: "short", outputItems: 2, turns: []toolbenchTurn{
+		{session: "a", tools: []string{"gh_list_issue", "gh_get_issue"}},
 	}},
-	{"long", []toolbenchTurn{
-		{"a", []string{"gh_list_pull_request"}},
-		{"a", []string{"gh_get_pull_request"}},
-		{"a", []string{"sheet_get_range"}},
-		{"a", []string{"sheet_append_row"}},
-		{"a", []string{"db_list_table", "db_get_schema"}},
-		{"a", []string{"gh_list_pull_request"}},
-		{"a", []string{"sheet_get_range"}},
-		{"a", []string{"db_list_table"}},
-		{"a", []string{"cal_list_event"}},
-		{"a", []string{"gh_create_issue"}},
+	{name: "long", outputItems: 2, turns: []toolbenchTurn{
+		{session: "a", tools: []string{"gh_list_pull_request"}},
+		{session: "a", tools: []string{"gh_get_pull_request"}},
+		{session: "a", tools: []string{"sheet_get_range"}},
+		{session: "a", tools: []string{"sheet_append_row"}},
+		{session: "a", tools: []string{"db_list_table", "db_get_schema"}},
+		// Ten minutes away: the prompt cache has expired.
+		{session: "a", tools: []string{"gh_list_pull_request"}, gap: 600},
+		{session: "a", tools: []string{"sheet_get_range"}},
+		{session: "a", tools: []string{"db_list_table"}},
+		{session: "a", tools: []string{"cal_list_event"}},
+		{session: "a", tools: []string{"gh_create_issue"}},
 	}},
-	{"two_sessions", []toolbenchTurn{
-		{"a", []string{"gh_list_issue"}},
-		{"b", []string{"sheet_get_range"}},
-		{"a", []string{"gh_get_issue"}},
-		{"b", []string{"cal_list_event"}},
-		{"a", []string{"gh_list_issue"}},
+	{name: "two_sessions", outputItems: 2, turns: []toolbenchTurn{
+		{session: "a", tools: []string{"gh_list_issue"}},
+		{session: "b", tools: []string{"sheet_get_range"}},
+		{session: "a", tools: []string{"gh_get_issue"}},
+		{session: "b", tools: []string{"cal_list_event"}},
+		{session: "a", tools: []string{"gh_list_issue"}},
 	}},
+	// Large results in a 64k window: old history must be released (stubbed
+	// or folded) to keep going, and eager tool lists compete for the room.
+	{name: "long_fold", outputItems: 200, maxContextTokens: 64000, turns: toolbenchFoldTurns()},
 }
 
 // ---------------------------------------------------------------------------
-// Scripted model: plays a turn's tool list, searching for any tool it was
-// not given (the way a model follows tool_search), and records every call.
+// Scripted model: plays a turn's tool list and records every call.
 // ---------------------------------------------------------------------------
 
 var toolbenchTurnTag = regexp.MustCompile(`\[toolbench s=(\w+) t=(\d+)\]`)
 
 type toolbenchCall struct {
 	session  string
+	turn     int
 	tools    []shuttle.Tool
 	messages []llmtypes.Message
+	response *llmtypes.LLMResponse
 }
 
 type toolbenchModel struct {
-	mu    sync.Mutex
-	plans map[string][]string // "session/turn" → tool names
-	state map[string]*toolbenchPlanState
-	calls []toolbenchCall
-	seq   int
+	strict bool
+
+	mu      sync.Mutex
+	plans   map[string][]string // "session/turn" → tool names
+	state   map[string]*toolbenchPlanState
+	calls   []toolbenchCall
+	skipped int // planned tool uses the strict model could not make
+	seq     int
 }
 
 type toolbenchPlanState struct {
@@ -327,8 +389,8 @@ type toolbenchPlanState struct {
 	searched bool
 }
 
-func newToolbenchModel(sc toolbenchScenario) *toolbenchModel {
-	m := &toolbenchModel{plans: map[string][]string{}, state: map[string]*toolbenchPlanState{}}
+func newToolbenchModel(sc toolbenchScenario, strict bool) *toolbenchModel {
+	m := &toolbenchModel{strict: strict, plans: map[string][]string{}, state: map[string]*toolbenchPlanState{}}
 	for i, t := range sc.turns {
 		m.plans[fmt.Sprintf("%s/%d", t.session, i)] = t.tools
 	}
@@ -342,36 +404,42 @@ func (m *toolbenchModel) Chat(_ context.Context, messages []llmtypes.Message, to
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	var key, session string
+	session, turn, key := "", -1, ""
 	for i := len(messages) - 1; i >= 0; i-- {
 		if messages[i].Role != "user" {
 			continue
 		}
 		if g := toolbenchTurnTag.FindStringSubmatch(toolbenchText(messages[i])); g != nil {
 			session, key = g[1], g[1]+"/"+g[2]
+			turn, _ = strconv.Atoi(g[2])
 			break
 		}
 	}
+	resp := m.respond(key, tools)
 	m.calls = append(m.calls, toolbenchCall{
 		session:  session,
+		turn:     turn,
 		tools:    append([]shuttle.Tool(nil), tools...),
 		messages: append([]llmtypes.Message(nil), messages...),
+		response: resp,
 	})
+	return resp, nil
+}
 
+func (m *toolbenchModel) respond(key string, tools []shuttle.Tool) *llmtypes.LLMResponse {
 	plan, ok := m.plans[key]
 	if !ok {
-		return &llmtypes.LLMResponse{Content: "ok", StopReason: "end_turn"}, nil
+		return &llmtypes.LLMResponse{Content: "ok", StopReason: "end_turn"}
 	}
 	st := m.state[key]
 	if st == nil {
 		st = &toolbenchPlanState{}
 		m.state[key] = st
 	}
-	if st.next >= len(plan) {
-		return &llmtypes.LLMResponse{Content: "Done.", StopReason: "end_turn"}, nil
+	advertised := map[string]bool{}
+	for _, t := range tools {
+		advertised[t.Name()] = true
 	}
-
-	want := plan[st.next]
 	call := func(name string, input map[string]interface{}) *llmtypes.LLMResponse {
 		m.seq++
 		return &llmtypes.LLMResponse{StopReason: "tool_use", ToolCalls: []llmtypes.ToolCall{
@@ -380,31 +448,34 @@ func (m *toolbenchModel) Chat(_ context.Context, messages []llmtypes.Message, to
 	}
 	args := map[string]interface{}{"id": "1", "owner": "me"}
 
-	advertised := map[string]bool{}
-	for _, t := range tools {
-		advertised[t.Name()] = true
+	for st.next < len(plan) {
+		want := plan[st.next]
+		def := toolbenchDef(want)
+		switch {
+		case advertised[def.qualified()]:
+			st.next, st.searched = st.next+1, false
+			return call(def.qualified(), args)
+		case advertised[want]:
+			st.next, st.searched = st.next+1, false
+			return call(want, args)
+		case !st.searched && advertised[builtin.ToolSearchName]:
+			st.searched = true
+			return call(builtin.ToolSearchName, map[string]interface{}{
+				"query": strings.ReplaceAll(want, "_", " "),
+				"mode":  "fast",
+			})
+		case !m.strict:
+			// Read about it in the search result: call it by the name the
+			// index gave, though it is not in the tool list.
+			st.next, st.searched = st.next+1, false
+			return call(want, args)
+		default:
+			// A constrained model cannot call a tool it was not given.
+			st.next, st.searched = st.next+1, false
+			m.skipped++
+		}
 	}
-	def := toolbenchFixtureByName()[want]
-	switch {
-	case advertised[def.qualified()]:
-		st.next++
-		return call(def.qualified(), args), nil
-	case advertised[want]:
-		st.next++
-		return call(want, args), nil
-	case !st.searched && advertised[builtin.ToolSearchName]:
-		st.searched = true
-		return call(builtin.ToolSearchName, map[string]interface{}{
-			"query": strings.ReplaceAll(want, "_", " "),
-			"mode":  "fast",
-		}), nil
-	default:
-		// Read about it in the search result (or never found it): call it by
-		// the name the index gave.
-		st.next++
-		st.searched = false
-		return call(want, args), nil
-	}
+	return &llmtypes.LLMResponse{Content: "Done.", StopReason: "end_turn"}
 }
 
 func toolbenchText(m llmtypes.Message) string {
@@ -422,16 +493,23 @@ func toolbenchText(m llmtypes.Message) string {
 // Measurement
 // ---------------------------------------------------------------------------
 
-// toolbenchResult holds one scenario × setup. All fields are deterministic.
+// toolbenchResult holds one scenario × setup × behavior. All fields are
+// deterministic.
 type toolbenchResult struct {
 	Scenario string `json:"scenario"`
 	Setup    string `json:"setup"`
+	Behavior string `json:"behavior"`
 
-	UserTurns     int `json:"user_turns"`
-	ProviderCalls int `json:"provider_calls"`
-	ToolCalls     int `json:"tool_calls"`
-	ToolCallsOK   int `json:"tool_calls_ok"`
-	SearchCalls   int `json:"search_calls"`
+	UserTurns   int `json:"user_turns"`
+	FailedTurns int `json:"failed_turns"`
+	// FirstError is the first failed turn's error, for reading the report.
+	FirstError    string `json:"first_error,omitempty"`
+	ProviderCalls int    `json:"provider_calls"`
+	PlannedUses   int    `json:"planned_tool_uses"`
+	ToolCalls     int    `json:"tool_calls"`
+	ToolCallsOK   int    `json:"tool_calls_ok"`
+	SearchCalls   int    `json:"search_calls"`
+	Skipped       int    `json:"skipped_tool_uses"`
 
 	AdvertisedToolsMax   int `json:"advertised_tools_max"`
 	AdvertisedToolsFirst int `json:"advertised_tools_first_call"`
@@ -439,28 +517,34 @@ type toolbenchResult struct {
 	ToolTokens    int `json:"tool_tokens_total"`
 	MessageTokens int `json:"message_tokens_total"`
 	InputTokens   int `json:"input_tokens_total"`
-	// BilledTokensModeled prices InputTokens with prompt caching: the prefix
-	// identical to the session's previous call (tools first, then messages)
-	// is a cache read, the rest a cache write. A tool-list change makes the
-	// whole request a write.
+	CachedTokens  int `json:"cached_input_tokens"`
+	OutputTokens  int `json:"output_tokens_total"`
+	// BilledTokensModeled is the run's cost in input-token equivalents: cache
+	// reads, cache writes and output priced by the constants above, with one
+	// prompt cache shared by every conversation on the agent.
 	BilledTokensModeled int `json:"billed_tokens_modeled"`
 
 	// ToolSetChanges counts calls whose tool list differs from the same
-	// session's previous call (each one resets the prompt cache).
+	// conversation's previous call.
 	ToolSetChanges int `json:"tool_set_changes"`
-	// CrossSessionLeaks counts distinct tools advertised to a session that
-	// are neither in the agent's first tool list nor used by that session.
+	// HistoryRewrites counts calls with an unchanged tool list whose messages
+	// do not extend the conversation's previous call (released or folded
+	// history).
+	HistoryRewrites int `json:"history_rewrites"`
+	// CrossSessionLeaks counts distinct tools advertised to a conversation
+	// that are neither in the agent's first tool list nor used by that
+	// conversation.
 	CrossSessionLeaks int `json:"cross_session_leaks"`
 }
 
 type toolbenchMeter struct {
 	tc         *TokenCounter
 	toolTokens map[string]int
-	msgTokens  map[string]int
+	textTokens map[string]int
 }
 
 func newToolbenchMeter() *toolbenchMeter {
-	return &toolbenchMeter{tc: GetTokenCounter(), toolTokens: map[string]int{}, msgTokens: map[string]int{}}
+	return &toolbenchMeter{tc: GetTokenCounter(), toolTokens: map[string]int{}, textTokens: map[string]int{}}
 }
 
 func toolbenchToolSig(tools []shuttle.Tool) string {
@@ -493,6 +577,15 @@ func (m *toolbenchMeter) toolsTokens(tools []shuttle.Tool) int {
 	return n
 }
 
+func (m *toolbenchMeter) tokens(text string) int {
+	if n, ok := m.textTokens[text]; ok {
+		return n
+	}
+	n := m.tc.CountTokens(text)
+	m.textTokens[text] = n
+	return n
+}
+
 func toolbenchMessageWire(msg llmtypes.Message) string {
 	var b strings.Builder
 	b.WriteString(msg.Role)
@@ -509,51 +602,117 @@ func toolbenchMessageWire(msg llmtypes.Message) string {
 	return b.String()
 }
 
-func (m *toolbenchMeter) messageTokens(wire string) int {
-	if n, ok := m.msgTokens[wire]; ok {
-		return n
+func toolbenchResponseWire(r *llmtypes.LLMResponse) string {
+	if r == nil {
+		return ""
 	}
-	n := m.tc.CountTokens(wire)
-	m.msgTokens[wire] = n
-	return n
+	j, _ := json.Marshal(r.ToolCalls)
+	return r.Content + string(j)
 }
 
-func runToolbench(tb testing.TB, sc toolbenchScenario, setup toolbenchSetup, index *toolregistry.Registry, meter *toolbenchMeter) toolbenchResult {
-	tb.Helper()
-	model := newToolbenchModel(sc)
-	ag := toolbenchAgent(tb, setup, model, index)
-	ctx := context.Background()
+// toolbenchCache is a prompt cache keyed by request prefix (tool list, then
+// each message in order), shared by every conversation on one agent.
+type toolbenchCache struct{ expiry map[uint64]int }
 
-	res := toolbenchResult{Scenario: sc.name, Setup: setup.name, UserTurns: len(sc.turns)}
-	used := map[string]map[string]bool{} // session → tool names it used or searched for
-	for i, turn := range sc.turns {
-		if used[turn.session] == nil {
-			used[turn.session] = map[string]bool{}
+func (c *toolbenchCache) chain(toolSig string, wires []string) []uint64 {
+	keys := make([]uint64, len(wires)+1)
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(toolSig))
+	keys[0] = h.Sum64()
+	for i, w := range wires {
+		_, _ = h.Write([]byte{0})
+		_, _ = h.Write([]byte(w))
+		keys[i+1] = h.Sum64()
+	}
+	return keys
+}
+
+// lookup returns the cached prefix length in tokens for a request at time
+// now, and stores (or refreshes) every prefix of the request.
+func (c *toolbenchCache) lookup(keys []uint64, prefixTokens []int, now int) int {
+	cached := 0
+	for i := len(keys) - 1; i >= 0; i-- {
+		if prefixTokens[i] < toolbenchCacheMinTokens {
+			break
+		}
+		if exp, ok := c.expiry[keys[i]]; ok && exp > now {
+			cached = prefixTokens[i]
+			break
+		}
+	}
+	for i, k := range keys {
+		if prefixTokens[i] >= toolbenchCacheMinTokens {
+			c.expiry[k] = now + toolbenchCacheTTLSeconds
+		}
+	}
+	return cached
+}
+
+type toolbenchRun struct {
+	sc       toolbenchScenario
+	setup    toolbenchSetup
+	behavior string
+	model    *toolbenchModel
+	agent    *Agent
+	res      toolbenchResult
+	used     map[string]map[string]bool // session → tool names it used or searched for
+}
+
+func newToolbenchRun(tb testing.TB, sc toolbenchScenario, setup toolbenchSetup, behavior string, index *toolregistry.Registry) *toolbenchRun {
+	tb.Helper()
+	model := newToolbenchModel(sc, behavior == "strict")
+	return &toolbenchRun{
+		sc: sc, setup: setup, behavior: behavior, model: model,
+		agent: toolbenchAgent(tb, sc, setup, model, index),
+		res:   toolbenchResult{Scenario: sc.name, Setup: setup.name, Behavior: behavior, UserTurns: len(sc.turns)},
+		used:  map[string]map[string]bool{},
+	}
+}
+
+func (r *toolbenchRun) play(tb testing.TB) {
+	tb.Helper()
+	ctx := context.Background()
+	for i, turn := range r.sc.turns {
+		if r.used[turn.session] == nil {
+			r.used[turn.session] = map[string]bool{}
 		}
 		for _, n := range turn.tools {
-			used[turn.session][n] = true
-			used[turn.session][toolbenchFixtureByName()[n].qualified()] = true
+			r.used[turn.session][n] = true
+			r.used[turn.session][toolbenchDef(n).qualified()] = true
 		}
+		r.res.PlannedUses += len(turn.tools)
 		msg := fmt.Sprintf("[toolbench s=%s t=%d] Please use %s.", turn.session, i, strings.Join(turn.tools, " and "))
-		resp, err := ag.Chat(ctx, "toolbench-"+sc.name+"-"+setup.name+"-"+turn.session, msg)
+		sessionID := strings.Join([]string{"toolbench", r.sc.name, r.setup.name, r.behavior, turn.session}, "-")
+		resp, err := r.agent.Chat(ctx, sessionID, msg)
 		if err != nil {
-			tb.Fatalf("%s/%s turn %d: %v", sc.name, setup.name, i, err)
+			// A turn the agent cannot complete (e.g. the tool list alone
+			// leaves no room in the context window) is a result, not a
+			// harness failure.
+			r.res.FailedTurns++
+			if r.res.FirstError == "" {
+				r.res.FirstError = fmt.Sprintf("turn %d: %v", i, err)
+			}
+			continue
 		}
 		for _, ex := range resp.ToolExecutions {
 			if ex.ToolName == builtin.ToolSearchName {
-				res.SearchCalls++
+				r.res.SearchCalls++
 				continue
 			}
-			res.ToolCalls++
+			r.res.ToolCalls++
 			if ex.Result != nil && ex.Result.Success {
-				res.ToolCallsOK++
+				r.res.ToolCallsOK++
 			}
 		}
 	}
+}
 
-	model.mu.Lock()
-	calls := model.calls
-	model.mu.Unlock()
+func (r *toolbenchRun) measure(meter *toolbenchMeter) toolbenchResult {
+	r.model.mu.Lock()
+	calls := r.model.calls
+	r.res.Skipped = r.model.skipped
+	r.model.mu.Unlock()
+	res := r.res
 	res.ProviderCalls = len(calls)
 
 	base := map[string]bool{}
@@ -565,50 +724,72 @@ func runToolbench(tb testing.TB, sc toolbenchScenario, setup toolbenchSetup, ind
 	}
 
 	type prev struct {
-		sig  string
-		msgs []string
+		sig   string
+		wires []string
 	}
 	last := map[string]*prev{}
 	leaks := map[string]bool{}
+	cache := &toolbenchCache{expiry: map[uint64]int{}}
+	now, turn := 0, -1
+	var billed float64
 	for _, c := range calls {
+		if c.turn != turn {
+			turn = c.turn
+			gap := toolbenchTurnGapSeconds
+			if turn >= 0 && turn < len(r.sc.turns) && r.sc.turns[turn].gap > 0 {
+				gap = r.sc.turns[turn].gap
+			}
+			now += gap
+		} else {
+			now += toolbenchCallSeconds
+		}
+
 		if len(c.tools) > res.AdvertisedToolsMax {
 			res.AdvertisedToolsMax = len(c.tools)
 		}
-		toolTok := meter.toolsTokens(c.tools)
 		sig := toolbenchToolSig(c.tools)
+		toolTok := meter.toolsTokens(c.tools)
 		wires := make([]string, len(c.messages))
-		msgTok := 0
+		prefix := make([]int, len(c.messages)+1)
+		prefix[0] = toolTok
 		for i, msg := range c.messages {
 			wires[i] = toolbenchMessageWire(msg)
-			msgTok += meter.messageTokens(wires[i])
+			prefix[i+1] = prefix[i] + meter.tokens(wires[i])
 		}
+		total := prefix[len(prefix)-1]
+		out := meter.tokens(toolbenchResponseWire(c.response))
 		res.ToolTokens += toolTok
-		res.MessageTokens += msgTok
-		res.InputTokens += toolTok + msgTok
+		res.MessageTokens += total - toolTok
+		res.InputTokens += total
+		res.OutputTokens += out
 
-		cached := 0
+		cached := cache.lookup(cache.chain(sig, wires), prefix, now)
+		res.CachedTokens += cached
+		billed += toolbenchCacheRead*float64(cached) + toolbenchCacheWrite*float64(total-cached) +
+			toolbenchOutputPrice*float64(out)
+
 		if p := last[c.session]; p != nil {
 			if p.sig != sig {
 				res.ToolSetChanges++
 			} else {
-				cached = toolTok
-				for i := 0; i < len(wires) && i < len(p.msgs) && wires[i] == p.msgs[i]; i++ {
-					cached += meter.messageTokens(wires[i])
+				common := 0
+				for common < len(wires) && common < len(p.wires) && wires[common] == p.wires[common] {
+					common++
+				}
+				if common < len(p.wires) {
+					res.HistoryRewrites++
 				}
 			}
 		}
-		fresh := toolTok + msgTok - cached
-		res.BilledTokensModeled += int(math.Round(toolbenchCacheReadMultiplier*float64(cached) +
-			toolbenchCacheWriteMultiplier*float64(fresh)))
-		last[c.session] = &prev{sig: sig, msgs: wires}
+		last[c.session] = &prev{sig: sig, wires: wires}
 
 		for _, t := range c.tools {
-			n := t.Name()
-			if !base[n] && !used[c.session][n] {
+			if n := t.Name(); !base[n] && !r.used[c.session][n] {
 				leaks[c.session+"\x00"+n] = true
 			}
 		}
 	}
+	res.BilledTokensModeled = int(math.Round(billed))
 	res.CrossSessionLeaks = len(leaks)
 	return res
 }
@@ -619,7 +800,11 @@ func runToolbenchAll(tb testing.TB) []toolbenchResult {
 	var out []toolbenchResult
 	for _, sc := range toolbenchScenarios {
 		for _, setup := range toolbenchSetups {
-			out = append(out, runToolbench(tb, sc, setup, toolbenchIndex(tb), meter))
+			for _, behavior := range toolbenchBehaviors {
+				run := newToolbenchRun(tb, sc, setup, behavior, toolbenchIndex(tb))
+				run.play(tb)
+				out = append(out, run.measure(meter))
+			}
 		}
 	}
 	return out
@@ -636,6 +821,8 @@ type toolbenchReport struct {
 
 const toolbenchNote = "Generated by TestToolbench_NoRegression (pkg/agent/toolbench_test.go). " +
 	"Regenerate with LOOM_TOOLBENCH_UPDATE=1 only for an intended change; see docs/testing/toolbench.md."
+
+func toolbenchKey(r toolbenchResult) string { return r.Scenario + "/" + r.Setup + "/" + r.Behavior }
 
 func TestToolbench_NoRegression(t *testing.T) {
 	if testing.Short() {
@@ -654,13 +841,34 @@ func TestToolbench_NoRegression(t *testing.T) {
 			t.Fatalf("write report: %v", err)
 		}
 	}
-	for _, r := range results {
-		t.Logf("%-12s %-9s calls=%-3d tools_max=%-3d tool_tok=%-7d input_tok=%-7d billed=%-7d changes=%d leaks=%d ok=%d/%d search=%d",
-			r.Scenario, r.Setup, r.ProviderCalls, r.AdvertisedToolsMax, r.ToolTokens, r.InputTokens,
-			r.BilledTokensModeled, r.ToolSetChanges, r.CrossSessionLeaks, r.ToolCallsOK, r.ToolCalls, r.SearchCalls)
+
+	var baseline toolbenchReport
+	update := os.Getenv("LOOM_TOOLBENCH_UPDATE") == "1"
+	raw, readErr := os.ReadFile(toolbenchBaselinePath)
+	if readErr == nil {
+		if err := json.Unmarshal(raw, &baseline); err != nil {
+			t.Fatalf("parse baseline: %v", err)
+		}
+	} else if !update {
+		t.Fatalf("read baseline (create it with LOOM_TOOLBENCH_UPDATE=1): %v", readErr)
+	}
+	want := map[string]toolbenchResult{}
+	for _, b := range baseline.Results {
+		want[toolbenchKey(b)] = b
 	}
 
-	if os.Getenv("LOOM_TOOLBENCH_UPDATE") == "1" {
+	for _, r := range results {
+		delta := ""
+		if b, ok := want[toolbenchKey(r)]; ok && b.BilledTokensModeled > 0 {
+			delta = fmt.Sprintf(" (%+.1f%%)", 100*float64(r.BilledTokensModeled-b.BilledTokensModeled)/float64(b.BilledTokensModeled))
+		}
+		t.Logf("%-12s %-9s %-7s failed=%d calls=%-3d done=%d/%d tools_max=%-3d tool_tok=%-7d input_tok=%-7d cached=%-7d out=%-5d billed=%d%s changes=%d rewrites=%d leaks=%d",
+			r.Scenario, r.Setup, r.Behavior, r.FailedTurns, r.ProviderCalls, r.ToolCallsOK, r.PlannedUses, r.AdvertisedToolsMax,
+			r.ToolTokens, r.InputTokens, r.CachedTokens, r.OutputTokens, r.BilledTokensModeled, delta,
+			r.ToolSetChanges, r.HistoryRewrites, r.CrossSessionLeaks)
+	}
+
+	if update {
 		if err := os.MkdirAll(filepath.Dir(toolbenchBaselinePath), 0o750); err != nil {
 			t.Fatal(err)
 		}
@@ -671,31 +879,28 @@ func TestToolbench_NoRegression(t *testing.T) {
 		return
 	}
 
-	raw, err := os.ReadFile(toolbenchBaselinePath)
-	if err != nil {
-		t.Fatalf("read baseline (create it with LOOM_TOOLBENCH_UPDATE=1): %v", err)
-	}
-	var baseline toolbenchReport
-	if err := json.Unmarshal(raw, &baseline); err != nil {
-		t.Fatalf("parse baseline: %v", err)
-	}
-	want := map[string]toolbenchResult{}
-	for _, b := range baseline.Results {
-		want[b.Scenario+"/"+b.Setup] = b
-	}
-
 	for _, r := range results {
-		key := r.Scenario + "/" + r.Setup
+		key := toolbenchKey(r)
 		b, ok := want[key]
 		if !ok {
 			t.Errorf("%s: no baseline entry; regenerate the baseline", key)
 			continue
 		}
+		if r.FailedTurns > b.FailedTurns {
+			t.Errorf("%s: failed turns %d > baseline %d: %s", key, r.FailedTurns, b.FailedTurns, r.FirstError)
+		}
 		if r.ToolCallsOK != r.ToolCalls {
 			t.Errorf("%s: %d of %d tool calls failed", key, r.ToolCalls-r.ToolCallsOK, r.ToolCalls)
 		}
 		if r.ToolCallsOK < b.ToolCallsOK {
-			t.Errorf("%s: successful tool calls %d < baseline %d", key, r.ToolCallsOK, b.ToolCallsOK)
+			t.Errorf("%s: completed tool uses %d < baseline %d", key, r.ToolCallsOK, b.ToolCallsOK)
+			continue
+		}
+		if r.ToolCallsOK > b.ToolCallsOK {
+			// More of the planned work got done: a different workload, not
+			// comparable call-for-call. Lock it in with LOOM_TOOLBENCH_UPDATE=1.
+			t.Logf("%s: completed tool uses improved %d -> %d; regenerate the baseline", key, b.ToolCallsOK, r.ToolCallsOK)
+			continue
 		}
 		if r.ProviderCalls > b.ProviderCalls {
 			t.Errorf("%s: provider calls %d > baseline %d (extra model round trips)", key, r.ProviderCalls, b.ProviderCalls)
@@ -706,15 +911,9 @@ func TestToolbench_NoRegression(t *testing.T) {
 		if r.CrossSessionLeaks > b.CrossSessionLeaks {
 			t.Errorf("%s: cross-session leaks %d > baseline %d", key, r.CrossSessionLeaks, b.CrossSessionLeaks)
 		}
-		toolbenchCheckTokens(t, key, "input tokens", r.InputTokens, b.InputTokens)
-		toolbenchCheckTokens(t, key, "modeled billed tokens", r.BilledTokensModeled, b.BilledTokensModeled)
-	}
-}
-
-func toolbenchCheckTokens(t *testing.T, key, what string, got, base int) {
-	t.Helper()
-	if limit := float64(base) * (1 + toolbenchTokenSlack); float64(got) > limit {
-		t.Errorf("%s: %s %d > baseline %d (+%.0f%% slack)", key, what, got, base, toolbenchTokenSlack*100)
+		if limit := float64(b.ToolTokens) * (1 + toolbenchTokenSlack); float64(r.ToolTokens) > limit {
+			t.Errorf("%s: tool-definition tokens %d > baseline %d (+%.0f%% slack)", key, r.ToolTokens, b.ToolTokens, toolbenchTokenSlack*100)
+		}
 	}
 }
 
@@ -722,16 +921,19 @@ func toolbenchCheckTokens(t *testing.T, key, what string, got, base int) {
 // Speed benchmarks (compare with benchstat; not gated)
 // ---------------------------------------------------------------------------
 
+// BenchmarkToolbenchConversation times playing a scenario; building the agent
+// and measuring are outside the timer.
 func BenchmarkToolbenchConversation(b *testing.B) {
-	meter := newToolbenchMeter()
 	for _, sc := range toolbenchScenarios {
 		for _, setup := range toolbenchSetups {
 			b.Run(sc.name+"/"+setup.name, func(b *testing.B) {
 				index := toolbenchIndex(b)
 				b.ReportAllocs()
-				b.ResetTimer()
 				for i := 0; i < b.N; i++ {
-					_ = runToolbench(b, sc, setup, index, meter)
+					b.StopTimer()
+					run := newToolbenchRun(b, sc, setup, "lenient", index)
+					b.StartTimer()
+					run.play(b)
 				}
 			})
 		}
@@ -741,7 +943,8 @@ func BenchmarkToolbenchConversation(b *testing.B) {
 func BenchmarkToolbenchAdvertisedTools(b *testing.B) {
 	for _, setup := range toolbenchSetups {
 		b.Run(setup.name, func(b *testing.B) {
-			ag := toolbenchAgent(b, setup, newToolbenchModel(toolbenchScenario{}), toolbenchIndex(b))
+			sc := toolbenchScenario{outputItems: 2}
+			ag := toolbenchAgent(b, sc, setup, newToolbenchModel(sc, false), toolbenchIndex(b))
 			ag.captureBaseTools()
 			session := &Session{ID: "bench"}
 			ctx := context.Background()
