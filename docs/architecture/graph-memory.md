@@ -416,6 +416,18 @@ Uses multiplicative combination (`CombineScores` in `pkg/memory/salience.go:122`
 3. Format result via `EntityRecall.Format()` into structured text
 4. Return the note `[Graph Memory Context]\n{formatted_recall}`, which every LLM call of the turn carries in its trailing `<system-reminder>` user message (`withTransientTail`, with the request context and soft reminder). It is never added to the session, so it is not persisted and a resumed turn recalls again. It is not a system message: the Anthropic client moves system messages into the request's `system` field, ahead of the conversation, where a note that changes every turn would miss the prompt cache on every call.
 
+   `TestGraphMemoryRecall_PromptCacheLive` (`pkg/agent/graph_memory_prompt_cache_live_test.go`, needs `ANTHROPIC_API_KEY`) runs an eight-message conversation against the Anthropic API and logs the cache read, cache write and uncached input tokens the API reports for each call. `TestGraphMemoryRecall_PromptCache` checks the placement offline on every run: one recall note per request, none in the `system` field.
+
+   Runs of the live test on 2026-10-27, `claude-haiku-5-5`, with each message sent right after the previous one (inside the 5-minute cache lifetime). "Before" has the note in a system message (bfbae05 reverted). "Note in reminder" is bfbae05 alone. "Now" also keeps settled turns' thinking blocks while the context before them is unchanged (`compileLocked` in `pkg/agent/context_compilation.go`): Claude Haiku 5.5, like Opus 4.5 and later and Sonnet 4.6 and later, keeps earlier turns' thinking, so leaving it out changed the request from the first tool call of each earlier message that used tools, and the next message missed the cache from there. Totals are for every main call after the first; the runs made 15, 16 and 16 main calls in all, because the model chose its own `graph_memory` tool calls. Only "Now" passes the test's check that each call reads back everything the previous call cached.
+
+   | Calls 2 onward | Before | Note in reminder | Now |
+   |---|---|---|---|
+   | Input tokens read from cache | 151,073 (80%) | 186,300 (95%) | 191,041 (97%) |
+   | Input tokens written to cache | 20,169 | 7,441 | 4,015 |
+   | Uncached input tokens | 17,769 | 1,505 | 1,439 |
+   | Cost | $0.0075 | $0.0052 | $0.0044 |
+   | Recall notes in the last request | 7 | 1 | 1 |
+
 **Token Budget**: Controlled by config. Default: 20% of context window (200K * 20% = 40K tokens). Can be overridden with absolute `max_context_tokens`. Within `ContextFor()`, the budget is allocated in three phases: entity profile (200 tokens reserved), graph neighborhood (300 tokens reserved), and remaining budget for ranked memories via `AllocateMemoryBudget()` in `pkg/memory/budget.go`.
 
 **Tool Guidance**: The `graph_memory` tool's own description carries its usage guidance. The system prompt gets no graph-memory supplement — the ROM slot is byte-stable for the life of a session (ContextCompilation HLD §3), so per-feature prompt injection is not a channel.
