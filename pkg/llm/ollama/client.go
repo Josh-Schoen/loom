@@ -348,6 +348,9 @@ func sanitizeSchemaTypes(schema *shuttle.JSONSchema) {
 // convertMessages converts agent messages to Ollama format.
 func (c *Client) convertMessages(messages []llmtypes.Message) []ollamaMessage {
 	var apiMessages []ollamaMessage
+	native := c.supportsNativeTools()
+	// Tool call ID → name sent to the model, so each result can name its tool.
+	toolNames := make(map[string]string)
 
 	for _, msg := range messages {
 		switch msg.Role {
@@ -387,19 +390,38 @@ func (c *Client) convertMessages(messages []llmtypes.Message) []ollamaMessage {
 			}
 
 		case "assistant":
-			apiMessages = append(apiMessages, ollamaMessage{
+			apiMsg := ollamaMessage{
 				Role:    msg.Role,
 				Content: msg.Content,
-			})
+			}
+			// Echo the model's own tool calls. Without them the history shows
+			// tool results nobody asked for, and the model repeats the call.
+			if native {
+				for _, tc := range msg.ToolCalls {
+					name := llm.SanitizeToolName(tc.Name)
+					toolNames[tc.ID] = name
+					args := tc.Input
+					if args == nil {
+						args = map[string]interface{}{}
+					}
+					apiMsg.ToolCalls = append(apiMsg.ToolCalls, ollamaToolCall{
+						ID:       tc.ID,
+						Type:     "function",
+						Function: ollamaFunctionCall{Name: name, Arguments: args},
+					})
+				}
+			}
+			apiMessages = append(apiMessages, apiMsg)
 
 		case "tool":
-			if c.supportsNativeTools() {
+			if native {
 				// Native tool format (Ollama v0.12.3+) — separate role, safe
 				// alongside a following user-role sidecar (no consecutive
 				// same-role messages).
 				apiMessages = append(apiMessages, ollamaMessage{
-					Role:    "tool",
-					Content: msg.Content,
+					Role:     "tool",
+					Content:  msg.Content,
+					ToolName: toolNames[msg.ToolUseID],
 				})
 			} else {
 				// Fallback path: tool_result inlined as a user message. Route
@@ -760,6 +782,7 @@ type ollamaMessage struct {
 	Content   string           `json:"content"`
 	Images    []string         `json:"images,omitempty"` // Base64-encoded images for vision models
 	ToolCalls []ollamaToolCall `json:"tool_calls,omitempty"`
+	ToolName  string           `json:"tool_name,omitempty"` // Tool role: which tool produced this result
 }
 
 type ollamaToolCall struct {

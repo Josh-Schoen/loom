@@ -650,6 +650,34 @@ func TestClient_SupportsNativeTools_FailedProbeIsRetried(t *testing.T) {
 	assert.True(t, client.supportsNativeTools(), "the next request probes again")
 }
 
+func TestClient_ConvertMessages_EchoesToolCalls(t *testing.T) {
+	// The model's own tool calls must go back with the history, or it sees a
+	// result it never asked for and calls the tool again.
+	messages := []llmtypes.Message{
+		{Role: "user", Content: "What's on my calendar tomorrow?"},
+		{Role: "assistant", ToolCalls: []llmtypes.ToolCall{
+			{ID: "call_1", Name: "device_list_calendar_events", Input: map[string]interface{}{"start": "2026-10-30"}},
+		}},
+		{Role: "tool", ToolUseID: "call_1", Content: `{"events":[]}`},
+	}
+
+	client := NewClient(Config{Model: "gemma4:26b", ToolMode: ToolModeNative})
+	converted := client.convertMessages(messages)
+	require.Len(t, converted, 3)
+	require.Len(t, converted[1].ToolCalls, 1)
+	call := converted[1].ToolCalls[0]
+	assert.Equal(t, "call_1", call.ID)
+	assert.Equal(t, "device_list_calendar_events", call.Function.Name)
+	assert.Equal(t, map[string]interface{}{"start": "2026-10-30"}, call.Function.Arguments)
+	assert.Equal(t, "tool", converted[2].Role)
+	assert.Equal(t, "device_list_calendar_events", converted[2].ToolName)
+
+	// Prompt-mode models get no tool_calls: they wrote the call as text.
+	client = NewClient(Config{Model: "gemma4:26b", ToolMode: ToolModePrompt})
+	converted = client.convertMessages(messages)
+	assert.Empty(t, converted[1].ToolCalls)
+}
+
 func TestClient_SupportsNativeTools_ExplicitModes(t *testing.T) {
 	client := NewClient(Config{Model: "unknown-model", ToolMode: ToolModeNative})
 	assert.True(t, client.supportsNativeTools())
