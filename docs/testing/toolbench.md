@@ -40,6 +40,8 @@ not captured from real servers.
 
 `strict` is the closer stand-in for a real model. `lenient` shows what loom's
 fallback (the executor registering any indexed tool by name) makes possible.
+`eager_all` runs only as `lenient`: every tool is already in its list, so the
+model never searches and both behaviors play identically.
 
 **Scenarios**:
 
@@ -86,7 +88,10 @@ just toolbench-speed    # speed benchmarks, for benchstat
 ```
 
 CI runs the gate as part of `go test ./pkg/...` (it is skipped under `-short`);
-it takes about 15 s, about 45 s with `-race`.
+it takes about 10 s, about 28 s with `-race` (measured on 4 cores; the
+`long_fold` scenario is most of it). That adds about a quarter to the
+`pkg/agent` test run (103 s → 139 s with `-race` before these two savings:
+one shared tool index for all rows and no duplicate `eager_all` rows).
 
 **Gate rules**, per scenario, setup and behavior, against
 `pkg/agent/testdata/toolbench/baseline.json`:
@@ -114,25 +119,21 @@ machine with `benchstat old.txt new.txt`.
 | Scenario | Setup | Behavior | Failed turns | Done | Calls | Tools max | Tool tokens | Billed (modeled) | Tool-list changes | History rewrites |
 |---|---|---|---|---|---|---|---|---|---|---|
 | short | eager_all | lenient | 0 | 2/2 | 3 | 153 | 123,387 | 60,613 | 0 | 0 |
-| short | eager_all | strict | 0 | 2/2 | 3 | 153 | 123,387 | 60,613 | 0 | 0 |
 | short | on_demand | lenient | 0 | 2/2 | 5 | 6 | 4,764 | 13,085 | 2 | 0 |
 | short | on_demand | strict | 0 | 0/2 | 3 | 4 | 2,295 | 4,738 | 0 | 0 |
 | short | mixed | lenient | 0 | 2/2 | 3 | 44 | 34,749 | 17,772 | 0 | 0 |
 | short | mixed | strict | 0 | 2/2 | 3 | 44 | 34,749 | 17,772 | 0 | 0 |
 | long | eager_all | lenient | 0 | 11/11 | 21 | 153 | 863,709 | 187,636 | 0 | 0 |
-| long | eager_all | strict | 0 | 11/11 | 21 | 153 | 863,709 | 187,636 | 0 | 0 |
 | long | on_demand | lenient | 0 | 11/11 | 29 | 12 | 53,237 | 122,410 | 8 | 0 |
 | long | on_demand | strict | 0 | 0/11 | 21 | 4 | 16,065 | 42,723 | 0 | 0 |
 | long | mixed | lenient | 0 | 11/11 | 26 | 49 | 318,136 | 182,756 | 5 | 0 |
 | long | mixed | strict | 0 | 4/11 | 21 | 44 | 243,243 | 78,016 | 0 | 0 |
 | two_sessions | eager_all | lenient | 0 | 5/5 | 10 | 153 | 411,290 | 90,668 | 0 | 0 |
-| two_sessions | eager_all | strict | 0 | 5/5 | 10 | 153 | 411,290 | 90,668 | 0 | 0 |
 | two_sessions | on_demand | lenient | 0 | 5/5 | 14 | 6 | 14,063 | 26,986 | 4 | 0 |
 | two_sessions | on_demand | strict | 0 | 0/5 | 10 | 4 | 7,650 | 11,156 | 0 | 0 |
 | two_sessions | mixed | lenient | 0 | 5/5 | 12 | 46 | 140,222 | 65,594 | 2 | 0 |
 | two_sessions | mixed | strict | 0 | 3/5 | 10 | 44 | 115,830 | 29,976 | 0 | 0 |
 | long_fold | eager_all | lenient | 24 | 0/24 | 24 | 153 | 987,096 | 161,383 | 0 | 23 |
-| long_fold | eager_all | strict | 24 | 0/24 | 24 | 153 | 987,096 | 161,383 | 0 | 23 |
 | long_fold | on_demand | lenient | 0 | 24/24 | 56 | 12 | 128,679 | 493,682 | 8 | 2 |
 | long_fold | on_demand | strict | 0 | 0/24 | 48 | 4 | 36,720 | 109,524 | 0 | 0 |
 | long_fold | mixed | lenient | 0 | 24/24 | 54 | 50 | 687,116 | 492,180 | 6 | 3 |

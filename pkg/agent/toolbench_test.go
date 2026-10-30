@@ -280,6 +280,15 @@ func toolbenchIndex(tb testing.TB) *toolregistry.Registry {
 	return reg
 }
 
+func toolbenchHasOnDemand(setup toolbenchSetup) bool {
+	for _, srv := range toolbenchServers {
+		if !setup.eager(srv.name) {
+			return true
+		}
+	}
+	return false
+}
+
 func toolbenchAgent(tb testing.TB, sc toolbenchScenario, setup toolbenchSetup, model *toolbenchModel, index *toolregistry.Registry) *Agent {
 	tb.Helper()
 	cfg := DefaultConfig()
@@ -797,11 +806,19 @@ func (r *toolbenchRun) measure(meter *toolbenchMeter) toolbenchResult {
 func runToolbenchAll(tb testing.TB) []toolbenchResult {
 	tb.Helper()
 	meter := newToolbenchMeter()
+	// The index is read-only during a run (tool_search and exact-name
+	// resolution only read it), so one copy serves every row.
+	index := toolbenchIndex(tb)
 	var out []toolbenchResult
 	for _, sc := range toolbenchScenarios {
 		for _, setup := range toolbenchSetups {
 			for _, behavior := range toolbenchBehaviors {
-				run := newToolbenchRun(tb, sc, setup, behavior, toolbenchIndex(tb))
+				if behavior == "strict" && !toolbenchHasOnDemand(setup) {
+					// Every tool is in the list, so the model never searches
+					// and both behaviors play identically.
+					continue
+				}
+				run := newToolbenchRun(tb, sc, setup, behavior, index)
 				run.play(tb)
 				out = append(out, run.measure(meter))
 			}
