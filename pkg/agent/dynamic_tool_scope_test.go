@@ -15,6 +15,7 @@ package agent
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"testing"
 
@@ -108,15 +109,32 @@ func TestDynamicTool_BaseToolNotScopedByUse(t *testing.T) {
 func TestDynamicTool_ConcurrentSessions(t *testing.T) {
 	a := newDynamicScopeAgent(t)
 	var wg sync.WaitGroup
+	errs := make(chan error, 8)
 	for i := 0; i < 8; i++ {
 		wg.Add(1)
 		go func(id string) {
 			defer wg.Done()
-			execInSession(t, a, id, "gh_list_issue")
+			// require must not run off the test goroutine; report instead.
+			ctx := &agentContext{
+				Context: session.WithSessionID(context.Background(), id),
+				session: &Session{ID: id},
+				tracer:  observability.NewNoOpTracer(),
+			}
+			res, err := a.executeToolWithSelfCorrection(ctx, "gh_list_issue", map[string]interface{}{}, id)
+			if err == nil && (res == nil || !res.Success) {
+				err = fmt.Errorf("session %s: tool call did not succeed: %+v", id, res)
+			}
+			if err != nil {
+				errs <- err
+			}
 			_ = advertisedNames(a, &Session{ID: id})
 		}(string(rune('a' + i)))
 	}
 	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Error(err)
+	}
 	for i := 0; i < 8; i++ {
 		assert.Contains(t, advertisedNames(a, &Session{ID: string(rune('a' + i))}), "gh_list_issue")
 	}
