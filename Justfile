@@ -120,6 +120,19 @@ bench:
 bench-pkg pkg:
     GOWORK=off go test -tags fts5 -bench=. -benchmem ./{{pkg}}/...
 
+# Tool-context benchmark: gate against pkg/agent/testdata/toolbench/baseline.json
+# (see docs/testing/toolbench.md). Writes the current report to toolbench.json.
+toolbench:
+    GOWORK=off LOOM_TOOLBENCH_OUT="$PWD/toolbench.json" go test -tags fts5 -race -count=1 -run TestToolbench_NoRegression -v ./pkg/agent/
+
+# Regenerate the toolbench baseline (only for an intended change; review the diff)
+toolbench-update:
+    GOWORK=off LOOM_TOOLBENCH_UPDATE=1 go test -tags fts5 -count=1 -run TestToolbench_NoRegression -v ./pkg/agent/
+
+# Toolbench speed benchmarks for benchstat: just toolbench-speed > new.txt; benchstat old.txt new.txt
+toolbench-speed:
+    GOWORK=off go test -tags fts5 -run '^$' -bench Toolbench -benchmem -count=6 -benchtime=5x ./pkg/agent/
+
 # Generate embedded weaver.yaml from template (injects CLI help)
 generate-weaver:
     @echo "Generating embedded/weaver.yaml from template..."
