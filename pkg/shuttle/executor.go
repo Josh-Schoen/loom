@@ -56,6 +56,14 @@ type MCPManager interface {
 	GetClient(serverName string) (interface{}, error)
 }
 
+// DynamicRegistrationHook runs just before the executor registers a tool it
+// resolved from the tool registry (an Execute-time fallback for a tool found
+// via tool_search, or ResolveAndRegister). ctx is the resolving call's
+// context, so the host can scope the new tool to the requesting session
+// before the tool enters the shared registry, where every other session's
+// tool projection would otherwise see it.
+type DynamicRegistrationHook func(ctx context.Context, tool Tool)
+
 // BuiltinToolProvider is an interface for getting builtin tools.
 // This avoids import cycles with pkg/shuttle/builtin.
 type BuiltinToolProvider interface {
@@ -74,6 +82,7 @@ type Executor struct {
 	toolRegistry        ToolRegistry                 // Tool registry for dynamic tool discovery
 	mcpManager          MCPManager                   // MCP manager for dynamic MCP tool registration
 	builtinToolProvider BuiltinToolProvider          // Builtin tool provider for dynamic builtin tool registration
+	onDynamicRegister   DynamicRegistrationHook      // Runs before a registry-resolved tool is registered; nil = none
 	logger              *zap.Logger                  // Structured logger; never nil (defaults to no-op)
 
 	// Metrics for large parameter optimization
@@ -163,6 +172,12 @@ func (e *Executor) SetMCPManager(manager MCPManager) {
 // SetBuiltinToolProvider configures the builtin tool provider for dynamic builtin tool registration.
 func (e *Executor) SetBuiltinToolProvider(provider BuiltinToolProvider) {
 	e.builtinToolProvider = provider
+}
+
+// SetDynamicRegistrationHook installs the hook run before each registry-resolved
+// tool is registered. Set it before the executor serves calls.
+func (e *Executor) SetDynamicRegistrationHook(hook DynamicRegistrationHook) {
+	e.onDynamicRegister = hook
 }
 
 // CanonicalToolName returns the registered tool's own name for a lookup key.
@@ -932,6 +947,7 @@ func (e *Executor) registerMCPTool(ctx context.Context, toolInfo *loomv1.Indexed
 	}
 
 	// Register the tool so subsequent calls don't require dynamic lookup
+	e.beforeDynamicRegister(ctx, mcpTool)
 	e.registry.Register(mcpTool)
 
 	return mcpTool, nil
@@ -950,9 +966,16 @@ func (e *Executor) registerBuiltinTool(ctx context.Context, toolInfo *loomv1.Ind
 	}
 
 	// Register the tool so subsequent calls don't require dynamic lookup
+	e.beforeDynamicRegister(ctx, tool)
 	e.registry.Register(tool)
 
 	return tool, nil
+}
+
+func (e *Executor) beforeDynamicRegister(ctx context.Context, tool Tool) {
+	if e.onDynamicRegister != nil {
+		e.onDynamicRegister(ctx, tool)
+	}
 }
 
 // mcpToolWrapper wraps an MCP client to implement the Tool interface.

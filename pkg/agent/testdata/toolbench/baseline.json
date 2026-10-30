@@ -128,14 +128,14 @@
       "tool_calls": 5,
       "tool_calls_ok": 5,
       "search_calls": 4,
-      "advertised_tools_max": 8,
+      "advertised_tools_max": 6,
       "advertised_tools_first_call": 4,
-      "tool_tokens_total": 17895,
+      "tool_tokens_total": 14063,
       "message_tokens_total": 25939,
-      "input_tokens_total": 43834,
-      "billed_tokens_modeled": 40230,
-      "tool_set_changes": 7,
-      "cross_session_leaks": 4
+      "input_tokens_total": 40002,
+      "billed_tokens_modeled": 26760,
+      "tool_set_changes": 4,
+      "cross_session_leaks": 0
     },
     {
       "scenario": "two_sessions",
@@ -147,12 +147,12 @@
       "search_calls": 2,
       "advertised_tools_max": 46,
       "advertised_tools_first_call": 44,
-      "tool_tokens_total": 141678,
+      "tool_tokens_total": 140222,
       "message_tokens_total": 13042,
-      "input_tokens_total": 154720,
-      "billed_tokens_modeled": 106708,
-      "tool_set_changes": 4,
-      "cross_session_leaks": 2
+      "input_tokens_total": 153264,
+      "billed_tokens_modeled": 78083,
+      "tool_set_changes": 2,
+      "cross_session_leaks": 0
     }
   ]
 }

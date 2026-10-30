@@ -80,7 +80,7 @@ conversations, for building the advertised tool list, and for `tool_search`.
 These are machine-dependent and not gated; compare two runs on the same
 machine with `benchstat old.txt new.txt`.
 
-## Baseline (main @ 29b10ed)
+## First baseline (main @ 29b10ed, before any tool-loading change)
 
 | Scenario | Setup | Calls | Tools max | Tool tokens | Input tokens | Billed (modeled) | Tool-list changes | Leaks |
 |---|---|---|---|---|---|---|---|---|
@@ -108,6 +108,24 @@ All tool calls succeeded in every row.
 3. **Tools leak across conversations.** In `two_sessions/on_demand`, 4 tools
    loaded by one conversation are sent to the other. Tools registered on first
    call go into the agent-wide registry, not the conversation's own tool list.
+
+## Change 1: tools loaded on first call belong to the conversation
+
+A tool the executor resolves from the index is now recorded in the calling
+conversation's own tool list before it enters the shared registry (executor
+`DynamicRegistrationHook`, `Agent.scopeDynamicTool`). A second conversation
+that calls the same tool adds it to its own list (`Agent.adoptScopedTool`).
+Deleting a conversation drops its list.
+
+Rows that changed (all others are identical to the first baseline):
+
+| Scenario | Setup | Billed (modeled) | Tool-list changes | Leaks |
+|---|---|---|---|---|
+| two_sessions | on_demand | 40,230 → 26,760 (−33%) | 7 → 4 | 4 → 0 |
+| two_sessions | mixed | 106,708 → 78,083 (−27%) | 4 → 2 | 2 → 0 |
+
+Single-conversation scenarios do not change, as expected. The committed
+baseline now holds these numbers.
 
 ## Limitations
 

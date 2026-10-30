@@ -157,6 +157,9 @@ func NewAgent(backend fabric.ExecutionBackend, llmProvider LLMProvider, opts ...
 	// through the process logger; zap.L() is a no-op unless the host installed
 	// one via zap.ReplaceGlobals (cmd_serve does).
 	a.executor.SetLogger(zap.L())
+	// Tools the executor resolves from the tool registry (tool_search
+	// discovery) belong to the session that asked for them.
+	a.executor.SetDynamicRegistrationHook(a.scopeDynamicTool)
 
 	// Set permission checker on executor if provided
 	if a.permissionChecker != nil {
@@ -793,6 +796,38 @@ func (a *Agent) registerSessionTool(sessionID string, name string) {
 	a.sessionToolLedger[sessionID][name] = true
 	if !a.baseToolNames[name] {
 		a.scopedToolNames[name] = true
+	}
+}
+
+// scopeDynamicTool is the executor's DynamicRegistrationHook: a tool resolved
+// from the tool registry on a session's call is scoped to that session before
+// it enters the shared Registry, so it is advertised to that session alone and
+// leaves with it (DeleteSession). Without this the tool would land outside both
+// the base set and every ledger, and advertisedTools would offer it to every
+// session of the agent for the rest of the process. A ctx without a session
+// (skill-required resolution) is left to its caller, which scopes the tool
+// itself.
+func (a *Agent) scopeDynamicTool(ctx context.Context, tool shuttle.Tool) {
+	sessionID := session.SessionIDFromContext(ctx)
+	if sessionID == "" || tool == nil {
+		return
+	}
+	a.registerSessionTool(sessionID, tool.Name())
+}
+
+// adoptScopedTool records a session-scoped tool into sessionID's ledger when
+// the session executed it. A second session that finds (via tool_search) a
+// tool another session already resolved runs the registered definition
+// without a new registration, so no hook fires; adopting it here advertises
+// the tool to the session that is now using it. Agent-wide tools are not
+// scoped and are left alone.
+func (a *Agent) adoptScopedTool(sessionID, name string) {
+	a.mu.RLock()
+	scoped := a.scopedToolNames[name]
+	owned := a.sessionToolLedger[sessionID][name]
+	a.mu.RUnlock()
+	if scoped && !owned {
+		a.registerSessionTool(sessionID, name)
 	}
 }
 
@@ -3650,6 +3685,10 @@ func (a *Agent) executeToolWithSelfCorrection(ctx Context, toolName string, inpu
 	} else {
 		// No circuit breaker - execute directly
 		result, err = a.executor.Execute(ctxWithAgent, toolName, input)
+	}
+
+	if result != nil {
+		a.adoptScopedTool(sessionID, a.executor.CanonicalToolName(toolName))
 	}
 
 	// Backend-declared lease events ride the result's metadata: fold them
