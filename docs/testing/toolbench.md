@@ -88,7 +88,7 @@ just toolbench-speed    # speed benchmarks, for benchstat
 ```
 
 CI runs the gate as part of `go test ./pkg/...` (it is skipped under `-short`);
-it takes about 10 s, about 28 s with `-race` (measured on 4 cores; the
+it takes about 3 s, about 28 s with `-race` (measured on 4 cores; the
 `long_fold` scenario is most of it). That adds about a quarter to the
 `pkg/agent` test run (103 s → 139 s with `-race` before these two savings:
 one shared tool index for all rows and no duplicate `eager_all` rows).
