@@ -31,7 +31,7 @@ MCP Apps are standalone HTML documents compiled from a declarative JSON spec. Th
 
 - **gRPC**: `CreateUIApp` / `UpdateUIApp` / `DeleteUIApp` RPCs
 - **MCP tools**: `loom_create_app` / `loom_update_app` / `loom_delete_app` (for Claude Code, Cursor, etc.)
-- **Agent tools**: `create_ui_app` / `update_ui_app` / `delete_ui_app` / `get_ui_app` (lazily disclosed to all server-side agents)
+- **Agent tools**: `create_ui_app` / `update_ui_app` / `delete_ui_app` / `get_ui_app` / `list_ui_apps` (lazily disclosed to all server-side agents)
 
 Apps are served as MCP resources at `ui://loom/<name>` and via HTTP at `/apps/<name>`.
 
@@ -596,7 +596,8 @@ spec:
 | `update_ui_app` | Update an existing dynamic app |
 | `delete_ui_app` | Delete a dynamic app |
 | `list_component_types` | Discover available component types and prop schemas |
-| `get_ui_app` | Return an app's current spec (`{name, spec}`), including checklist ticks. Fails with `NOT_FOUND` for unknown apps or apps without a stored spec |
+| `get_ui_app` | Return an app's current spec (`{name, spec}`), including checklist ticks. Fails with `NOT_FOUND` for unknown apps or apps without a stored spec (the suggestion points to `list_ui_apps`) |
+| `list_ui_apps` | List the dynamic apps the user can see (their own and shared ones), most recently updated first: `{apps: [{name, title, description, updated_at, shared}], count}`. Embedded apps are left out. With a shared app in the list, the result carries the same note as `get_ui_app` (its text may come from another person) |
 
 Agent tools never share an app: `create_ui_app` always creates the person's
 own app, and there is no agent tool to share one. Sharing goes through

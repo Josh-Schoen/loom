@@ -125,3 +125,56 @@ func TestAgentToolsDoNotShare(t *testing.T) {
 	assert.Equal(t, "alex", data["shared_by"])
 	assert.Equal(t, sharedAppNote, data["note"])
 }
+
+// list_ui_apps shows each person their own apps and shared ones, never the
+// server's embedded apps or someone else's own app, so the agent finds the
+// exact name instead of guessing it.
+func TestListUIAppsTool(t *testing.T) {
+	srv, registry := newChecklistServer(t, t.TempDir())
+	alex, sam := ctxFor("alex"), ctxFor("sam")
+	list := &listUIAppsTool{provider: registry}
+
+	res, err := list.Execute(sam, nil)
+	require.NoError(t, err)
+	require.True(t, res.Success, "%+v", res.Error)
+	assert.Equal(t, 0, res.Data.(map[string]interface{})["count"], "embedded apps are not listed")
+
+	_, err = srv.CreateUIApp(alex, &loomv1.CreateUIAppRequest{Name: "packing", Spec: groceriesSpec(t)})
+	require.NoError(t, err)
+	_, err = srv.CreateUIApp(alex, &loomv1.CreateUIAppRequest{Name: "groceries", Spec: groceriesSpec(t), Shared: true})
+	require.NoError(t, err)
+
+	res, err = list.Execute(alex, nil)
+	require.NoError(t, err)
+	data := res.Data.(map[string]interface{})
+	assert.Equal(t, 2, data["count"])
+	names := map[string]bool{}
+	for _, raw := range data["apps"].([]interface{}) {
+		entry := raw.(map[string]interface{})
+		names[entry["name"].(string)] = true
+		assert.NotEmpty(t, entry["updated_at"])
+		if entry["name"] == "groceries" {
+			assert.Equal(t, true, entry["shared"])
+		} else {
+			assert.Nil(t, entry["shared"])
+		}
+	}
+	assert.Equal(t, map[string]bool{"packing": true, "groceries": true}, names)
+	assert.Equal(t, sharedAppNote, data["note"])
+
+	res, err = list.Execute(sam, nil)
+	require.NoError(t, err)
+	data = res.Data.(map[string]interface{})
+	require.Equal(t, 1, data["count"], "Sam sees only the shared list")
+	assert.Equal(t, "groceries", data["apps"].([]interface{})[0].(map[string]interface{})["name"])
+
+	// A wrong name points at the list.
+	res, err = (&getUIAppTool{provider: registry}).Execute(alex, map[string]interface{}{"name": "packing-list"})
+	require.NoError(t, err)
+	assert.Equal(t, "NOT_FOUND", res.Error.Code)
+	assert.Contains(t, res.Error.Suggestion, "list_ui_apps")
+
+	res, err = (&listUIAppsTool{}).Execute(alex, nil)
+	require.NoError(t, err)
+	assert.Equal(t, "PRECONDITION_FAILED", res.Error.Code)
+}
