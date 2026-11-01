@@ -7,6 +7,7 @@ package server
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -1000,4 +1001,58 @@ func TestAgentLifecycle_B4_ReloadWithNilNestedConfig(t *testing.T) {
 	require.NoError(t, err, "ReloadAgent must not crash with nil nested fields in inline config")
 	require.NotNil(t, reloadResp)
 	assert.Equal(t, "b4-nil-nested-reload-v2", reloadResp.Name)
+}
+
+// reload_from_file rebuilds the agent through the registry's reload callback
+// (as the config file watcher does) and the agent answering requests is the
+// new one; the reply says the reload was applied. Before, only the registry's
+// copy changed and the server kept answering with the old instructions.
+func TestAgentLifecycle_ReloadFromFileReplacesTheAnsweringAgent(t *testing.T) {
+	srv := newTestMultiAgentServer(t)
+	ctx := context.Background()
+	llm := &mockLLMForMultiAgent{}
+	old := agent.NewAgent(nil, llm, agent.WithName("reload-me"), agent.WithSystemPrompt("Old instructions."))
+	id := old.GetID()
+	srv.AddAgent(id, old)
+
+	dir := t.TempDir()
+	registry, err := agent.NewRegistry(agent.RegistryConfig{ConfigDir: dir, DBPath: filepath.Join(t.TempDir(), "registry.db")})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, registry.Close()) })
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "agents", "reload-me.yaml"), []byte(`apiVersion: loom/v1
+kind: Agent
+metadata:
+  name: reload-me
+  description: Lighter
+spec:
+  system_prompt: New instructions.
+`), 0o600))
+	registry.SetReloadCallback(func(name, _ string, config *loomv1.AgentConfig) error {
+		rebuilt := agent.NewAgent(nil, llm, agent.WithName(name),
+			agent.WithDescription(config.Description), agent.WithSystemPrompt(config.SystemPrompt))
+		rebuilt.SetID(id) // the same agent, rebuilt (as looms serve's callback does)
+		return srv.UpdateAgent(id, rebuilt)
+	})
+	srv.SetAgentRegistry(registry)
+
+	info, err := srv.ReloadAgent(ctx, &loomv1.ReloadAgentRequest{AgentId: id, ReloadFromFile: true})
+	require.NoError(t, err)
+	assert.Equal(t, "true", info.Metadata["reload_applied"])
+	assert.Equal(t, "Lighter", info.Metadata["description"])
+	answering, _, err := srv.getAgent(id)
+	require.NoError(t, err)
+	assert.Equal(t, "Lighter", answering.GetDescription(), "the agent answering requests is the reloaded one")
+}
+
+// Without a reload callback the server can't rebuild the agent, and the reply
+// doesn't claim it did.
+func TestAgentLifecycle_ReloadFromFileWithoutCallbackIsNotApplied(t *testing.T) {
+	srv := newTestMultiAgentServer(t)
+	dir := t.TempDir()
+	registry, err := agent.NewRegistry(agent.RegistryConfig{ConfigDir: dir, DBPath: filepath.Join(t.TempDir(), "registry.db")})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, registry.Close()) })
+	srv.SetAgentRegistry(registry)
+	_, err = srv.ReloadAgent(context.Background(), &loomv1.ReloadAgentRequest{AgentId: "default", ReloadFromFile: true})
+	require.Error(t, err, "no file for it: nothing reloaded")
 }
