@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`ReloadAgent` with `reload_from_file` now replaces the agent answering requests.** It called the registry's own `ReloadAgent`, which rebuilt only the registry's copy, so the server kept answering with the old instructions and tools until a restart (and macOS file watching, the other route, is unreliable). It now goes through `Registry.ForceReload`, the path the config file watcher uses: the reload callback rebuilds the agent with its tools, MCP servers and UI app tools and puts it in the server. The returned `AgentInfo` has `metadata["reload_applied"] = "true"` when the agent answering is the rebuilt one (also for a reload with a new `config`), so a caller can tell this server from one that only re-read the file.
+
 ### Changed
 
 - **`WeaveRequest.context` keeps the prompt cache valid.** The request-context note (e.g. the caller's local time) was a trailing system message; the Anthropic client moves system messages into the system prompt at the head of the request, so a note that changed with every request kept the conversation from being read from the prompt cache. It is now part of the turn's trailing `<system-reminder>` user message (with the soft reminder), after every cache breakpoint. `types.IsSystemReminder` recognizes such notes; the scripted provider skips them when finding the newest turn.

@@ -483,18 +483,26 @@ func (s *MultiAgentServer) ReloadAgent(ctx context.Context, req *loomv1.ReloadAg
 
 	// Determine the new config to apply
 	var newConfig *loomv1.AgentConfig
+	// applied: the agent answering requests was replaced by one built from
+	// the new config (reported as metadata reload_applied, so a caller can
+	// tell a server that only re-read the file).
+	applied := false
 
 	if req.ReloadFromFile {
-		// Delegate to registry for file-based reload
 		if s.registry != nil {
-			if reloadErr := s.registry.ReloadAgent(ctx, resolvedID); reloadErr != nil {
+			// ForceReload rebuilds the agent the way the config file watcher
+			// does (tools, MCP servers, UI app tools) and puts it in this
+			// server through the registry's reload callback. The registry's
+			// own ReloadAgent only replaced the registry's copy, so the agent
+			// answering kept its old instructions and tools.
+			name := ag.GetName()
+			if reloadErr := s.registry.ForceReload(ctx, name); reloadErr != nil {
 				return nil, status.Errorf(codes.Internal, "failed to reload agent from file: %v", reloadErr)
 			}
-
-			// Retrieve updated agent info from registry
-			info, infoErr := s.registry.GetAgentInfo(resolvedID)
-			if infoErr == nil {
-				newConfig = s.registry.GetConfig(info.Name)
+			newConfig = s.registry.GetConfig(name)
+			if fresh, _, freshErr := s.getAgent(resolvedID); freshErr == nil && fresh != ag {
+				ag = fresh
+				applied = true
 			}
 		} else {
 			return nil, status.Error(codes.FailedPrecondition, "reload_from_file requires an agent registry; no registry configured")
@@ -532,6 +540,7 @@ func (s *MultiAgentServer) ReloadAgent(ctx context.Context, req *loomv1.ReloadAg
 			}
 
 			ag = newAgent
+			applied = true
 		} else {
 			// Simple reload without registry: create new agent with updated opts
 			opts := []agent.Option{
@@ -552,6 +561,7 @@ func (s *MultiAgentServer) ReloadAgent(ctx context.Context, req *loomv1.ReloadAg
 			}
 
 			ag = newAgent
+			applied = true
 		}
 	} else {
 		return nil, status.Error(codes.InvalidArgument, "either config or reload_from_file must be specified")
@@ -588,5 +598,9 @@ func (s *MultiAgentServer) ReloadAgent(ctx context.Context, req *loomv1.ReloadAg
 			zap.Bool("from_file", req.ReloadFromFile))
 	}
 
-	return s.buildAgentInfo(ag, resolvedID, &snap), nil
+	info := s.buildAgentInfo(ag, resolvedID, &snap)
+	if applied {
+		info.Metadata["reload_applied"] = "true"
+	}
+	return info, nil
 }
