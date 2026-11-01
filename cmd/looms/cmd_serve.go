@@ -220,6 +220,14 @@ func registerYAMLBuiltinTools(
 		"delete_ui_app":                   "UI app subsystem (AppCompiler/AppProvider)",
 		"get_ui_app":                      "UI app subsystem (AppCompiler/AppProvider)",
 		"contact_human":                   "HITL store (registerContactHumanFromYAML)",
+		// Registered by the agent itself; declaring one keeps it surfaced
+		// under tools.minimal/none (agent.SuppressedFor).
+		"task_board":        "agent (task board, with memory.task_board.enabled)",
+		"query_tool_result": "agent (this turn's large results)",
+		"recall":            "agent (summary-cited conversation spans)",
+		"graph_memory":      "agent (graph memory)",
+		"manage_skills":     "agent (skill orchestrator)",
+		"load_pattern":      "agent (pattern orchestrator)",
 	}
 
 	logger.Info(indent+"Registering builtin tools", zap.Int("count", len(cfg.Tools.Builtin)))
@@ -1979,7 +1987,7 @@ func runServe(cmd *cobra.Command, args []string) {
 				// over-coupled to subsystem wiring). tools.none additionally hides
 				// the other progressive-disclosure tools so the LLM only sees what
 				// the YAML explicitly declared.
-				for _, name := range builtinToolsToSuppress() {
+				for _, name := range agent.SuppressedFor(builtinToolsToSuppress(), cfg) {
 					agentOpts = append(agentOpts, agent.WithoutBuiltinTool(name))
 				}
 
@@ -3299,7 +3307,7 @@ func runServe(cmd *cobra.Command, args []string) {
 			}
 
 			// Tool-surface gating — see builtinToolsToSuppress() for policy.
-			for _, name := range builtinToolsToSuppress() {
+			for _, name := range agent.SuppressedFor(builtinToolsToSuppress(), agentConfig) {
 				agentOpts = append(agentOpts, agent.WithoutBuiltinTool(name))
 			}
 
