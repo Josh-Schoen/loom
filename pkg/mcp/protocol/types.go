@@ -126,6 +126,13 @@ type CallToolParams struct {
 // with forward_caller_identity. The value is a string.
 const MetaCallerUserID = "com.teradata.loom/callerUserId"
 
+// MetaCallerSessionID is the tools/call request _meta key carrying the
+// session (conversation) the agent is acting in, sent with
+// MetaCallerUserID to servers configured with forward_caller_identity, so
+// a server can keep per-conversation state (for example, a conversation
+// tied to one folder of the person's notes). The value is a string.
+const MetaCallerSessionID = "com.teradata.loom/callerSessionId"
+
 // CallToolResult is the response from tools/call
 type CallToolResult struct {
 	Content           []Content              `json:"content"`                     // Array of content items

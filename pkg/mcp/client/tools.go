@@ -21,6 +21,7 @@ import (
 
 	"github.com/teradata-labs/loom/pkg/mcp/protocol"
 	"github.com/teradata-labs/loom/pkg/mcp/transport"
+	"github.com/teradata-labs/loom/pkg/session"
 	"github.com/teradata-labs/loom/pkg/types"
 	"go.uber.org/zap"
 )
@@ -128,6 +129,9 @@ func (c *Client) CallTool(ctx context.Context, name string, arguments map[string
 	if c.forwardCaller {
 		if userID := types.UserIDFromContext(ctx); userID != "" {
 			params.Meta = map[string]interface{}{protocol.MetaCallerUserID: userID}
+			if sessionID := session.SessionIDFromContext(ctx); sessionID != "" {
+				params.Meta[protocol.MetaCallerSessionID] = sessionID
+			}
 		}
 	}
 

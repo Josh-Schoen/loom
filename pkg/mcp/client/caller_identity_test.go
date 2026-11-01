@@ -22,6 +22,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/teradata-labs/loom/pkg/mcp/protocol"
+	"github.com/teradata-labs/loom/pkg/session"
 	"github.com/teradata-labs/loom/pkg/types"
 )
 
@@ -71,6 +72,64 @@ func TestCallToolForwardsCallerIdentityWhenConfigured(t *testing.T) {
 		}
 		ft.mu.Unlock()
 	}
+}
+
+// sessionOf returns the caller session ID in recorded tools/call params, or "".
+func sessionOf(t *testing.T, params json.RawMessage) string {
+	t.Helper()
+	var obj map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal(params, &obj))
+	raw, ok := obj["_meta"]
+	if !ok {
+		return ""
+	}
+	var meta map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal(raw, &meta))
+	var id string
+	if v, ok := meta[protocol.MetaCallerSessionID]; ok {
+		require.NoError(t, json.Unmarshal(v, &id))
+	}
+	return id
+}
+
+func TestCallToolForwardsTheSessionWithTheCaller(t *testing.T) {
+	for _, stateless := range []bool{false, true} {
+		ft := newScriptedTransport()
+		if stateless {
+			ft.discoverResult = statelessDiscoverResult()
+		}
+		ft.tools = []protocol.Tool{simpleTool("do_thing", nil)}
+		ft.callResult = json.RawMessage(`{"content":[],"resultType":"complete"}`)
+		c := connectClient(t, ft, Config{ForwardCallerIdentity: true})
+		require.NoError(t, c.Connect(context.Background(), protocol.Implementation{Name: "loom"}))
+
+		ctx := session.WithSessionID(types.ContextWithUserID(context.Background(), "sam-2"), "sess-9")
+		_, err := c.CallTool(ctx, "do_thing", map[string]interface{}{})
+		require.NoError(t, err)
+		// A session without a caller: nothing is forwarded.
+		_, err = c.CallTool(session.WithSessionID(context.Background(), "sess-9"), "do_thing", map[string]interface{}{})
+		require.NoError(t, err)
+
+		ft.mu.Lock()
+		require.Len(t, ft.callParams, 2)
+		assert.Equal(t, "sam-2", callerOf(t, ft.callParams[0]), "stateless=%v", stateless)
+		assert.Equal(t, "sess-9", sessionOf(t, ft.callParams[0]), "stateless=%v", stateless)
+		assert.Empty(t, sessionOf(t, ft.callParams[1]), "stateless=%v", stateless)
+		ft.mu.Unlock()
+	}
+
+	// Not configured: neither goes.
+	ft := newScriptedTransport()
+	ft.tools = []protocol.Tool{simpleTool("do_thing", nil)}
+	ft.callResult = json.RawMessage(`{"content":[],"resultType":"complete"}`)
+	c := connectClient(t, ft, Config{})
+	require.NoError(t, c.Connect(context.Background(), protocol.Implementation{Name: "loom"}))
+	ctx := session.WithSessionID(types.ContextWithUserID(context.Background(), "sam-2"), "sess-9")
+	_, err := c.CallTool(ctx, "do_thing", map[string]interface{}{})
+	require.NoError(t, err)
+	ft.mu.Lock()
+	assert.Empty(t, sessionOf(t, ft.callParams[0]))
+	ft.mu.Unlock()
 }
 
 func TestCallToolKeepsCallerIdentityByDefault(t *testing.T) {

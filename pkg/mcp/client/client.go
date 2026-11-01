@@ -128,7 +128,9 @@ type Config struct {
 
 	// ForwardCallerIdentity adds the caller's user ID (types.UserIDFromContext)
 	// to each tools/call request's _meta under protocol.MetaCallerUserID, so a
-	// server that keeps per-person data knows whose it is. Only for servers
+	// server that keeps per-person data knows whose it is, and with it the
+	// session it's acting in (session.SessionIDFromContext) under
+	// protocol.MetaCallerSessionID. Only for servers
 	// loom trusts with that identity: a stdio child, or an HTTP server
 	// reachable only by loom.
 	ForwardCallerIdentity bool
