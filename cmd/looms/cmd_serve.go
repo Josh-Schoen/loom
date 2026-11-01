@@ -1104,6 +1104,10 @@ func exportConfigToEnv(cfg *Config) {
 		// #nosec G104 -- os.Setenv rarely fails, and we can continue without it
 		_ = os.Setenv("SERPAPI_KEY", cfg.Tools.WebSearch.SerpAPIKey)
 	}
+	if p := strings.ToLower(strings.TrimSpace(cfg.Tools.WebSearch.OnlyProvider)); p != "" {
+		// #nosec G104 -- os.Setenv rarely fails, and we can continue without it
+		_ = os.Setenv(builtin.WebSearchOnlyProviderEnv, p)
+	}
 	// Safe mode for the file tools. Only set when asked: the env var is also
 	// the direct switch for a library embedding, and writing "false" here
 	// would override a caller that set it before start.

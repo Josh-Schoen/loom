@@ -114,6 +114,19 @@ func (t *WebSearchTool) InputSchema() *shuttle.JSONSchema {
 	)
 }
 
+// WebSearchOnlyProviderEnv names the one provider web_search may use, when
+// set (looms exports tools.web_search.only_provider into it).
+const WebSearchOnlyProviderEnv = "LOOM_WEB_SEARCH_ONLY_PROVIDER"
+
+// missingKeySuggestion is what to do about a missing key; with one provider
+// only, no other provider is suggested.
+func missingKeySuggestion(envVarName string, onlyOne bool) string {
+	if onlyOne {
+		return fmt.Sprintf("Web search isn't set up: its key is missing (%s). Say you can't search the web right now.", envVarName)
+	}
+	return fmt.Sprintf("Set api_key parameter, configure via 'looms config set-key', or set %s environment variable. Or use duckduckgo which doesn't require an API key.", envVarName)
+}
+
 func (t *WebSearchTool) Execute(ctx context.Context, params map[string]interface{}) (*shuttle.Result, error) {
 	start := time.Now()
 
@@ -137,6 +150,14 @@ func (t *WebSearchTool) Execute(ctx context.Context, params map[string]interface
 	}
 
 	apiKey, _ := params["api_key"].(string)
+
+	// One provider only (tools.web_search.only_provider): the model can't
+	// choose another company or bring its own key.
+	only := strings.ToLower(strings.TrimSpace(os.Getenv(WebSearchOnlyProviderEnv)))
+	if only != "" {
+		provider = only
+		apiKey = ""
+	}
 
 	// FORCE TAVILY if API key is available (override LLM's provider choice)
 	if provider != "tavily" && os.Getenv("TAVILY_API_KEY") != "" {
@@ -196,7 +217,7 @@ func (t *WebSearchTool) Execute(ctx context.Context, params map[string]interface
 			Error: &shuttle.Error{
 				Code:       "MISSING_API_KEY",
 				Message:    fmt.Sprintf("API key required for provider: %s", provider),
-				Suggestion: fmt.Sprintf("Set api_key parameter, configure via 'looms config set-key', or set %s environment variable. Or use duckduckgo which doesn't require an API key.", envVarName),
+				Suggestion: missingKeySuggestion(envVarName, only != ""),
 			},
 			ExecutionTimeMs: time.Since(start).Milliseconds(),
 		}, nil
