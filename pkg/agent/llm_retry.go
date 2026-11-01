@@ -27,6 +27,17 @@ import (
 	"go.uber.org/zap"
 )
 
+// Persisted roles for agent-authored content that reaches the LLM as a user
+// turn. Values mirror internal/message (a TUI-domain package pkg/agent must
+// not import); producers and IsSyntheticWireUserRole share these so a rename
+// cannot silently stop a role folding to "user" on the wire.
+const (
+	roleSkillBody          = "skill_body"
+	roleHygieneInjection   = "hygiene_injection"
+	roleEmptyResponseRetry = "empty_response_retry"
+	roleSynthesisPrompt    = "synthesis_prompt"
+)
+
 // IsSyntheticWireUserRole reports whether role is a persisted Loom-internal
 // role that must be delivered to the LLM as user-turn content — the
 // skill-body sidecar, a hygiene retry injection, an empty-response retry
@@ -36,7 +47,7 @@ import (
 // independently.
 func IsSyntheticWireUserRole(role string) bool {
 	switch role {
-	case "skill_body", "hygiene_injection", "empty_response_retry", "synthesis_prompt":
+	case roleSkillBody, roleHygieneInjection, roleEmptyResponseRetry, roleSynthesisPrompt:
 		return true
 	default:
 		return false
@@ -151,8 +162,9 @@ func (a *Agent) observeSchedulerOutcome(err error) {
 //
 // Both conditions are required. A resumed turn whose rows still carry their
 // blocks (the park never left the process) needs no suppression, and a missing
-// block outside a resume is not this problem — compile strips blocks from
-// SETTLED turns by design, and a model may simply have returned none.
+// block outside a resume is not this problem — compile strips blocks from a
+// SETTLED turn once the context before them has changed, and a model may
+// simply have returned none.
 func (a *Agent) providerCtx(ctx Context, messages []Message) context.Context {
 	if isResumedTurn(ctx) && rebuiltToolTurn(messages) {
 		return llm.ContextSuppressThinking(ctx)
@@ -162,8 +174,8 @@ func (a *Agent) providerCtx(ctx Context, messages []Message) context.Context {
 
 // rebuiltToolTurn reports whether the newest turn present holds an assistant
 // message with tool calls but no thinking blocks — the shape a store rebuild
-// produces. Only the newest turn is examined: settled turns render without
-// their blocks on purpose.
+// produces. Only the newest turn is examined: settled turns may render
+// without their blocks on purpose.
 func rebuiltToolTurn(messages []Message) bool {
 	var newest int64
 	for i := range messages {
@@ -427,6 +439,7 @@ func (a *Agent) chatWithStreaming(ctx Context, messages []Message, tools []shutt
 			ToolName:          call.name,
 			ToolCallID:        call.id,
 			ToolInputBytes:    int64(p.Bytes),
+			ToolCallIndex:     int32(p.Index),
 		})
 	})
 
