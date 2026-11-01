@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -354,4 +355,21 @@ func TestWebSearchTool_ContextCancellation(t *testing.T) {
 	if err == nil {
 		assert.False(t, result.Success)
 	}
+}
+
+// With one provider only, the model can't send the search to another
+// company (duckduckgo needs no key, so it would otherwise run), and a
+// missing key suggests no other provider.
+func TestWebSearchOnlyProvider(t *testing.T) {
+	t.Setenv(WebSearchOnlyProviderEnv, "tavily")
+	t.Setenv("TAVILY_API_KEY", "")
+	tool := NewWebSearchTool()
+	res, err := tool.Execute(context.Background(), map[string]interface{}{
+		"query": "opening hours", "provider": "duckduckgo", "api_key": "made-up",
+	})
+	require.NoError(t, err)
+	require.False(t, res.Success)
+	require.NotNil(t, res.Error)
+	assert.Equal(t, "MISSING_API_KEY", res.Error.Code, "the model's provider and key are ignored")
+	assert.NotContains(t, strings.ToLower(res.Error.Suggestion), "duckduckgo")
 }

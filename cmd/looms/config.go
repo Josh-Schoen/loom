@@ -882,6 +882,11 @@ type WebSearchConfig struct {
 	// DefaultProvider is the default web search provider to use
 	DefaultProvider string `mapstructure:"default_provider"`
 
+	// OnlyProvider, when set, is the one provider web_search may use: the
+	// model's provider and api_key are ignored and no other provider is
+	// suggested, so search words never go to another company.
+	OnlyProvider string `mapstructure:"only_provider"`
+
 	// Endpoints holds API endpoint URLs (configurable for proxies or self-hosted)
 	Endpoints WebSearchEndpointsConfig `mapstructure:"endpoints"`
 

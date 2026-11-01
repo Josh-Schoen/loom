@@ -1051,6 +1051,10 @@ func exportConfigToEnv(cfg *Config) {
 		// #nosec G104 -- os.Setenv rarely fails, and we can continue without it
 		_ = os.Setenv("SERPAPI_KEY", cfg.Tools.WebSearch.SerpAPIKey)
 	}
+	if p := strings.ToLower(strings.TrimSpace(cfg.Tools.WebSearch.OnlyProvider)); p != "" {
+		// #nosec G104 -- os.Setenv rarely fails, and we can continue without it
+		_ = os.Setenv(builtin.WebSearchOnlyProviderEnv, p)
+	}
 }
 
 // buildServerAuthConfig converts the viper auth config into the server package's
