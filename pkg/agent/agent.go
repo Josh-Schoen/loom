@@ -591,6 +591,28 @@ func WithoutBuiltinTool(name string) Option {
 	}
 }
 
+// SuppressedFor is the server's tool-surface policy for one agent: the
+// suppressed builtins minus those the agent's YAML declares in
+// tools.builtin. tools.none promises "exactly what its YAML declared", so a
+// builtin an agent asks for by name (task_board, query_tool_result, recall,
+// ...) is surfaced even when the policy hides it from everyone else.
+func SuppressedFor(policy []string, cfg *loomv1.AgentConfig) []string {
+	if len(policy) == 0 {
+		return nil
+	}
+	declared := make(map[string]bool, len(cfg.GetTools().GetBuiltin()))
+	for _, name := range cfg.GetTools().GetBuiltin() {
+		declared[name] = true
+	}
+	out := make([]string, 0, len(policy))
+	for _, name := range policy {
+		if !declared[name] {
+			out = append(out, name)
+		}
+	}
+	return out
+}
+
 // isBuiltinToolSuppressed reports whether the named tool has been suppressed
 // via WithoutBuiltinTool. Read-only; safe under the agent's normal mutex
 // discipline because the suppression map is set at construction and not
@@ -1324,7 +1346,8 @@ func (a *Agent) skillMenuPromptSupplement() string {
 // taskBoardPromptSupplement returns instructions for agents with task board enabled.
 // Returns empty string when task board is not available.
 func (a *Agent) taskBoardPromptSupplement() string {
-	if a.taskManager == nil || a.taskBoardConfig == nil || !a.taskBoardConfig.Enabled {
+	// Never describe a tool the model isn't offered (tools.minimal/none).
+	if a.taskManager == nil || a.taskBoardConfig == nil || !a.taskBoardConfig.Enabled || a.isBuiltinToolSuppressed("task_board") {
 		return ""
 	}
 	return `
@@ -1424,7 +1447,7 @@ func (a *Agent) checkAndRegisterLoadPatternTool() {
 // survives context compaction — the agent never forgets what it's working on.
 // Returns empty string if task board is not enabled, budget is 0, or no tasks exist.
 func (a *Agent) buildTaskContext(ctx context.Context) string {
-	if a.taskManager == nil || a.taskBoardConfig == nil || !a.taskBoardConfig.Enabled {
+	if a.taskManager == nil || a.taskBoardConfig == nil || !a.taskBoardConfig.Enabled || a.isBuiltinToolSuppressed("task_board") {
 		return ""
 	}
 

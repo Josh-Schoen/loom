@@ -828,7 +828,7 @@ func (r *Registry) buildAgent(ctx context.Context, config *loomv1.AgentConfig) (
 
 	// Apply server-level tool-surface policy. WithoutBuiltinTool hides a
 	// tool from the LLM's tool list without disabling its subsystem.
-	for _, name := range suppressedTools {
+	for _, name := range SuppressedFor(suppressedTools, config) {
 		opts = append(opts, WithoutBuiltinTool(name))
 	}
 

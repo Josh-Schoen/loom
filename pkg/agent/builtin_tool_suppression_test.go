@@ -22,6 +22,7 @@ import (
 	"github.com/teradata-labs/loom/pkg/observability"
 	"github.com/teradata-labs/loom/pkg/shuttle"
 	"github.com/teradata-labs/loom/pkg/storage/sqlite"
+	"github.com/teradata-labs/loom/pkg/task"
 )
 
 // newTestGraphStore spins up an in-memory SQLite-backed graph store. Shared
@@ -191,4 +192,38 @@ func TestWithoutBuiltinTool_RetrievalTools(t *testing.T) {
 		assert.False(t, ag.tools.IsRegistered("query_tool_result"), "query_tool_result must NOT surface")
 		assert.False(t, ag.tools.IsRegistered("recall"), "recall must NOT surface")
 	})
+}
+
+// TestSuppressedFor: a builtin the agent's YAML declares by name stays
+// surfaced under the server's policy (tools.none promises exactly what the
+// YAML declared); everything else the policy names stays hidden.
+func TestSuppressedFor(t *testing.T) {
+	policy := []string{"graph_memory", "task_board", "query_tool_result", "recall", "send_message"}
+	cfg := &loomv1.AgentConfig{Tools: &loomv1.ToolsConfig{Builtin: []string{"create_ui_app", "task_board", "query_tool_result", "recall"}}}
+	assert.Equal(t, []string{"graph_memory", "send_message"}, SuppressedFor(policy, cfg))
+	assert.Equal(t, policy, SuppressedFor(policy, &loomv1.AgentConfig{}), "nothing declared: the policy as is")
+	assert.Equal(t, policy, SuppressedFor(policy, nil))
+	assert.Nil(t, SuppressedFor(nil, cfg), "no policy: nothing hidden")
+}
+
+// TestTaskBoardTextFollowsTheTool: the kanban prompt and the in-context
+// task summary describe task_board, so a hidden task_board means neither.
+func TestTaskBoardTextFollowsTheTool(t *testing.T) {
+	db, err := sql.Open("sqlite3", filepath.Join(t.TempDir(), "test.db")+"?_fk=1&_journal_mode=WAL")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	mig, err := sqlite.NewMigrator(db, observability.NewNoOpTracer())
+	require.NoError(t, err)
+	require.NoError(t, mig.MigrateUp(context.Background()))
+	mgr := task.NewManager(sqlite.NewTaskStore(db, observability.NewNoOpTracer()), nil, observability.NewNoOpTracer(), nil)
+	cfg := &loomv1.TaskBoardConfig{Enabled: true}
+
+	shown := NewAgent(nil, nil, WithTaskBoard(mgr, nil, cfg))
+	assert.True(t, shown.tools.IsRegistered("task_board"))
+	assert.Contains(t, shown.taskBoardPromptSupplement(), "task_board")
+
+	hidden := NewAgent(nil, nil, WithTaskBoard(mgr, nil, cfg), WithoutBuiltinTool("task_board"))
+	assert.False(t, hidden.tools.IsRegistered("task_board"))
+	assert.Empty(t, hidden.taskBoardPromptSupplement(), "never describe a tool that isn't offered")
+	assert.Empty(t, hidden.buildTaskContext(context.Background()))
 }
