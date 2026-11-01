@@ -126,6 +126,18 @@ func buildConversationBlock(ec extractionContext) string {
 	return sb.String()
 }
 
+// assistantWordsRule keeps the assistant's own words out of memory as facts
+// about the user. Tool results are not in the conversation block, so the
+// extractor can't tell a time the assistant offered from one the user booked;
+// recorded as fact, an offer comes back in a later turn as if it happened
+// (a suggested haircut slot recalled as an appointment and added to an
+// unrelated reminder). Both passes carry it.
+const assistantWordsRule = `- Messages from [assistant] are suggestions, offers, questions and answers, not facts about the user.
+  Never record something only the assistant said (times or options it offered, plans it proposed,
+  details it added, events or appointments it described) as a fact about the user. Record it only
+  when the user stated or confirmed it in their own message ("yes, book the Thursday one").
+`
+
 // jsonSchema is the shared output schema for both extraction passes.
 const jsonSchema = `{
   "entities": [{"name": "lowercase_name", "entity_type": "person|tool|project|concept|organization|dataset|system|event|place", "properties": "{}", "is_user": false}],
@@ -163,7 +175,7 @@ func buildGraphMemoryExtractionPromptWithDate(messages []types.Message, maxEntit
 
 Rules:
 - Only extract information explicitly stated or clearly implied in the conversation
-- Normalize entity names to lowercase
+` + assistantWordsRule + `- Normalize entity names to lowercase
 - Keep memory content concise and factual (one sentence)
 - Keep summary under 50 characters
 - Set salience proportional to importance: critical decisions 0.8-1.0, routine facts 0.3-0.5
@@ -225,7 +237,7 @@ Each fact should be a standalone statement that would be useful if recalled mont
 
 Rules:
 - Extract facts about the USER, not about the topic being discussed
-- Convert ALL relative dates to absolute dates using the current date as anchor
+` + assistantWordsRule + `- Convert ALL relative dates to absolute dates using the current date as anchor
 - For each memory with a time dimension, populate "event_date" (YYYY-MM-DD)
   and "event_date_confidence" ("exact" | "approximate" | "ambiguous").
   If the time cue is too vague to anchor (e.g., "a while back"), leave

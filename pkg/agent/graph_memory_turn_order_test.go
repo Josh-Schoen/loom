@@ -199,6 +199,9 @@ func TestGraphMemory_EarlierTurnRecalledOnNextTurn(t *testing.T) {
 	last := req[len(req)-1]
 	assert.True(t, types.IsSystemReminder(last), "the recall note is the request's trailing system reminder")
 	assert.Contains(t, last.Content, graphMemoryContextMarker)
+	// Recalled memories say they are unchecked, so a remembered plan isn't
+	// stated as fact or added to something the user didn't ask for.
+	assert.Contains(t, last.Content, "not checked now")
 	for _, m := range req {
 		if m.Role == "system" {
 			assert.NotContains(t, m.Content, graphMemoryContextMarker)

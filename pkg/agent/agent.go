@@ -3774,6 +3774,14 @@ func (a *Agent) FlushGraphMemoryExtraction() {
 // graphMemoryContextMarker opens the graph memory recall note.
 const graphMemoryContextMarker = "[Graph Memory Context]"
 
+// graphMemoryRecallHeader opens the recalled memories. They are what was said
+// in earlier conversations, not checked against anything now: the header says
+// so, so the answering model doesn't state a remembered plan or appointment as
+// current fact or add one to something the user didn't ask for.
+const graphMemoryRecallHeader = "Relevant memories from past conversations. These are what was said before, " +
+	"not checked now: a plan, appointment or date here may have changed or never happened. " +
+	"Check current data before stating one as fact, and don't add one to anything the user didn't ask for.\n\n"
+
 // graphMemoryNote queries graph memory for the current topic and returns the
 // relevant memories as a note for this turn's LLM calls, or "" when there are
 // none. The note is transient: it is never added to the session.
@@ -3912,7 +3920,7 @@ func (a *Agent) graphMemoryNote(ctx context.Context, session *types.Session) str
 	span.SetAttribute("recall.injected", len(relevant))
 
 	var sb strings.Builder
-	sb.WriteString("Relevant memories from past conversations:\n\n")
+	sb.WriteString(graphMemoryRecallHeader)
 	for _, m := range relevant {
 		sb.WriteString("- ")
 		if m.EventDate != "" {

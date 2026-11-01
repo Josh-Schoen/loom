@@ -675,3 +675,21 @@ func TestBuildConversationBlock_RendersPerTurnDates(t *testing.T) {
 	assert.Contains(t, block, "2. [user]: legacy line",
 		"a timestamp-less row renders role only, no invented date")
 }
+
+// Both passes tell the extractor that the assistant's offers are not facts
+// about the user: a haircut slot the assistant suggested was later recalled
+// as an appointment and put into an unrelated reminder.
+func TestExtractionPrompts_AssistantOffersAreNotFacts(t *testing.T) {
+	messages := []types.Message{
+		{Role: "user", Content: "Find me a time for a haircut"},
+		{Role: "assistant", Content: "You're free Tue 4 PM or Thu 10 AM. Which works?"},
+	}
+	ec := extractionContext{messages: messages, maxEntities: 10, currentDate: "2026-10-28"}
+	for name, prompt := range map[string]string{
+		"pass 1": buildGraphMemoryExtractionPromptWithDate(messages, 10, nil, nil, "2026-10-28"),
+		"pass 2": buildIncidentalFactsPrompt(ec),
+	} {
+		assert.Contains(t, prompt, "Never record something only the assistant said", name)
+		assert.Contains(t, prompt, "stated or confirmed it in their own message", name)
+	}
+}
