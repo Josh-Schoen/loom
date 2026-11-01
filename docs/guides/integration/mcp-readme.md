@@ -213,8 +213,13 @@ mcp:
 
 ```json
 {"method": "tools/call", "params": {"name": "household_notes", "arguments": {},
- "_meta": {"com.teradata.loom/callerUserId": "sam-3f9a0c71"}}}
+ "_meta": {"com.teradata.loom/callerUserId": "sam-3f9a0c71",
+           "com.teradata.loom/callerSessionId": "sess-91b2"}}}
 ```
+
+- With the user ID goes the session (conversation) the agent is acting in,
+  under `com.teradata.loom/callerSessionId`, when there is one, so a server
+  can keep per-conversation state. It's never sent without a user ID.
 
 - The user ID is the one loom's interceptors established for the request:
   the paired device's user, the JWT subject, or `X-User-Id`. With no user,
