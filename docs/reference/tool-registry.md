@@ -702,6 +702,34 @@ tools, _ := registry.GetToolsByCapability(ctx, "database",
 ```
 
 
+## Tool Deferral
+
+**Status**: ⚠️ Partial. The mechanism and Go API are implemented and tested. There is no YAML, proto or RPC surface yet, so it can only be configured from Go code. Its effect on model accuracy and real cache behavior has not been measured (see [Tool Search Benchmark Harness](../testing/tool-search-benchmark.md) for the offline model).
+
+By default every registered tool is advertised to the model on every provider call. With deferral active, a session is offered only its core tools plus the tools it has found with `tool_search`; the rest stay registered and executable but are not advertised.
+
+| Mode | Behavior |
+|------|----------|
+| `off` (default) | Advertise every tool |
+| `on` | Hide every tool the session has not discovered |
+| `auto` | Switch on when the full advertised list reaches `ThresholdBytes` (default 40 KB); switch off again below 70% of it. The decision is per session and sticky inside that band, because each flip breaks the provider's cached prompt prefix |
+
+Always advertised, even while deferral is active: `tool_search`, the agent-internal tools (`query_tool_result`, `recall`, `graph_memory`, `task_board`, `manage_skills`, `load_pattern`), tools a skill advertised to the session, and names in `AlwaysOn` (a trailing `*` matches a prefix, such as `vantage:*`).
+
+Deferral never activates for an agent without `tool_search` registered, since the model could not find the hidden tools.
+
+```go
+// Agent default, from config:
+cfg.ToolDeferral = agent.ToolDeferralConfig{Mode: agent.DeferralAuto, AlwaysOn: []string{"vantage:*"}}
+
+// On the fly, effective on the next provider call:
+a.SetToolDeferral(agent.ToolDeferralConfig{Mode: agent.DeferralOn})
+a.SetSessionToolDeferral(sessionID, agent.DeferralOff) // one session
+a.ClearSessionToolDeferral(sessionID)                  // follow the agent again
+```
+
+Discovered tools are advertised by name from the session's next call. This is the "append" delivery method: adding a tool changes the advertised list and breaks the cached prefix from that point on. The benchmark model suggests a generic `call_tool` dispatcher avoids that; it is not implemented.
+
 ## See Also
 
 - [MCP Integration Guide](../guides/integration/mcp-readme.md) - MCP server setup

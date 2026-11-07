@@ -64,6 +64,7 @@ import (
 	"github.com/teradata-labs/loom/pkg/prompts"
 	"github.com/teradata-labs/loom/pkg/scheduler"
 	"github.com/teradata-labs/loom/pkg/server"
+	"github.com/teradata-labs/loom/pkg/session"
 	"github.com/teradata-labs/loom/pkg/shuttle"
 	"github.com/teradata-labs/loom/pkg/shuttle/builtin"
 	"github.com/teradata-labs/loom/pkg/skills"
@@ -2132,6 +2133,11 @@ func runServe(cmd *cobra.Command, args []string) {
 					if permissionChecker != nil {
 						searchTool.SetToolFilter(permissionChecker.Advertisable)
 					}
+					// Reveal discovered tools to the searching session when tool
+					// deferral is active.
+					searchTool.SetDiscoveryHook(func(ctx context.Context, names []string) {
+						ag.DiscoverTools(session.SessionIDFromContext(ctx), names...)
+					})
 					ag.RegisterTool(searchTool)
 					logger.Info("    Registered tool_search for dynamic discovery")
 
@@ -3442,6 +3448,11 @@ func runServe(cmd *cobra.Command, args []string) {
 				if permissionChecker != nil {
 					searchTool.SetToolFilter(permissionChecker.Advertisable)
 				}
+				// Reveal discovered tools to the searching session when tool
+				// deferral is active.
+				searchTool.SetDiscoveryHook(func(ctx context.Context, names []string) {
+					newAgent.DiscoverTools(session.SessionIDFromContext(ctx), names...)
+				})
 				newAgent.RegisterTool(searchTool)
 				logger.Info("  Registered tool_search for dynamic discovery")
 

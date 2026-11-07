@@ -33,6 +33,10 @@ type SearchTool struct {
 	// deployment); the model would then call one and eat a denial — a wasted turn
 	// and a policy decision miscounted as a tool failure. Nil means no filtering.
 	advertisable func(toolName string) bool
+	// onDiscovered, when set, is called with the names of the tools a search
+	// returned, so the caller can start advertising them to the session. Each
+	// MCP tool is reported both plain and server-qualified ("server:tool").
+	onDiscovered func(ctx context.Context, toolNames []string)
 }
 
 // NewSearchTool creates a new tool search tool.
@@ -48,6 +52,13 @@ func NewSearchTool(registry *Registry) *SearchTool {
 // permission-checker advertisability predicate.
 func (t *SearchTool) SetToolFilter(advertisable func(toolName string) bool) {
 	t.advertisable = advertisable
+}
+
+// SetDiscoveryHook installs a callback that receives the names of the tools each
+// search returns, after the advertisable filter. The agent uses it to reveal
+// deferred tools to the searching session.
+func (t *SearchTool) SetDiscoveryHook(hook func(ctx context.Context, toolNames []string)) {
+	t.onDiscovered = hook
 }
 
 // Name returns the tool name.
@@ -171,6 +182,7 @@ func (t *SearchTool) Execute(ctx context.Context, params map[string]interface{})
 	// Format results for LLM consumption, skipping any tool the calling agent
 	// could not execute so the model never discovers a tool it can't run.
 	results := make([]map[string]interface{}, 0, len(resp.Results))
+	var discovered []string
 	for _, r := range resp.Results {
 		if t.advertisable != nil && r.Tool != nil && !t.advertisable(r.Tool.Name) {
 			continue
@@ -224,6 +236,13 @@ func (t *SearchTool) Execute(ctx context.Context, params map[string]interface{})
 		}
 
 		results = append(results, result)
+		discovered = append(discovered, r.Tool.Name)
+		if r.Tool.McpServer != "" {
+			discovered = append(discovered, r.Tool.McpServer+":"+r.Tool.Name)
+		}
+	}
+	if t.onDiscovered != nil && len(discovered) > 0 {
+		t.onDiscovered(ctx, discovered)
 	}
 
 	// Build response data

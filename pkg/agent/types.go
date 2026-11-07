@@ -237,6 +237,17 @@ type Agent struct {
 	baseToolNames     map[string]bool
 	baseToolsOnce     sync.Once
 
+	// Tool deferral state (see tool_deferral.go). deferralOverride is the
+	// runtime setting from SetToolDeferral (nil = follow config). The per-session
+	// maps hold a mode override, the sticky DeferralAuto decision, and the tools
+	// the session discovered. All guarded by deferralMu. Lock order: deferralMu
+	// before mu.
+	deferralMu        sync.RWMutex
+	deferralOverride  *ToolDeferralConfig
+	sessionDeferral   map[string]DeferralMode
+	sessionAutoOn     map[string]bool
+	sessionDiscovered map[string]map[string]bool
+
 	// Per-session resource-lease ledger: the scarce backend resources each
 	// session's conversation currently holds, tracked from backend-declared
 	// lease events on tool results and mirrored onto the LLM slot scheduler's
@@ -316,6 +327,11 @@ type Config struct {
 	// MaxIterations are executed; the rest receive "turn_limit_exceeded" errors.
 	// 0 = use default (10).
 	MaxIterations int
+
+	// ToolDeferral controls whether tools are advertised upfront or only after
+	// a session discovers them with tool_search. The zero value is off.
+	// Agent.SetToolDeferral overrides it at runtime.
+	ToolDeferral ToolDeferralConfig
 
 	// SystemPrompt is the direct system prompt text (takes precedence over SystemPromptKey)
 	SystemPrompt string

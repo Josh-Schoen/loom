@@ -94,6 +94,9 @@ func NewAgent(backend fabric.ExecutionBackend, llmProvider LLMProvider, opts ...
 
 		sessionToolLedger: make(map[string]map[string]bool),
 		scopedToolNames:   make(map[string]bool),
+		sessionDeferral:   make(map[string]DeferralMode),
+		sessionAutoOn:     make(map[string]bool),
+		sessionDiscovered: make(map[string]map[string]bool),
 	}
 
 	// Mutation-debug carrier: its closures read this agent's switch and turn
@@ -844,6 +847,10 @@ func (a *Agent) advertisedTools(ctx context.Context, session *Session) []shuttle
 		}
 	}
 	a.mu.RUnlock()
+
+	// Hide tools this session has not discovered yet when deferral is active.
+	// Call-scoped tools come after: the caller supplied them for this call.
+	out = a.applyToolDeferral(sessionID, out)
 
 	// Call-scoped tools never share a name with a registered tool (callers
 	// validate that up front); they are appended, not merged.
@@ -4280,6 +4287,7 @@ func (a *Agent) DeleteSession(sessionID string) {
 	a.mu.Lock()
 	delete(a.sessionToolLedger, sessionID)
 	a.mu.Unlock()
+	a.forgetSessionDeferral(sessionID)
 	// In-turn SQLite databases are normally dropped at the session's next turn
 	// start; a deleted session has no next turn, so drop them here.
 	a.dropInTurnSQLite(sessionID)
@@ -4339,6 +4347,7 @@ func (a *Agent) ClearAllSessions() {
 	a.mu.Lock()
 	a.sessionToolLedger = make(map[string]map[string]bool)
 	a.mu.Unlock()
+	a.resetDeferralState()
 	a.dropAllInTurnSQLite()
 	a.leases.reset()
 }

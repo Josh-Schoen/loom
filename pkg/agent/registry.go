@@ -35,6 +35,7 @@ import (
 	"github.com/teradata-labs/loom/pkg/mcp/manager"
 	"github.com/teradata-labs/loom/pkg/memory"
 	"github.com/teradata-labs/loom/pkg/observability"
+	"github.com/teradata-labs/loom/pkg/session"
 	"github.com/teradata-labs/loom/pkg/shuttle"
 	"github.com/teradata-labs/loom/pkg/shuttle/builtin"
 	"github.com/teradata-labs/loom/pkg/skills"
@@ -1011,6 +1012,11 @@ func (r *Registry) buildAgent(ctx context.Context, config *loomv1.AgentConfig) (
 			// Read lazily so it reflects the checker regardless of wiring order.
 			st.SetToolFilter(func(name string) bool {
 				return agent.permissionChecker == nil || agent.permissionChecker.Advertisable(name)
+			})
+			// Reveal discovered tools to the searching session when tool
+			// deferral is active.
+			st.SetDiscoveryHook(func(ctx context.Context, names []string) {
+				agent.DiscoverTools(session.SessionIDFromContext(ctx), names...)
 			})
 			searchTool := shuttle.Tool(st)
 			// Wrap with PromptAwareTool for externalized descriptions
