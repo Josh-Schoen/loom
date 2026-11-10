@@ -152,7 +152,7 @@ See the [MCP Probe guide](docs/guides/mcp-probe.md) for negotiation, MRTR elicit
 | EXPLAIN Plan Visualizer | SVG DAG rendering of Teradata EXPLAIN plans with cost coloring |
 | Data Quality Dashboard | Completeness, uniqueness, distribution, and outlier analysis |
 
-**Dynamic App Creation**: Agents and MCP clients can create custom dashboards at runtime from a declarative JSON spec with 14 component types (stat cards, charts, tables, heatmaps, DAGs, etc.). Up to 100 dynamic apps, compiled to secure standalone HTML with the Tokyonight Dark theme. See [MCP Apps Guide](docs/guides/mcp-apps-guide.md).
+**Dynamic App Creation**: Agents and MCP clients can create custom dashboards at runtime from a declarative JSON spec with 18 component types (stat cards, charts, tables, data tables, heatmaps, DAGs, query plans, etc.). Up to 100 dynamic apps, compiled to secure standalone HTML with the Tokyonight Dark theme. See [MCP Apps Guide](docs/guides/mcp-apps-guide.md).
 
 ### Built-in Tools
 

@@ -46,7 +46,7 @@ The fastest way to create an app is through Claude Code (or any MCP client with 
 
 **Step 1**: Discover available components:
 
-Call `loom_list_component_types` — this returns all 14 component types with their prop schemas.
+Call `loom_list_component_types` — this returns all 18 component types with their prop schemas.
 
 **Step 2**: Create your app:
 

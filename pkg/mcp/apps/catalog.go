@@ -37,7 +37,7 @@ type componentEntry struct {
 	ExampleJSON string
 }
 
-// NewComponentCatalog creates a catalog with all 14 built-in component types.
+// NewComponentCatalog creates a catalog with all 18 built-in component types.
 func NewComponentCatalog() *ComponentCatalog {
 	entries := []componentEntry{
 		// Display components
@@ -265,6 +265,114 @@ func NewComponentCatalog() *ComponentCatalog {
 			},
 			ExampleJSON: `{"type":"heatmap","props":{"title":"Query Latency (ms)","rowLabels":["Mon","Tue","Wed"],"columnLabels":["Morning","Afternoon","Evening"],"values":[[120,150,90],[200,180,110],[95,130,85]]}}`,
 		},
+		{
+			Type:        "data-table",
+			Description: "Rows a person can search, sort, filter and open, following relations to rows in other data-tables on the page. Use one per table of data you gathered (query results, a spreadsheet, a CSV), instead of \"table\", whenever there are more than a few rows or the tables join. Give it an id and a name; columns are names or {name, label, type, key}; rows are lists in column order (at most 1000; put in a sample and set total for a bigger table); relations say which column matches a column in another data-table on the same page.",
+			Category:    "display",
+			PropsSchema: map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"title": map[string]interface{}{"type": "string"},
+					"name":  map[string]interface{}{"type": "string", "description": "The table's name, which relations in other data-tables and the schema use"},
+					"total": map[string]interface{}{"type": "number", "description": "Rows in the whole table, when rows holds only part of it"},
+					"columns": map[string]interface{}{
+						"type":        "array",
+						"description": "Column names, or objects describing each column",
+						"items": map[string]interface{}{
+							"oneOf": []interface{}{
+								map[string]interface{}{"type": "string"},
+								map[string]interface{}{
+									"type": "object",
+									"properties": map[string]interface{}{
+										"name":     map[string]interface{}{"type": "string"},
+										"label":    map[string]interface{}{"type": "string", "description": "Shown instead of the name"},
+										"type":     map[string]interface{}{"type": "string", "enum": []string{"text", "number", "money", "date", "yes-no"}, "description": "text (the usual), number, money (US dollars unless currency), date (YYYY-MM-DD) or yes-no"},
+										"key":      map[string]interface{}{"type": "boolean", "description": "true for the column that tells rows apart"},
+										"about":    map[string]interface{}{"type": "string", "description": "What the column holds, in plain words"},
+										"currency": map[string]interface{}{"type": "string", "description": "Currency code for money, e.g. EUR"},
+									},
+									"required": []string{"name"},
+								},
+							},
+						},
+					},
+					"rows": map[string]interface{}{
+						"type":        "array",
+						"maxItems":    MaxDataTableRows,
+						"description": "One list per row, values in column order",
+						"items": map[string]interface{}{
+							"type":  "array",
+							"items": map[string]interface{}{"type": []string{"string", "number", "boolean"}},
+						},
+					},
+					"relations": map[string]interface{}{
+						"type":        "array",
+						"description": "This table's column matches the column to in the data-table named table on the same page (many of these rows to one of those)",
+						"items": map[string]interface{}{
+							"type": "object",
+							"properties": map[string]interface{}{
+								"column": map[string]interface{}{"type": "string"},
+								"table":  map[string]interface{}{"type": "string"},
+								"to":     map[string]interface{}{"type": "string"},
+							},
+							"required": []string{"column", "table", "to"},
+						},
+					},
+				},
+				"required": []string{"columns", "rows"},
+			},
+			ExampleJSON: `{"type":"data-table","id":"vehicles","props":{"title":"Vehicles","name":"vehicles","total":200,"columns":[{"name":"vehicle_id","label":"ID","key":true},"make",{"name":"model_year","label":"Year","type":"number"},{"name":"price_usd","label":"Price","type":"money"}],"rows":[["V001","Toyota",2019,18500],["V002","Ford",2021,24900]],"relations":[{"column":"make","table":"makes","to":"make"}]}}`,
+		},
+		{
+			Type:        "schema",
+			Description: "How the tables fit together: each table with what it holds, its row count and its columns (type, key), and the relations between tables. Use it when you show more than one table, next to their data-tables.",
+			Category:    "display",
+			PropsSchema: map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"title": map[string]interface{}{"type": "string"},
+					"tables": map[string]interface{}{
+						"type": "array",
+						"items": map[string]interface{}{
+							"type": "object",
+							"properties": map[string]interface{}{
+								"name":  map[string]interface{}{"type": "string", "description": "Matches the name of a data-table on the page, if there is one"},
+								"about": map[string]interface{}{"type": "string"},
+								"rows":  map[string]interface{}{"type": "number", "description": "Rows in the table"},
+								"columns": map[string]interface{}{
+									"type": "array",
+									"items": map[string]interface{}{
+										"type": "object",
+										"properties": map[string]interface{}{
+											"name":  map[string]interface{}{"type": "string"},
+											"type":  map[string]interface{}{"type": "string", "enum": []string{"text", "number", "money", "date", "yes-no"}},
+											"key":   map[string]interface{}{"type": "boolean"},
+											"about": map[string]interface{}{"type": "string"},
+										},
+										"required": []string{"name"},
+									},
+								},
+							},
+							"required": []string{"name"},
+						},
+					},
+					"relations": map[string]interface{}{
+						"type": "array",
+						"items": map[string]interface{}{
+							"type": "object",
+							"properties": map[string]interface{}{
+								"from": map[string]interface{}{"type": "string", "description": "table.column"},
+								"to":   map[string]interface{}{"type": "string", "description": "table.column"},
+								"kind": map[string]interface{}{"type": "string", "enum": []string{"many-to-one", "one-to-one", "one-to-many"}},
+							},
+							"required": []string{"from", "to"},
+						},
+					},
+				},
+				"required": []string{"tables"},
+			},
+			ExampleJSON: `{"type":"schema","props":{"title":"Tables","tables":[{"name":"vehicles","about":"Made-up cars","rows":200,"columns":[{"name":"vehicle_id","type":"text","key":true},{"name":"make","type":"text"}]},{"name":"makes","rows":8,"columns":[{"name":"make","key":true},{"name":"country"}]}],"relations":[{"from":"vehicles.make","to":"makes.make","kind":"many-to-one"}]}}`,
+		},
 
 		// Layout components
 		{
@@ -383,6 +491,45 @@ func NewComponentCatalog() *ComponentCatalog {
 				"required": []string{"messages"},
 			},
 			ExampleJSON: `{"type":"message-list","props":{"messages":[{"role":"user","content":"Show me revenue trends"},{"role":"assistant","content":"Here's the analysis..."}]}}`,
+		},
+		{
+			Type:        "query-plan",
+			Description: "How a query runs, as a tree of steps (top step first, each with the steps it reads from as children), so a person can see what it does and which step is slow. Use it to show an explain plan: label each step in plain words and put the engine's own words in detail; give rows, and time (ms) or cost.",
+			Category:    "complex",
+			PropsSchema: map[string]interface{}{
+				"type": "object",
+				"$defs": map[string]interface{}{
+					"step": map[string]interface{}{
+						"type": "object",
+						"properties": map[string]interface{}{
+							"label":  map[string]interface{}{"type": "string", "description": "What the step does, in plain words"},
+							"detail": map[string]interface{}{"type": "string", "description": "The engine's own words for the step"},
+							"note":   map[string]interface{}{"type": "string", "description": "Anything worth knowing, e.g. why it is slow"},
+							"rows":   map[string]interface{}{"type": "number"},
+							"time":   map[string]interface{}{"type": "number", "description": "Time spent in this step (ms)"},
+							"cost":   map[string]interface{}{"type": "number", "description": "The engine's cost estimate, when there is no time"},
+							"children": map[string]interface{}{
+								"type":  "array",
+								"items": map[string]interface{}{"$ref": "#/$defs/step"},
+							},
+						},
+						"required": []string{"label"},
+					},
+				},
+				"properties": map[string]interface{}{
+					"title":   map[string]interface{}{"type": "string"},
+					"engine":  map[string]interface{}{"type": "string", "description": "The database or engine, e.g. DataFusion, Postgres"},
+					"query":   map[string]interface{}{"type": "string"},
+					"summary": map[string]interface{}{"type": "string", "description": "What the plan does, in a sentence"},
+					"steps": map[string]interface{}{
+						"type":        "array",
+						"description": "The top steps (usually one); at most 100 steps in all, nested at most 12 deep",
+						"items":       map[string]interface{}{"$ref": "#/$defs/step"},
+					},
+				},
+				"required": []string{"steps"},
+			},
+			ExampleJSON: `{"type":"query-plan","props":{"title":"How the country join runs","engine":"DataFusion","query":"SELECT country, count(*) FROM vehicles JOIN makes USING (make) GROUP BY country","summary":"Reads both tables once and matches them by make.","steps":[{"label":"Count cars by country","detail":"AggregateExec mode=Final","rows":3,"time":1.2,"children":[{"label":"Match cars to their make","detail":"HashJoinExec on make","rows":200,"time":3.1,"children":[{"label":"Read vehicles (make only)","rows":200,"time":0.8},{"label":"Read makes","rows":8,"time":0.1}]}]}]}}`,
 		},
 	}
 

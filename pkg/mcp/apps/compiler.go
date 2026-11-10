@@ -32,6 +32,10 @@ const (
 	MaxNestingDepth        = 10
 	MaxComponentPropsBytes = 64 * 1024  // 64 KB per component props
 	MaxSpecBytes           = 512 * 1024 // 512 KB total spec
+
+	MaxDataTableRows = 1000 // rows in one data-table
+	MaxPlanDepth     = 12   // levels of steps in one query-plan
+	MaxPlanSteps     = 100  // steps in one query-plan, all levels
 )
 
 // Dangerous keys that are rejected at any nesting depth (prototype pollution prevention).
@@ -219,8 +223,12 @@ func (c *Compiler) validateComponents(components []*loomv1.UIComponent, depth in
 				return fmt.Errorf("component[%d] %q: failed to marshal props: %w", i, comp.Type, err)
 			}
 			if len(propsJSON) > MaxComponentPropsBytes {
-				return fmt.Errorf("component[%d] %q: props exceed maximum size (%d bytes > %d bytes)",
-					i, comp.Type, len(propsJSON), MaxComponentPropsBytes)
+				hint := ""
+				if comp.Type == "data-table" {
+					hint = "; put in fewer rows (a sample) and set total to the full count"
+				}
+				return fmt.Errorf("component[%d] %q: props exceed maximum size (%d bytes > %d bytes)%s",
+					i, comp.Type, len(propsJSON), MaxComponentPropsBytes, hint)
 			}
 
 			// Sanitize props for dangerous keys and values
@@ -229,10 +237,17 @@ func (c *Compiler) validateComponents(components []*loomv1.UIComponent, depth in
 			}
 		}
 
-		if comp.Type == "checklist" {
-			if err := validateChecklist(comp); err != nil {
-				return fmt.Errorf("component[%d] \"checklist\": %w", i, err)
-			}
+		var partErr error
+		switch comp.Type {
+		case "checklist":
+			partErr = validateChecklist(comp)
+		case "data-table":
+			partErr = validateDataTable(comp)
+		case "query-plan":
+			partErr = validateQueryPlan(comp)
+		}
+		if partErr != nil {
+			return fmt.Errorf("component[%d] %q: %w", i, comp.Type, partErr)
 		}
 
 		// Validate children
@@ -265,6 +280,101 @@ func validateChecklist(comp *loomv1.UIComponent) error {
 			return fmt.Errorf("duplicate item id %q", id)
 		}
 		seen[id] = true
+	}
+	return nil
+}
+
+// dataColumnTypes are the column types a data-table (and a schema) knows.
+var dataColumnTypes = map[string]bool{"text": true, "number": true, "money": true, "date": true, "yes-no": true}
+
+// validateDataTable requires what drawing the rows needs: columns, at most
+// MaxDataTableRows rows, each no longer than the columns, and relations that
+// name one of the table's own columns.
+func validateDataTable(comp *loomv1.UIComponent) error {
+	fields := comp.GetProps().GetFields()
+	columns := fields["columns"].GetListValue().GetValues()
+	if len(columns) == 0 {
+		return fmt.Errorf(`columns is required: list the column names, or objects like {"name":"price","label":"Price","type":"money"}`)
+	}
+	names := make(map[string]bool, len(columns))
+	for n, col := range columns {
+		name := col.GetStringValue()
+		if obj := col.GetStructValue(); obj != nil {
+			name = obj.GetFields()["name"].GetStringValue()
+			if typ, ok := obj.GetFields()["type"]; ok && !dataColumnTypes[typ.GetStringValue()] {
+				return fmt.Errorf("column %d (%q) has type %q: use text, number, money, date or yes-no", n, name, typ.GetStringValue())
+			}
+		}
+		if name == "" {
+			return fmt.Errorf(`column %d needs a name: give a string, or an object with "name"`, n)
+		}
+		names[name] = true
+	}
+	rowsVal, ok := fields["rows"]
+	if !ok {
+		return fmt.Errorf("rows is required: one list of values per row, in column order (it may be empty)")
+	}
+	if rowsVal.GetListValue() == nil {
+		return fmt.Errorf("rows must be a list of rows, each a list of values in column order")
+	}
+	rows := rowsVal.GetListValue().GetValues()
+	if len(rows) > MaxDataTableRows {
+		return fmt.Errorf("has %d rows, more than the %d a data-table holds: put in a sample of at most %d rows and set total to the full count", len(rows), MaxDataTableRows, MaxDataTableRows)
+	}
+	for n, row := range rows {
+		cells := row.GetListValue()
+		if cells == nil {
+			return fmt.Errorf("row %d must be a list of values in column order, not an object", n)
+		}
+		if len(cells.GetValues()) > len(columns) {
+			return fmt.Errorf("row %d has %d values but there are %d columns: give one value per column, in column order", n, len(cells.GetValues()), len(columns))
+		}
+	}
+	for n, rel := range fields["relations"].GetListValue().GetValues() {
+		rf := rel.GetStructValue().GetFields()
+		column, table, to := rf["column"].GetStringValue(), rf["table"].GetStringValue(), rf["to"].GetStringValue()
+		if column == "" || table == "" || to == "" {
+			return fmt.Errorf(`relation %d needs column, table and to, like {"column":"make","table":"makes","to":"make"}`, n)
+		}
+		if !names[column] {
+			return fmt.Errorf("relation %d names column %q, which this data-table does not have", n, column)
+		}
+	}
+	return nil
+}
+
+// validateQueryPlan requires steps, each with a label, nested at most
+// MaxPlanDepth deep and at most MaxPlanSteps in all.
+func validateQueryPlan(comp *loomv1.UIComponent) error {
+	steps := comp.GetProps().GetFields()["steps"].GetListValue().GetValues()
+	if len(steps) == 0 {
+		return fmt.Errorf(`steps is required: the top step (usually one), like {"label":"Count cars by country","rows":3,"time":1.2,"children":[...]}`)
+	}
+	count := 0
+	return validatePlanSteps(steps, 1, &count)
+}
+
+func validatePlanSteps(steps []*structpb.Value, depth int, count *int) error {
+	if depth > MaxPlanDepth {
+		return fmt.Errorf("steps are nested more than %d deep: leave out the less important inner steps, or join them into one step", MaxPlanDepth)
+	}
+	for _, step := range steps {
+		*count++
+		if *count > MaxPlanSteps {
+			return fmt.Errorf("has more than %d steps: show the main steps and join the small ones", MaxPlanSteps)
+		}
+		obj := step.GetStructValue()
+		if obj == nil {
+			return fmt.Errorf(`each step must be an object like {"label":"Read makes","rows":8}`)
+		}
+		if obj.GetFields()["label"].GetStringValue() == "" {
+			return fmt.Errorf("step %d needs a label: say what the step does in plain words", *count)
+		}
+		if children := obj.GetFields()["children"].GetListValue().GetValues(); len(children) > 0 {
+			if err := validatePlanSteps(children, depth+1, count); err != nil {
+				return err
+			}
+		}
 	}
 	return nil
 }

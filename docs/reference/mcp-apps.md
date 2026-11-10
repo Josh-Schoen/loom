@@ -90,7 +90,7 @@ The `layout` field controls how top-level components are arranged:
 
 ## Component Types
 
-14 built-in component types across 3 categories.
+18 built-in component types across 3 categories.
 
 ### Display Components
 
@@ -520,6 +520,113 @@ Tappable list of items. Tapping a row toggles its `checked` value in the page an
 
 ---
 
+#### `data-table`
+
+Rows a person can search, sort and filter, following relations to rows in other data-tables on the page. Use it for gathered data (query results, a spreadsheet) instead of `table` when there are more than a few rows or the tables join. loom's own page draws it as a table with click-to-sort headers, a filter box (from 10 rows), pages of 25 with Show more, and its relations in words; hosts with their own renderer (Weaver) also open a row and walk its relations.
+
+**Props:**
+
+| Prop | Type | Required | Description |
+|------|------|----------|-------------|
+| `title` | string | No | Title |
+| `name` | string | No | The table's name, used by relations in other data-tables and by `schema` |
+| `total` | number | No | Rows in the whole table, when `rows` holds only part of it |
+| `columns` | array | Yes | Column names, or `{name, label?, type?, key?, about?, currency?}` |
+| `rows` | array | Yes | One array per row, values (string, number or boolean) in column order |
+| `relations` | array | No | `{column, table, to}`: this table's `column` matches `to` in the data-table named `table` (many to one) |
+
+Column `type` is `text` (the default), `number`, `money` (US dollars unless `currency`), `date` (`YYYY-MM-DD`) or `yes-no`; values are drawn as $18,500, 96,462, Nov 4, 2026, Yes. `key: true` marks the column that tells rows apart.
+
+**Constraints** (validation errors on create/update):
+
+- `columns` is not empty; each column has a name; a column `type` is one of the five above.
+- `rows` is present, at most 1000 rows, each an array no longer than `columns` (shorter rows leave the last cells blank).
+- Each relation has `column`, `table` and `to`, and `column` is one of the table's columns.
+- The 64 KB props limit applies; for a bigger table put in a sample and set `total`.
+
+```json
+{
+  "type": "data-table",
+  "id": "vehicles",
+  "props": {
+    "title": "Vehicles", "name": "vehicles", "total": 200,
+    "columns": [
+      {"name": "vehicle_id", "label": "ID", "key": true},
+      "make",
+      {"name": "model_year", "label": "Year", "type": "number"},
+      {"name": "price_usd", "label": "Price", "type": "money"}
+    ],
+    "rows": [["V001", "Toyota", 2019, 18500], ["V002", "Ford", 2021, 24900]],
+    "relations": [{"column": "make", "table": "makes", "to": "make"}]
+  }
+}
+```
+
+A `chart` may carry `"link": {"table": "vehicles", "column": "make"}`; hosts that support it filter that data-table to a label when the label is tapped. loom keeps the prop and ignores it when drawing.
+
+---
+
+#### `schema`
+
+How tables fit together: each table with what it holds, its row count and columns, and the relations in words.
+
+**Props:**
+
+| Prop | Type | Required | Description |
+|------|------|----------|-------------|
+| `title` | string | No | Title (default "Tables") |
+| `tables` | array | Yes | `{name, about?, rows?, columns?: [{name, type?, key?, about?}]}` |
+| `relations` | array | No | `{from, to, kind?}`: `table.column` to `table.column`; `kind` is `many-to-one`, `one-to-one` or `one-to-many` |
+
+```json
+{
+  "type": "schema",
+  "props": {
+    "title": "Tables",
+    "tables": [
+      {"name": "vehicles", "about": "Made-up cars", "rows": 200, "columns": [
+        {"name": "vehicle_id", "type": "text", "key": true}, {"name": "make", "type": "text"}]},
+      {"name": "makes", "rows": 8, "columns": [{"name": "make", "key": true}, {"name": "country"}]}
+    ],
+    "relations": [{"from": "vehicles.make", "to": "makes.make", "kind": "many-to-one"}]
+  }
+}
+```
+
+---
+
+#### `query-plan`
+
+How a query runs, as a tree of steps (top step first), with each step's rows and its share of the total `time` (or of `cost` when no step has a time); the largest share is marked "Slowest step". `detail` holds the engine's own words; `query` is shown under "Show the query".
+
+**Props:**
+
+| Prop | Type | Required | Description |
+|------|------|----------|-------------|
+| `title` | string | No | Title |
+| `engine` | string | No | The engine, e.g. DataFusion |
+| `query` | string | No | The query text |
+| `summary` | string | No | What the plan does, in a sentence |
+| `steps` | array | Yes | Top steps: `{label, detail?, note?, rows?, time?, cost?, children?}`, `children` being steps again |
+
+**Constraints** (validation errors on create/update): `steps` is not empty, every step has a `label`, steps nest at most 12 deep and there are at most 100 in all.
+
+```json
+{
+  "type": "query-plan",
+  "props": {
+    "title": "How the country join runs", "engine": "DataFusion",
+    "summary": "Reads both tables once and matches them by make.",
+    "steps": [{"label": "Count cars by country", "detail": "AggregateExec mode=Final", "rows": 3, "time": 1.2,
+      "children": [{"label": "Match cars to their make", "detail": "HashJoinExec on make", "rows": 200, "time": 3.1,
+        "children": [{"label": "Read vehicles (make only)", "rows": 200, "time": 0.8},
+                     {"label": "Read makes", "rows": 8, "time": 0.1}]}]}]
+  }
+}
+```
+
+---
+
 ## Colors
 
 All components that accept a `color` prop use the Tokyonight Dark theme palette:
@@ -542,6 +649,8 @@ You can also pass hex colors (e.g., `"#ff6b6b"`), but named colors are preferred
 | Max components per spec | 50 |
 | Max nesting depth | 10 |
 | Max props size per component | 64 KB |
+| Max rows per `data-table` | 1000 |
+| Max steps per `query-plan` | 100 in all, 12 deep |
 | Max total spec size | 512 KB |
 | Max dynamic apps (per owner) | 100 |
 | Max total dynamic app storage (per owner) | 50 MB |
