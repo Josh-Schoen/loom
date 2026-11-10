@@ -38,13 +38,13 @@ MCP Apps are interactive HTML dashboards built from a declarative JSON spec. The
 
 ### Component Catalog (`pkg/mcp/apps/catalog.go`)
 
-Defines the 14 built-in component types across 3 categories:
+Defines the 18 built-in component types across 3 categories:
 
 | Category | Components |
 |----------|-----------|
-| Display | stat-cards, chart, table, key-value, text, code-block, progress-bar, badges, heatmap |
+| Display | stat-cards, chart, table, key-value, checklist, text, code-block, progress-bar, badges, heatmap, data-table, schema |
 | Layout | header, section, tabs |
-| Complex | dag, message-list |
+| Complex | dag, message-list, query-plan |
 
 Each catalog entry includes:
 - Type name and category
@@ -87,7 +87,7 @@ The registry provides:
 
 An embedded HTML template (~1300 lines, mostly CSS) that provides:
 - Tokyonight Dark theme with 6 named colors
-- CSS for all 14 component types
+- CSS for all 18 component types
 - Responsive grid layouts
 - CSP meta tag restricting script sources
 

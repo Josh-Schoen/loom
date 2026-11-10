@@ -23,6 +23,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	loomv1 "github.com/teradata-labs/loom/gen/go/loom/v1"
+	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/types/known/structpb"
 )
 
@@ -551,7 +552,7 @@ func TestCompiler_ListComponentTypes(t *testing.T) {
 	require.NoError(t, err)
 
 	types := c.ListComponentTypes()
-	require.Len(t, types, 15)
+	require.Len(t, types, 18)
 
 	// Verify all types have required fields populated
 	typeNames := make(map[string]bool)
@@ -569,6 +570,7 @@ func TestCompiler_ListComponentTypes(t *testing.T) {
 		"code-block", "progress-bar", "badges", "heatmap",
 		"header", "section", "tabs",
 		"dag", "message-list",
+		"checklist", "data-table", "schema", "query-plan",
 	}
 	for _, et := range expectedTypes {
 		assert.True(t, typeNames[et], "expected component type %q to be in catalog", et)
@@ -692,7 +694,7 @@ func TestCompiler_Validate_AllComponentTypes(t *testing.T) {
 	c, err := NewCompiler()
 	require.NoError(t, err)
 
-	// Validate that all 15 component types are accepted with minimal valid props
+	// Validate that all 18 component types are accepted with minimal valid props
 	types := c.Catalog().ValidTypes()
 	for _, typ := range types {
 		t.Run(typ, func(t *testing.T) {
@@ -784,6 +786,15 @@ func TestCompiler_Validate_AllComponentTypes(t *testing.T) {
 			case "checklist":
 				props, _ = structpb.NewStruct(map[string]interface{}{
 					"items": []interface{}{map[string]interface{}{"label": "Milk"}},
+				})
+			case "data-table":
+				props, _ = structpb.NewStruct(map[string]interface{}{
+					"columns": []interface{}{"col1"},
+					"rows":    []interface{}{[]interface{}{"val1"}},
+				})
+			case "query-plan":
+				props, _ = structpb.NewStruct(map[string]interface{}{
+					"steps": []interface{}{map[string]interface{}{"label": "Read"}},
 				})
 			default:
 				// For any new type not handled above, use empty struct
@@ -1219,4 +1230,162 @@ func TestCompiler_ValidateChecklist(t *testing.T) {
 		Children: []*loomv1.UIComponent{{Type: "checklist", Props: props}},
 	}}}
 	assert.ErrorContains(t, c.Validate(nested), "id is required")
+}
+
+// Every catalog example is a page part the compiler accepts.
+func TestCompiler_CatalogExamplesValidate(t *testing.T) {
+	c, err := NewCompiler()
+	require.NoError(t, err)
+	for _, ct := range c.ListComponentTypes() {
+		t.Run(ct.Type, func(t *testing.T) {
+			var comp loomv1.UIComponent
+			require.NoError(t, protojson.Unmarshal([]byte(ct.ExampleJson), &comp), "example JSON must parse")
+			assert.Equal(t, ct.Type, comp.Type)
+			if comp.Type == "checklist" && comp.Id == "" {
+				comp.Id = "c1"
+			}
+			spec := &loomv1.UIAppSpec{Version: "1.0", Components: []*loomv1.UIComponent{&comp}}
+			assert.NoError(t, c.Validate(spec))
+		})
+	}
+}
+
+// dataPage is the page of data-cases.json in loom-mobile
+// (libraries/weaver-screens): two related data-tables, a chart linked to one
+// of them, and two query-plans.
+const dataPage = `{"version":"1.0","title":"Vehicles","layout":"stack","components":[
+{"type":"data-table","id":"vehicles","props":{"title":"Vehicles","name":"vehicles","total":200,"columns":[{"name":"vehicle_id","label":"ID","key":true},"make",{"name":"model_year","label":"Year","type":"number"},{"name":"price_usd","label":"Price","type":"money"},{"name":"sold","label":"Sold","type":"yes-no"},{"name":"listed","label":"Listed","type":"date"}],"rows":[["V1","Toyota",2019,18500,true,"2026-01-04"],["V2","Ford",2021,"24900",false,"2026-02-11"],["V3","Toyota",2017,12000,false,""],["V4","Honda",2021,21000,true,"2025-12-30"],["V5","Kia","",15500,false,"2026-03-01"],["V6","Ford",2018,9900,true,"2026-01-20"]],"relations":[{"column":"make","table":"makes","to":"make"}]}},
+{"type":"data-table","id":"makes","props":{"title":"Makes","name":"makes","columns":[{"name":"make","key":true},"country"],"rows":[["Toyota","Japan"],["Ford","United States"],["Honda","Japan"],["Kia","South Korea"],["Nissan","Japan"]]}},
+{"type":"chart","props":{"chartType":"bar","title":"Cars by make","labels":["Toyota","Ford"],"datasets":[{"label":"Cars","data":[2,2]}],"link":{"table":"vehicles","column":"make"}}},
+{"type":"schema","props":{"title":"Tables","tables":[{"name":"vehicles","rows":200,"columns":[{"name":"vehicle_id","type":"text","key":true},{"name":"make"}]},{"name":"makes","rows":5,"columns":[{"name":"make","key":true},{"name":"country"}]}],"relations":[{"from":"vehicles.make","to":"makes.make","kind":"many-to-one"}]}},
+{"type":"query-plan","id":"plan","props":{"title":"How the country join runs","engine":"DataFusion","query":"SELECT country, count(*) FROM vehicles JOIN makes USING (make) GROUP BY country","steps":[{"label":"Count cars by country","detail":"AggregateExec","rows":3,"time":1,"children":[{"label":"Match cars to their make","detail":"HashJoinExec","rows":200,"time":5,"children":[{"label":"Read vehicles","rows":200,"time":3},{"label":"Read makes","rows":8,"time":1}]}]}]}},
+{"type":"query-plan","id":"costed","props":{"steps":[{"label":"Join","cost":30,"children":[{"label":"Scan a","cost":60},{"label":"Scan b"}]}]}}]}`
+
+func TestCompiler_DataPage(t *testing.T) {
+	c, err := NewCompiler()
+	require.NoError(t, err)
+	var spec loomv1.UIAppSpec
+	require.NoError(t, protojson.Unmarshal([]byte(dataPage), &spec))
+	require.NoError(t, c.Validate(&spec))
+
+	// The chart keeps its link (props are kept as given).
+	link := spec.Components[2].GetProps().GetFields()["link"].GetStructValue()
+	require.NotNil(t, link, "chart link must be kept")
+	assert.Equal(t, "vehicles", link.GetFields()["table"].GetStringValue())
+
+	html, err := c.Compile(&spec)
+	require.NoError(t, err)
+	assert.Contains(t, string(html), "HashJoinExec")
+}
+
+func TestCompiler_ValidateDataTable(t *testing.T) {
+	c, err := NewCompiler()
+	require.NoError(t, err)
+	table := func(props map[string]interface{}) *loomv1.UIAppSpec {
+		s, err := structpb.NewStruct(props)
+		require.NoError(t, err)
+		return &loomv1.UIAppSpec{Version: "1.0", Components: []*loomv1.UIComponent{{Type: "data-table", Id: "t", Props: s}}}
+	}
+	cols := []interface{}{"id", map[string]interface{}{"name": "price", "type": "money"}}
+
+	assert.NoError(t, c.Validate(table(map[string]interface{}{
+		"columns": cols, "rows": []interface{}{[]interface{}{"a", 1.0}, []interface{}{"b"}, []interface{}{}},
+	})), "rows shorter than the columns are fine")
+	assert.NoError(t, c.Validate(table(map[string]interface{}{"columns": cols, "rows": []interface{}{}})))
+
+	err = c.Validate(table(map[string]interface{}{"rows": []interface{}{}}))
+	assert.ErrorContains(t, err, `"data-table": columns is required`)
+	err = c.Validate(table(map[string]interface{}{"columns": []interface{}{}, "rows": []interface{}{}}))
+	assert.ErrorContains(t, err, "columns is required")
+	err = c.Validate(table(map[string]interface{}{"columns": cols}))
+	assert.ErrorContains(t, err, "rows is required")
+	err = c.Validate(table(map[string]interface{}{"columns": []interface{}{map[string]interface{}{"label": "No name"}}, "rows": []interface{}{}}))
+	assert.ErrorContains(t, err, "column 0 needs a name")
+	err = c.Validate(table(map[string]interface{}{"columns": []interface{}{map[string]interface{}{"name": "x", "type": "currency"}}, "rows": []interface{}{}}))
+	assert.ErrorContains(t, err, "use text, number, money, date or yes-no")
+
+	err = c.Validate(table(map[string]interface{}{"columns": cols, "rows": []interface{}{[]interface{}{"a", 1.0, "extra"}}}))
+	assert.ErrorContains(t, err, "row 0 has 3 values but there are 2 columns")
+	err = c.Validate(table(map[string]interface{}{"columns": cols, "rows": []interface{}{map[string]interface{}{"id": "a"}}}))
+	assert.ErrorContains(t, err, "row 0 must be a list")
+
+	tooMany := make([]interface{}, MaxDataTableRows+1)
+	for i := range tooMany {
+		tooMany[i] = []interface{}{1.0}
+	}
+	err = c.Validate(table(map[string]interface{}{"columns": []interface{}{"n"}, "rows": tooMany}))
+	assert.ErrorContains(t, err, "has 1001 rows, more than the 1000")
+	assert.ErrorContains(t, err, "set total")
+	assert.NoError(t, c.Validate(table(map[string]interface{}{"columns": []interface{}{"n"}, "rows": tooMany[:MaxDataTableRows]})))
+
+	err = c.Validate(table(map[string]interface{}{"columns": cols, "rows": []interface{}{},
+		"relations": []interface{}{map[string]interface{}{"column": "make", "table": "makes", "to": "make"}}}))
+	assert.ErrorContains(t, err, `relation 0 names column "make"`)
+	err = c.Validate(table(map[string]interface{}{"columns": cols, "rows": []interface{}{},
+		"relations": []interface{}{map[string]interface{}{"column": "id"}}}))
+	assert.ErrorContains(t, err, "relation 0 needs column, table and to")
+
+	// Too big for one part: the error says how to fix it.
+	big := make([]interface{}, 900)
+	for i := range big {
+		big[i] = []interface{}{strings.Repeat("x", 100)}
+	}
+	err = c.Validate(table(map[string]interface{}{"columns": []interface{}{"n"}, "rows": big}))
+	assert.ErrorContains(t, err, "put in fewer rows (a sample) and set total")
+}
+
+func TestCompiler_ValidateQueryPlan(t *testing.T) {
+	c, err := NewCompiler()
+	require.NoError(t, err)
+	plan := func(steps []interface{}) *loomv1.UIAppSpec {
+		props := map[string]interface{}{}
+		if steps != nil {
+			props["steps"] = steps
+		}
+		s, err := structpb.NewStruct(props)
+		require.NoError(t, err)
+		return &loomv1.UIAppSpec{Version: "1.0", Components: []*loomv1.UIComponent{{Type: "query-plan", Props: s}}}
+	}
+	// chain makes a plan n steps deep.
+	chain := func(n int) []interface{} {
+		var step map[string]interface{}
+		for i := n; i >= 1; i-- {
+			next := map[string]interface{}{"label": fmt.Sprintf("Step %d", i)}
+			if step != nil {
+				next["children"] = []interface{}{step}
+			}
+			step = next
+		}
+		return []interface{}{step}
+	}
+
+	assert.NoError(t, c.Validate(plan(chain(MaxPlanDepth))))
+	err = c.Validate(plan(chain(MaxPlanDepth + 1)))
+	assert.ErrorContains(t, err, `"query-plan": steps are nested more than 12 deep`)
+
+	err = c.Validate(plan(nil))
+	assert.ErrorContains(t, err, "steps is required")
+	err = c.Validate(plan([]interface{}{}))
+	assert.ErrorContains(t, err, "steps is required")
+
+	wide := make([]interface{}, MaxPlanSteps)
+	for i := range wide {
+		wide[i] = map[string]interface{}{"label": "Read"}
+	}
+	assert.NoError(t, c.Validate(plan(wide)))
+	err = c.Validate(plan(append(wide, map[string]interface{}{"label": "One more"})))
+	assert.ErrorContains(t, err, "more than 100 steps")
+
+	err = c.Validate(plan([]interface{}{map[string]interface{}{"label": "Top", "children": []interface{}{map[string]interface{}{"rows": 3.0}}}}))
+	assert.ErrorContains(t, err, "step 2 needs a label")
+	err = c.Validate(plan([]interface{}{"Read"}))
+	assert.ErrorContains(t, err, "each step must be an object")
+}
+
+// The data parts are drawn by the runtime too.
+func TestRuntimeJS_DataParts(t *testing.T) {
+	src := string(runtimeJS)
+	for _, part := range []string{`"data-table": renderDataTable`, `schema: renderSchema`, `"query-plan": renderQueryPlan`} {
+		assert.Contains(t, src, part)
+	}
 }

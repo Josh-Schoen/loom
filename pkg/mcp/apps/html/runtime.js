@@ -847,6 +847,8 @@
     "progress-bar": renderProgressBar,
     badges: renderBadges,
     heatmap: renderHeatmap,
+    "data-table": renderDataTable,
+    schema: renderSchema,
 
     // ---- Layout ----
     header: renderHeader,
@@ -856,6 +858,7 @@
     // ---- Complex ----
     dag: renderDAG,
     "message-list": renderMessageList,
+    "query-plan": renderQueryPlan,
   });
 
   // Per-type width tiers for the default top-level layout.
@@ -872,6 +875,8 @@
     section: "full",
     tabs: "full",
     badges: "full",
+    "data-table": "full",
+    "query-plan": "full",
 
     chart: "third",
     table: "third",
@@ -883,6 +888,7 @@
     checklist: "half",
     heatmap: "half",
     "message-list": "half",
+    schema: "half",
   });
 
   function tierForType(type) {
@@ -3006,6 +3012,689 @@
     }
 
     return container;
+  }
+
+  // --- data parts (data-table, schema, query-plan) ---
+  // A simple drawing of the data parts for hosts without their own: values
+  // are formatted as the page-parts contract says (money, grouped numbers,
+  // dates, yes-no), and every value goes through textContent.
+
+  const DATA_PAGE_SIZE = 25;
+  const MONTHS = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+  ];
+
+  function dataPanel() {
+    return createElement("div", {
+      style: {
+        background: THEME.surface,
+        border: "1px solid " + THEME.border,
+        borderRadius: "8px",
+        padding: "20px",
+      },
+    });
+  }
+
+  function dataTitle(text) {
+    return createElement(
+      "div",
+      {
+        style: {
+          fontSize: "14px",
+          fontWeight: "600",
+          marginBottom: "4px",
+          color: THEME.textPrimary,
+        },
+      },
+      text,
+    );
+  }
+
+  function dataMuted(text, extra) {
+    return createElement(
+      "div",
+      {
+        style: Object.assign(
+          { fontSize: "12px", color: THEME.textSecondary },
+          extra || {},
+        ),
+      },
+      text,
+    );
+  }
+
+  // Columns as {name, label, type, key, currency}, from names or objects.
+  function dataColumns(columns) {
+    if (!Array.isArray(columns)) return [];
+    const out = [];
+    for (const col of columns) {
+      if (typeof col === "string") {
+        out.push({ name: col, label: col, type: "text" });
+      } else if (col && typeof col === "object" && col.name) {
+        out.push({
+          name: String(col.name),
+          label: String(col.label || col.name),
+          type: typeof col.type === "string" ? col.type : "text",
+          key: col.key === true,
+          currency: typeof col.currency === "string" ? col.currency : "",
+        });
+      }
+    }
+    return out;
+  }
+
+  function cellText(value) {
+    if (value === undefined || value === null) return "";
+    return String(value);
+  }
+
+  function groupedNumber(n, decimals) {
+    const fixed = decimals > 0 ? n.toFixed(decimals) : String(Math.round(n));
+    const parts = fixed.split(".");
+    const sign = parts[0].startsWith("-") ? "-" : "";
+    const whole = sign ? parts[0].slice(1) : parts[0];
+    let grouped = "";
+    for (let i = 0; i < whole.length; i++) {
+      if (i > 0 && (whole.length - i) % 3 === 0) grouped += ",";
+      grouped += whole[i];
+    }
+    return sign + grouped + (parts[1] ? "." + parts[1] : "");
+  }
+
+  function asNumber(value) {
+    if (typeof value === "number") return isFinite(value) ? value : null;
+    if (typeof value === "string" && value.trim() !== "") {
+      const n = Number(value.trim());
+      return isFinite(n) ? n : null;
+    }
+    return null;
+  }
+
+  function asDate(value) {
+    if (typeof value !== "string") return null;
+    const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(value.trim());
+    if (!m) return null;
+    const month = Number(m[2]);
+    const day = Number(m[3]);
+    if (month < 1 || month > 12 || day < 1 || day > 31) return null;
+    return { y: Number(m[1]), m: month, d: day };
+  }
+
+  function asYesNo(value) {
+    if (value === true || value === 1) return true;
+    if (value === false || value === 0) return false;
+    if (typeof value === "string") {
+      const v = value.trim().toLowerCase();
+      if (v === "true" || v === "yes" || v === "1") return true;
+      if (v === "false" || v === "no" || v === "0") return false;
+    }
+    return null;
+  }
+
+  // Drawn text of a cell for its column's type; a value not of the type
+  // is shown as given.
+  function drawnText(value, col) {
+    const text = cellText(value);
+    if (text.trim() === "") return "";
+    if (col.type === "money") {
+      const n = asNumber(value);
+      if (n === null) return text;
+      const whole = Number.isInteger(n);
+      const amount = groupedNumber(Math.abs(n), whole ? 0 : 2);
+      const sign = n < 0 ? "-" : "";
+      if (col.currency && col.currency.toUpperCase() !== "USD") {
+        return sign + amount + " " + col.currency.toUpperCase();
+      }
+      return sign + "$" + amount;
+    }
+    if (col.type === "number") {
+      const n = asNumber(value);
+      if (n === null) return text;
+      if (Math.abs(n) < 10000) return String(n);
+      const decimals = Number.isInteger(n) ? 0 : (String(n).split(".")[1] || "").length;
+      return groupedNumber(n, decimals);
+    }
+    if (col.type === "date") {
+      const d = asDate(value);
+      return d ? MONTHS[d.m - 1] + " " + d.d + ", " + d.y : text;
+    }
+    if (col.type === "yes-no") {
+      const b = asYesNo(value);
+      return b === null ? text : b ? "Yes" : "No";
+    }
+    return text;
+  }
+
+  // Sort key for a cell: a number for number/money/date, lower-case text
+  // otherwise; null for blanks and values not of the type (sorted last).
+  function sortKey(value, col) {
+    const text = cellText(value).trim();
+    if (text === "") return null;
+    if (col.type === "number" || col.type === "money") return asNumber(value);
+    if (col.type === "date") {
+      const d = asDate(value);
+      return d ? d.y * 10000 + d.m * 100 + d.d : null;
+    }
+    return text.toLowerCase();
+  }
+
+  function renderDataTable(props) {
+    const wrapper = dataPanel();
+    const columns = dataColumns(props.columns);
+    const rows = (Array.isArray(props.rows) ? props.rows : []).filter(
+      (row) => Array.isArray(row),
+    );
+    const total = typeof props.total === "number" ? props.total : 0;
+
+    if (props.title || props.name) {
+      wrapper.appendChild(dataTitle(props.title || props.name));
+    }
+    const countLine = dataMuted("", { marginBottom: "12px" });
+    wrapper.appendChild(countLine);
+
+    // Each row's searchable text: every cell's text and drawn text.
+    const haystacks = rows.map((row) =>
+      columns
+        .map((col, i) => cellText(row[i]) + " " + drawnText(row[i], col))
+        .join(" ")
+        .toLowerCase(),
+    );
+
+    const search = createElement("input", {
+      type: "search",
+      placeholder: "Filter rows",
+      "aria-label": "Filter rows",
+      style: {
+        width: "100%",
+        boxSizing: "border-box",
+        padding: "8px 10px",
+        marginBottom: "12px",
+        background: THEME.card,
+        color: THEME.textPrimary,
+        border: "1px solid " + THEME.border,
+        borderRadius: "6px",
+        fontSize: "13px",
+      },
+    });
+    if (rows.length >= 10) wrapper.appendChild(search);
+
+    const scroller = createElement("div", { style: { overflowX: "auto" } });
+    const table = createElement("table", {
+      style: {
+        width: "100%",
+        borderCollapse: "collapse",
+        fontFamily: THEME.fontMono,
+        fontSize: "12px",
+      },
+    });
+    const thead = document.createElement("thead");
+    const headerRow = document.createElement("tr");
+    const tbody = document.createElement("tbody");
+    thead.appendChild(headerRow);
+    table.appendChild(thead);
+    table.appendChild(tbody);
+    scroller.appendChild(table);
+    wrapper.appendChild(scroller);
+
+    const more = createElement(
+      "button",
+      {
+        type: "button",
+        style: {
+          marginTop: "12px",
+          padding: "6px 12px",
+          background: THEME.card,
+          color: THEME.accent,
+          border: "1px solid " + THEME.border,
+          borderRadius: "6px",
+          fontSize: "12px",
+          cursor: "pointer",
+        },
+      },
+      "Show more",
+    );
+    wrapper.appendChild(more);
+
+    let sortCol = -1;
+    let descending = false;
+    let shown = DATA_PAGE_SIZE;
+    const headers = [];
+
+    columns.forEach((col, ci) => {
+      const th = createElement(
+        "th",
+        {
+          scope: "col",
+          tabindex: "0",
+          style: {
+            textAlign: col.type === "number" || col.type === "money" ? "right" : "left",
+            padding: "8px 12px",
+            borderBottom: "2px solid " + THEME.border,
+            color: THEME.textSecondary,
+            fontSize: "11px",
+            textTransform: "uppercase",
+            letterSpacing: "0.5px",
+            whiteSpace: "nowrap",
+            cursor: "pointer",
+            userSelect: "none",
+          },
+        },
+        col.label,
+      );
+      function sortBy() {
+        if (sortCol === ci) {
+          descending = !descending;
+        } else {
+          sortCol = ci;
+          descending = false;
+        }
+        update();
+      }
+      th.addEventListener("click", sortBy);
+      th.addEventListener("keydown", (event) => {
+        if (event.key === " " || event.key === "Enter") {
+          event.preventDefault();
+          sortBy();
+        }
+      });
+      headers.push(th);
+      headerRow.appendChild(th);
+    });
+
+    function matchingRows() {
+      const words = search.value.toLowerCase().split(/\s+/).filter(Boolean);
+      const order = [];
+      for (let r = 0; r < rows.length; r++) {
+        if (words.every((w) => haystacks[r].includes(w))) order.push(r);
+      }
+      if (sortCol >= 0) {
+        const col = columns[sortCol];
+        const keys = new Map(order.map((r) => [r, sortKey(rows[r][sortCol], col)]));
+        order.sort((a, b) => {
+          const ka = keys.get(a);
+          const kb = keys.get(b);
+          if (ka === null && kb === null) return a - b;
+          if (ka === null) return 1;
+          if (kb === null) return -1;
+          let c = 0;
+          if (typeof ka === "number" && typeof kb === "number") c = ka - kb;
+          else c = String(ka).localeCompare(String(kb));
+          if (c === 0) return a - b;
+          return descending ? -c : c;
+        });
+      }
+      return { order, words };
+    }
+
+    function update() {
+      const { order, words } = matchingRows();
+      while (tbody.firstChild) tbody.removeChild(tbody.firstChild);
+      const visible = order.slice(0, shown);
+      for (const r of visible) {
+        const tr = document.createElement("tr");
+        columns.forEach((col, ci) => {
+          tr.appendChild(
+            createElement(
+              "td",
+              {
+                style: {
+                  padding: "8px 12px",
+                  borderBottom: "1px solid " + THEME.border,
+                  color: THEME.textPrimary,
+                  textAlign: col.type === "number" || col.type === "money" ? "right" : "left",
+                  fontWeight: col.key ? "600" : "400",
+                },
+              },
+              drawnText(rows[r][ci], col),
+            ),
+          );
+        });
+        tbody.appendChild(tr);
+      }
+      headers.forEach((th, ci) => {
+        const arrow = ci === sortCol ? (descending ? " ▼" : " ▲") : "";
+        th.textContent = columns[ci].label + arrow;
+        setSafeAttribute(
+          th,
+          "aria-sort",
+          ci === sortCol ? (descending ? "descending" : "ascending") : "none",
+        );
+      });
+
+      const n = rows.length;
+      const plural = (k) => (k === 1 ? " row" : " rows");
+      let line;
+      if (words.length === 0) {
+        if (visible.length < n) {
+          line = visible.length + " of " + n + " shown";
+          if (total > n) line += " (" + groupedNumber(total, 0) + " in all)";
+        } else if (total > n) {
+          line = "First " + n + " of " + groupedNumber(total, 0);
+        } else {
+          line = n + plural(n);
+        }
+      } else {
+        const quoted = "“" + words.join(" ") + "”";
+        line =
+          order.length === 0
+            ? "Nothing matches " + quoted
+            : order.length + " match " + quoted;
+        if (visible.length < order.length) line += " · first " + visible.length;
+      }
+      countLine.textContent = line;
+      more.style.display = visible.length < order.length ? "inline-block" : "none";
+    }
+
+    search.addEventListener("input", () => {
+      shown = DATA_PAGE_SIZE;
+      update();
+    });
+    more.addEventListener("click", () => {
+      shown += DATA_PAGE_SIZE;
+      update();
+    });
+
+    // Relations, in words.
+    const relations = Array.isArray(props.relations) ? props.relations : [];
+    for (const rel of relations) {
+      if (!rel || typeof rel !== "object" || !rel.column || !rel.table) continue;
+      const col = columns.find((c) => c.name === rel.column);
+      wrapper.appendChild(
+        dataMuted(
+          (col ? col.label : String(rel.column)) +
+            " matches " +
+            String(rel.to || rel.column) +
+            " in " +
+            String(rel.table),
+          { marginTop: "8px" },
+        ),
+      );
+    }
+
+    update();
+    return wrapper;
+  }
+
+  const SCHEMA_TYPE_WORDS = Object.freeze({
+    text: "Text",
+    number: "Whole number",
+    money: "Money",
+    date: "Date",
+    "yes-no": "Yes or no",
+  });
+
+  function relationWords(rel) {
+    const from = String(rel.from);
+    const to = String(rel.to);
+    const fromTable = from.split(".")[0];
+    const toTable = to.split(".")[0];
+    const by = " (" + from + " → " + to + ")";
+    switch (rel.kind) {
+      case "many-to-one":
+        return "Many rows in " + fromTable + " match one row in " + toTable + by;
+      case "one-to-one":
+        return "Each row in " + fromTable + " matches one row in " + toTable + by;
+      case "one-to-many":
+        return "One row in " + fromTable + " matches many rows in " + toTable + by;
+      default:
+        return from + " joins to " + to;
+    }
+  }
+
+  function renderSchema(props) {
+    const wrapper = dataPanel();
+    wrapper.appendChild(dataTitle(props.title || "Tables"));
+
+    const tables = (Array.isArray(props.tables) ? props.tables : []).filter(
+      (t) => t && typeof t === "object" && t.name,
+    );
+    const relations = (Array.isArray(props.relations) ? props.relations : []).filter(
+      (r) => r && typeof r === "object" && r.from && r.to,
+    );
+
+    for (const t of tables) {
+      const columns = Array.isArray(t.columns)
+        ? t.columns.filter((c) => c && typeof c === "object" && c.name)
+        : [];
+      const block = createElement("div", {
+        style: {
+          borderTop: "1px solid " + THEME.border,
+          padding: "12px 0",
+        },
+      });
+      block.appendChild(
+        createElement(
+          "div",
+          {
+            style: {
+              fontFamily: THEME.fontMono,
+              fontSize: "13px",
+              fontWeight: "600",
+              color: THEME.textPrimary,
+            },
+          },
+          String(t.name),
+        ),
+      );
+      const facts = [];
+      if (t.about) facts.push(String(t.about));
+      if (typeof t.rows === "number") {
+        facts.push(groupedNumber(t.rows, 0) + (t.rows === 1 ? " row" : " rows"));
+      }
+      facts.push(columns.length + (columns.length === 1 ? " column" : " columns"));
+      block.appendChild(dataMuted(facts.join(" · "), { margin: "2px 0 6px" }));
+
+      const list = createElement("ul", {
+        style: { margin: "0", paddingLeft: "18px", fontSize: "12px" },
+      });
+      for (const c of columns) {
+        const parts = [];
+        if (Object.hasOwn(SCHEMA_TYPE_WORDS, c.type)) parts.push(SCHEMA_TYPE_WORDS[c.type]);
+        if (c.key === true) parts.push("key");
+        const here = String(t.name) + "." + String(c.name);
+        for (const r of relations) {
+          if (String(r.from) === here) parts.push("joins to " + String(r.to));
+        }
+        if (c.about) parts.push(String(c.about));
+        const li = createElement("li", {
+          style: { color: THEME.textPrimary, padding: "2px 0" },
+        });
+        li.appendChild(
+          createElement("span", { style: { fontFamily: THEME.fontMono } }, String(c.name)),
+        );
+        if (parts.length > 0) {
+          li.appendChild(
+            createElement(
+              "span",
+              { style: { color: THEME.textSecondary } },
+              " — " + parts.join(", "),
+            ),
+          );
+        }
+        list.appendChild(li);
+      }
+      block.appendChild(list);
+      wrapper.appendChild(block);
+    }
+
+    if (relations.length > 0) {
+      const rels = createElement("div", {
+        style: { borderTop: "1px solid " + THEME.border, paddingTop: "12px" },
+      });
+      rels.appendChild(dataMuted("How they join", { fontWeight: "600", marginBottom: "4px" }));
+      for (const r of relations) {
+        rels.appendChild(
+          createElement(
+            "div",
+            { style: { fontSize: "12px", color: THEME.textPrimary, padding: "2px 0" } },
+            relationWords(r),
+          ),
+        );
+      }
+      wrapper.appendChild(rels);
+    }
+    return wrapper;
+  }
+
+  // Flattens a plan's steps, top first, with their depth (at most 12 deep
+  // and 100 steps, as the compiler checks).
+  function planSteps(steps, depth, out) {
+    if (!Array.isArray(steps) || depth > 12) return out;
+    for (const step of steps) {
+      if (out.length >= 100) break;
+      if (!step || typeof step !== "object") continue;
+      out.push({ step: step, depth: depth });
+      planSteps(step.children, depth + 1, out);
+    }
+    return out;
+  }
+
+  function renderQueryPlan(props) {
+    const wrapper = dataPanel();
+    if (props.title) wrapper.appendChild(dataTitle(props.title));
+    if (props.engine) wrapper.appendChild(dataMuted(String(props.engine)));
+    if (props.summary) {
+      wrapper.appendChild(
+        createElement(
+          "div",
+          { style: { fontSize: "13px", color: THEME.textPrimary, margin: "6px 0" } },
+          String(props.summary),
+        ),
+      );
+    }
+
+    const flat = planSteps(props.steps, 0, []);
+    // Shares are of the total time when any step has one, else of cost.
+    const measure = flat.some((f) => typeof f.step.time === "number") ? "time" : "cost";
+    let sum = 0;
+    for (const f of flat) {
+      if (typeof f.step[measure] === "number") sum += f.step[measure];
+    }
+    const shares = flat.map((f) =>
+      sum > 0 && typeof f.step[measure] === "number"
+        ? Math.round((f.step[measure] / sum) * 100)
+        : null,
+    );
+    let slowest = -1;
+    if (shares.filter((s) => s !== null).length >= 2) {
+      shares.forEach((s, i) => {
+        if (s !== null && (slowest < 0 || s > shares[slowest])) slowest = i;
+      });
+    }
+
+    const list = createElement("div", {
+      style: { display: "flex", flexDirection: "column", marginTop: "8px" },
+    });
+    flat.forEach((f, i) => {
+      const step = f.step;
+      const row = createElement("div", {
+        style: {
+          padding: "8px 0 8px " + f.depth * 18 + "px",
+          borderTop: i === 0 ? "none" : "1px solid " + THEME.border,
+        },
+      });
+      const top = createElement("div", {
+        style: { display: "flex", gap: "8px", alignItems: "baseline", flexWrap: "wrap" },
+      });
+      top.appendChild(
+        createElement(
+          "span",
+          { style: { fontSize: "13px", fontWeight: "600", color: THEME.textPrimary } },
+          (f.depth > 0 ? "└ " : "") + String(step.label || ""),
+        ),
+      );
+      const facts = [];
+      if (typeof step.rows === "number") {
+        facts.push(groupedNumber(step.rows, 0) + (step.rows === 1 ? " row" : " rows"));
+      }
+      if (typeof step.time === "number") facts.push(step.time + " ms");
+      if (typeof step.cost === "number") facts.push("cost " + step.cost);
+      if (shares[i] !== null) facts.push(shares[i] + "%");
+      if (facts.length > 0) {
+        top.appendChild(
+          createElement(
+            "span",
+            { style: { fontSize: "12px", color: THEME.textSecondary, fontFamily: THEME.fontMono } },
+            facts.join(" · "),
+          ),
+        );
+      }
+      if (i === slowest) {
+        top.appendChild(
+          createElement(
+            "span",
+            { style: { fontSize: "11px", fontWeight: "600", color: THEME.warning } },
+            "Slowest step",
+          ),
+        );
+      }
+      row.appendChild(top);
+      if (shares[i] !== null) {
+        const track = createElement("div", {
+          style: {
+            height: "4px",
+            background: THEME.card,
+            borderRadius: "2px",
+            marginTop: "4px",
+            maxWidth: "240px",
+          },
+        });
+        track.appendChild(
+          createElement("div", {
+            style: {
+              height: "4px",
+              width: Math.max(0, Math.min(100, shares[i])) + "%",
+              background: i === slowest ? THEME.warning : THEME.accent,
+              borderRadius: "2px",
+            },
+          }),
+        );
+        row.appendChild(track);
+      }
+      if (step.detail) {
+        row.appendChild(
+          dataMuted(String(step.detail), { fontFamily: THEME.fontMono, marginTop: "4px" }),
+        );
+      }
+      if (step.note) {
+        row.appendChild(dataMuted(String(step.note), { marginTop: "2px" }));
+      }
+      list.appendChild(row);
+    });
+    wrapper.appendChild(list);
+
+    if (props.query) {
+      const details = createElement("details", { style: { marginTop: "12px" } });
+      details.appendChild(
+        createElement(
+          "summary",
+          { style: { fontSize: "12px", color: THEME.accent, cursor: "pointer" } },
+          "Show the query",
+        ),
+      );
+      details.appendChild(
+        createElement(
+          "pre",
+          {
+            style: {
+              margin: "8px 0 0",
+              padding: "12px",
+              background: THEME.card,
+              borderRadius: "6px",
+              fontFamily: THEME.fontMono,
+              fontSize: "12px",
+              color: THEME.textPrimary,
+              whiteSpace: "pre-wrap",
+              overflowX: "auto",
+            },
+          },
+          String(props.query),
+        ),
+      );
+      wrapper.appendChild(details);
+    }
+    return wrapper;
   }
 
   // ---------------------------------------------------------------------------
