@@ -755,3 +755,29 @@ func TestContainsUIIntent_Race(t *testing.T) {
 	wg.Wait()
 	// Race detector validates no concurrent write issues.
 }
+
+// A model sometimes sends the spec as JSON text: the tools read it as the
+// object it holds, and still refuse text that isn't one.
+func TestUIAppTools_SpecAsText(t *testing.T) {
+	provider := &mockAppProvider{
+		infos: []apps.AppInfo{{Name: "my-app", URI: "ui://loom/my-app", DisplayName: "My App", Dynamic: true}},
+		html:  map[string][]byte{"my-app": []byte("<html>v1</html>")},
+	}
+	tools := UIAppTools(&mockAppCompiler{}, provider)
+	text := `{"version": "1.0", "title": "From text", "components": [{"type": "text", "props": {"content": "hi"}}]}`
+
+	created, err := tools[0].Execute(context.Background(), map[string]interface{}{"name": "from-text", "spec": text})
+	require.NoError(t, err)
+	assert.True(t, created.Success, "%v", created.Error)
+
+	updated, err := tools[2].Execute(context.Background(), map[string]interface{}{"name": "my-app", "spec": "  " + text + "\n"})
+	require.NoError(t, err)
+	assert.True(t, updated.Success, "%v", updated.Error)
+
+	for _, bad := range []string{"", "not json", `["a list"]`, "null"} {
+		result, err := tools[0].Execute(context.Background(), map[string]interface{}{"name": "bad-text", "spec": bad})
+		require.NoError(t, err)
+		assert.False(t, result.Success, bad)
+		assert.Equal(t, "INVALID_PARAMS", result.Error.Code, bad)
+	}
+}

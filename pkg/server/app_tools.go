@@ -281,7 +281,7 @@ func (t *createUIAppTool) Execute(ctx context.Context, params map[string]interfa
 	}
 
 	// Extract spec
-	specMap, ok := params["spec"].(map[string]interface{})
+	specMap, ok := specParam(params)
 	if !ok || specMap == nil {
 		return &shuttle.Result{
 			Success:         false,
@@ -476,7 +476,7 @@ func (t *updateUIAppTool) Execute(ctx context.Context, params map[string]interfa
 		}, nil
 	}
 
-	specMap, ok := params["spec"].(map[string]interface{})
+	specMap, ok := specParam(params)
 	if !ok || specMap == nil {
 		return &shuttle.Result{
 			Success:         false,
@@ -625,4 +625,21 @@ func mapToUIAppSpec(m map[string]interface{}) (*loomv1.UIAppSpec, error) {
 	}
 
 	return spec, nil
+}
+
+// specParam is the "spec" argument as an object. Models sometimes send it
+// as JSON text instead of an object; text that holds one object is read as
+// that object rather than refused.
+func specParam(params map[string]interface{}) (map[string]interface{}, bool) {
+	switch v := params["spec"].(type) {
+	case map[string]interface{}:
+		return v, v != nil
+	case string:
+		var m map[string]interface{}
+		if err := json.Unmarshal([]byte(strings.TrimSpace(v)), &m); err != nil || m == nil {
+			return nil, false
+		}
+		return m, true
+	}
+	return nil, false
 }
