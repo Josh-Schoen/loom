@@ -253,22 +253,27 @@ install: build install-patterns install-docs
     echo "Connect with the TUI:"
     echo "  loom"
 
-# Build the iOS framework from pkg/mobile (macOS with Xcode only).
+# Build the Apple framework from pkg/mobile (macOS with Xcode only).
+# targets is a gomobile target list, e.g. "ios,iossimulator,macos".
 # gomobile and gobind are pinned as module tools in go.mod.
-build-ios-framework ios_version="16.0":
+build-apple-framework targets="ios,iossimulator" ios_version="16.0":
     #!/usr/bin/env bash
     set -euo pipefail
     mkdir -p bin/tools
     GOWORK=off go build -o bin/tools/gobind golang.org/x/mobile/cmd/gobind
     PATH="$PWD/bin/tools:$PATH" GOWORK=off go tool gomobile bind \
         -tags fts5 -ldflags "-s -w" \
-        -target ios,iossimulator -iosversion {{ios_version}} \
+        -target {{targets}} -iosversion {{ios_version}} \
         -prefix Loom -o bin/LoomMobile.xcframework ./pkg/mobile
-    echo "✅ Built bin/LoomMobile.xcframework"
+    echo "✅ Built bin/LoomMobile.xcframework ({{targets}})"
 
-# Run one agent turn of the example app in the booted iOS simulator
-run-ios-example ios_version="16.0": (build-ios-framework ios_version)
-    examples/ios-embedding/run-simulator.sh {{ios_version}}
+# Run the example app in the booted iOS simulator (model: scripted or on-device)
+run-ios-example ios_version="16.0" model="scripted": (build-apple-framework "ios,iossimulator" ios_version)
+    examples/ios-embedding/run-simulator.sh {{ios_version}} {{model}}
+
+# Run the example on this Mac with Apple's on-device model (macOS 26+)
+run-macos-example: (build-apple-framework "macos")
+    examples/ios-embedding/run-macos.sh
 
 # Build MCP bridge binary
 build-mcp: proto

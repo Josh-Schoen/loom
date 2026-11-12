@@ -216,7 +216,7 @@ See `pkg/skills/`.
 
 ### iOS Embedding
 
-⚠️ Partial. `pkg/mobile` runs an agent inside an iOS app with no server: the app links a gomobile-built framework and supplies the model and tools through callbacks, while the engine runs the agent loop and stores sessions in SQLite. Verified in the iOS simulator only; not yet run on a physical device, and Loom's own LLM providers are not exposed through it. See [docs/guides/ios-embedding.md](docs/guides/ios-embedding.md).
+⚠️ Partial. `pkg/mobile` runs an agent inside an iOS app with no server: the app links a gomobile-built framework and supplies the model and tools through callbacks, while the engine runs the agent loop and stores sessions in SQLite. The example includes a provider for Apple's on-device model. Verified in the iOS simulator (scripted model) and on macOS (on-device model); not yet run on a physical iPhone, and Loom's own LLM providers are not exposed through it. See [docs/guides/ios-embedding.md](docs/guides/ios-embedding.md).
 
 ### Per-Role LLM Providers
 

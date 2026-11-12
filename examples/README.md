@@ -28,7 +28,7 @@ loom chat --thread=weaver "hi there"
 examples/
 ├── backends/           # Backend integration configurations
 ├── config/             # Server configurations
-├── ios-embedding/      # Swift app that runs an agent in-process (⚠️ simulator only)
+├── ios-embedding/      # Swift app that runs an agent in-process (⚠️ simulator and macOS only)
 ├── patterns/           # Pattern libraries (domain knowledge)
 └── reference/          # Reference implementations and examples
     ├── agents/         # Agent configurations

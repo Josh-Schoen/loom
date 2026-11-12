@@ -3,10 +3,14 @@
 # booted iOS simulator and prints what the app reported. Exits non-zero unless
 # the app completed an agent turn.
 #
-# Usage: run-simulator.sh [minimum iOS version]
+# Usage: run-simulator.sh [minimum iOS version] [scripted|on-device]
+#
+# The model defaults to the scripted stand-in. "on-device" selects Apple's
+# on-device model, which needs a simulator and host that can serve it.
 set -euo pipefail
 
 ios_version="${1:-16.0}"
+model="${2:-scripted}"
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 example_dir="$repo_root/examples/ios-embedding"
 framework_dir="$repo_root/bin/LoomMobile.xcframework/ios-arm64_x86_64-simulator"
@@ -15,7 +19,7 @@ bundle_id="com.teradata.loom.demo"
 wait_seconds=60
 
 if [[ ! -d "$framework_dir" ]]; then
-    echo "error: $framework_dir not found; run 'just build-ios-framework' first" >&2
+    echo "error: $framework_dir not found; run 'just build-apple-framework' first" >&2
     exit 1
 fi
 if ! xcrun simctl list devices booted | grep -q "(Booted)"; then
@@ -32,14 +36,14 @@ xcrun --sdk iphonesimulator swiftc \
     -parse-as-library \
     -target "$(uname -m)-apple-ios${ios_version}-simulator" \
     -F "$framework_dir" -framework LoomMobile -lresolv \
-    "$example_dir/LoomDemo/main.swift" \
+    "$example_dir"/Shared/*.swift "$example_dir/LoomDemo/main.swift" \
     -o "$app_dir/LoomDemo"
 codesign --sign - --force "$app_dir" >/dev/null 2>&1
 
 log="$(mktemp -t loom-demo)"
 trap 'rm -f "$log"' EXIT
 xcrun simctl install booted "$app_dir"
-xcrun simctl launch --console-pty --terminate-running-process booted "$bundle_id" >"$log" 2>&1 &
+SIMCTL_CHILD_LOOM_DEMO_MODEL="$model" xcrun simctl launch --console-pty --terminate-running-process booted "$bundle_id" >"$log" 2>&1 &
 launch_pid=$!
 
 for ((i = 0; i < wait_seconds; i++)); do

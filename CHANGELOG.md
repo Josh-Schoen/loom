@@ -9,11 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-#### iOS embedding: run an agent inside an app (`pkg/mobile`) — ⚠️ simulator only
+#### iOS embedding: run an agent inside an app (`pkg/mobile`) — ⚠️ simulator and macOS only
 - **`pkg/mobile` runs one agent in-process, with no `looms` server.** It is written to be bound with gomobile: `NewEngine`, `RegisterTool`, `Weave`, `StreamWeave` and `Close` take and return proto3 JSON strings. The host application supplies the model (`ModelProvider`) and the tools (`HostTool`) through callbacks; the engine runs the agent loop, persists sessions to SQLite under the configured `data_dir` and, with `enable_tracing`, writes spans to a local trace database.
 - **Contract in `proto/loom/v1/mobile.proto`.** `MobileEngineConfig`, `HostModelRequest`, `HostModelResponse`, `HostModelMessage`, `HostToolCall` and `HostToolSpec`. Turns reuse `WeaveRequest`, `WeaveResponse` and `WeaveProgress`, served by the existing `pkg/server` code called in-process.
 - **Config is a checked subset of `AgentConfig`.** `name`, `description`, `system_prompt`, `rom` and the `behavior` limits `max_turns`, `max_tool_executions` and `max_iterations` are applied. A config that sets any other `AgentConfig` or `BehaviorConfig` field is rejected with an error naming the field.
-- **`just build-ios-framework` and `just run-ios-example`.** The first writes `bin/LoomMobile.xcframework` (device and simulator slices); the second builds `examples/ios-embedding/LoomDemo`, a Swift app with a scripted model and one tool, and runs it in the booted simulator. gomobile and gobind are pinned as module tools in `go.mod`.
+- **`just build-apple-framework`, `just run-ios-example` and `just run-macos-example`.** The first writes `bin/LoomMobile.xcframework` for a gomobile target list (iOS device and simulator by default). The second builds `examples/ios-embedding/LoomDemo`, a Swift app, and runs three turns in the booted simulator with a scripted model. The third runs the same turns on the Mac with Apple's on-device model. gomobile and gobind are pinned as module tools in `go.mod`.
+- **Example provider for Apple's on-device model.** `examples/ios-embedding/Shared/OnDeviceModel.swift` implements `ModelProvider` on the FoundationModels framework (iOS 26 / macOS 26 and later). It presents Loom's tools to the model, hands each tool call back to Loom to execute, and converts tool JSON Schemas made of objects, arrays, strings, numbers, integers and booleans. Verified on macOS 26 only: in the iOS 27.0 simulator on a macOS 26 host every generation fails for lack of model assets.
 - **Not done.** No run on a physical device; Loom's own LLM providers are not exposed through this API; image content is not carried to the host model; Android is not built. See `docs/guides/ios-embedding.md`.
 
 #### Third-party license notices ship with every release

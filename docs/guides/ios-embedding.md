@@ -1,6 +1,6 @@
 # iOS Embedding Guide
 
-> **Note:** Added after v1.4.0. ⚠️ Partial: verified in the iOS simulator only. It has not been run on a physical device.
+> **Note:** Added after v1.4.0. ⚠️ Partial: the engine is verified in the iOS simulator and on macOS. It has not been run on a physical iPhone, and Apple's on-device model has been verified on macOS only.
 
 ## Table of Contents
 
@@ -10,6 +10,7 @@
 - [Common Tasks](#common-tasks)
   - [Create an engine](#task-create-an-engine)
   - [Supply the model](#task-supply-the-model)
+  - [Use Apple's on-device model](#task-use-apples-on-device-model)
   - [Add a tool](#task-add-a-tool)
   - [Run a turn](#task-run-a-turn)
   - [Shut down](#task-shut-down)
@@ -28,8 +29,10 @@ Status:
 - ✅ Session persistence across app launches
 - ✅ Progress streaming
 - ✅ Optional tracing to a local SQLite trace database
-- ⚠️ iOS simulator verified; physical device not yet run
-- 📋 Model providers that ship with the framework (the host writes its own today)
+- ✅ Example provider for Apple's on-device model, verified on macOS 26
+- ⚠️ iOS simulator verified with a scripted model; physical device not yet run
+- ⚠️ On-device model in the iOS simulator: fails where the simulator has no model assets (see [Limitations](#limitations))
+- 📋 Model providers that ship with the framework (the host writes its own, or copies the example)
 - 📋 Android
 
 Turns use the same `WeaveRequest`, `WeaveResponse` and `WeaveProgress` messages as the gRPC API. The messages specific to embedding are in `proto/loom/v1/mobile.proto`. Every message crosses between Swift and the engine as proto3 JSON, with the field names written in the `.proto` files.
@@ -55,24 +58,43 @@ Expected output:
 
 ```
 LOOM_DEMO_BEGIN
+model: scripted / scripted-1
 stream stages: EXECUTION_STAGE_LLM_GENERATION > EXECUTION_STAGE_TOOL_EXECUTION > EXECUTION_STAGE_LLM_GENERATION > EXECUTION_STAGE_COMPLETED
-stream answer: Trail facts: {"result":{"aspect":"NE","length_m":1200,"max_pitch_deg":34,"trail":"[...] Corbet's Couloir"}}
-weave answer: Trail facts: {"result":{"aspect":"NE","length_m":1200,"max_pitch_deg":34,"trail":"[...] Rendezvous Bowl"}}
+stream answer: Trail facts: {"result":{"aspect":"NE","length_m":1200,"max_pitch_deg":34,"trail":"[...] How steep is Corbet's Couloir?"}}
+weave answer: Trail facts: {"result":{"aspect":"NE","length_m":1200,"max_pitch_deg":34,"trail":"[...] Which way does Rendezvous Bowl face?"}}
 failed tool answer: The lookup failed: trail is closed
 data directory: sessions.db, sessions.db-shm, sessions.db-wal, tool_results, traces.db, traces.db-shm, traces.db-wal
 LOOM_DEMO_OK
 LOOM_DEMO_END
 ```
 
-The example's model is a scripted stand-in written in Swift, so the run needs no API key and makes no network call.
+This run uses a scripted stand-in for the model, written in Swift, so it needs no API key and makes no network call.
+
+To run the same demo on your Mac with Apple's on-device model (macOS 26 or later with Apple Intelligence enabled):
+
+```bash
+just run-macos-example
+```
+
+Expected output (the wording of the answers varies between runs):
+
+```
+model: apple-on-device / system-language-model
+stream stages: EXECUTION_STAGE_LLM_GENERATION > EXECUTION_STAGE_TOOL_EXECUTION > EXECUTION_STAGE_LLM_GENERATION > EXECUTION_STAGE_COMPLETED
+stream answer: Corbet's Couloir has a maximum pitch of 34 degrees.
+weave answer: Rendezvous Bowl faces north-east.
+failed tool answer: Closed Run is closed.
+data directory: sessions.db, sessions.db-shm, sessions.db-wal, tool_results, traces.db, traces.db-shm, traces.db-wal
+LOOM_DEMO_OK
+```
 
 To build only the framework:
 
 ```bash
-just build-ios-framework
+just build-apple-framework
 ```
 
-This writes `bin/LoomMobile.xcframework`. Add it to an Xcode target under "Frameworks, Libraries, and Embedded Content", then `import LoomMobile`. To target a different minimum iOS version, pass it: `just build-ios-framework 17.0`.
+This writes `bin/LoomMobile.xcframework` with iOS device and simulator slices. Add it to an Xcode target under "Frameworks, Libraries, and Embedded Content", then `import LoomMobile`. The recipe takes a gomobile target list and a minimum iOS version, for example `just build-apple-framework "ios,iossimulator,macos" 17.0`. Each build replaces the framework, so name every slice you need in one call.
 
 ## Common Tasks
 
@@ -142,6 +164,25 @@ To report a failure, set `error.pointee` to an `NSError`; the turn fails with th
 
 Do not ship a model API key inside the app. Route cloud model calls through a server you control.
 
+### Task: Use Apple's on-device model
+
+`examples/ios-embedding/Shared/OnDeviceModel.swift` is a `ModelProvider` backed by the FoundationModels framework (iOS 26 / macOS 26 and later). Copy it into your app, check availability, and pass it to the engine:
+
+```swift
+if #available(iOS 26.0, *), OnDeviceModel.unavailableReason == nil {
+    engine = LoomMobileNewEngine(config, OnDeviceModel(), &error)
+}
+```
+
+How it works: Loom runs tools itself, while a FoundationModels session expects to run them. The provider presents each Loom tool to the session as a tool that records the call and stops the session, returns that call to Loom, and on the next call rebuilds the session history including the tool result.
+
+Things to know:
+
+- It converts each tool's JSON Schema to a generation schema. Objects, arrays, strings (including enums), numbers, integers and booleans are covered. A schema using anything else, such as `anyOf`, fails the model call with an error naming the tool.
+- After tool results it asks the model to continue with a fixed prompt (`OnDeviceModel.continuationPrompt`), because a session only generates in response to a prompt.
+- It reports no token usage.
+- The on-device model has a small context window. Long system prompts, many tools or long conversations can exceed it.
+
 ### Task: Add a tool
 
 Implement `LoomMobileHostToolProtocol` and register it before running turns.
@@ -199,14 +240,17 @@ try engine.close()
 
 ## Examples
 
-### Example: Swift app with a scripted model and one tool
+### Example: one demo, two models
 
-`examples/ios-embedding/LoomDemo/main.swift` is the app that `just run-ios-example` builds and runs. It implements the model, a tool and a progress listener in Swift, runs one streamed turn, one plain turn and one turn whose tool call fails, and prints what it stored in its data directory.
+`examples/ios-embedding/Shared/DemoSupport.swift` holds the demo: a tool, a progress listener, a scripted model and three turns (one streamed, one plain, one whose tool call fails). `LoomDemo/main.swift` wraps it in a SwiftUI app for `just run-ios-example`; `MacDemo/main.swift` runs it from the command line with `OnDeviceModel` for `just run-macos-example`.
+
+To try the on-device model in the simulator, pass the model name: `just run-ios-example 16.0 on-device`. See [Limitations](#limitations) for what to expect.
 
 ## Limitations
 
-- **Simulator only so far.** The device slice of the framework builds, but no run on a physical iPhone has been done.
-- **No bundled model providers.** Loom's Anthropic, Bedrock, OpenAI and other providers are not exposed through this API. The host implements the model call.
+- **No physical device run.** The device slice of the framework builds, but nothing has been run on a physical iPhone.
+- **On-device model verified on macOS only.** In the iOS 27.0 simulator on a macOS 26 host, the model reports itself available and then every generation fails with "no underlying assets ... com.apple.modelcatalog". The same provider source completes all three demo turns on macOS. It has not been run on an iPhone.
+- **No bundled model providers.** Loom's Anthropic, Bedrock, OpenAI and other providers are not exposed through this API. The host implements the model call or copies the on-device example.
 - **Text only.** Image content blocks are not carried to the host model.
 - **Callbacks must be thread-safe.** The engine can call the model and tools from several threads at once.
 - **Foreground only.** iOS suspends an app shortly after it leaves the screen, which pauses a turn in progress.
@@ -227,6 +271,10 @@ Pass the full path of a directory in the app container, for example one under Ap
 ### `invalid request: ... unknown field`
 
 A field name in the request JSON is misspelled. Names are the ones in the `.proto` files (`session_id`, `query`).
+
+### `on-device model: Model Catalog error ... no underlying assets`
+
+The simulator has no on-device model assets to run. Use the scripted model in the simulator (`just run-ios-example`) and test the on-device model with `just run-macos-example` or on a device.
 
 ### `error: no booted iOS simulator`
 
