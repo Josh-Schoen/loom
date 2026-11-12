@@ -7,6 +7,9 @@
 #
 # The model defaults to the scripted stand-in. "on-device" selects Apple's
 # on-device model, which needs a simulator and host that can serve it.
+#
+# LOOM_SIM_DEVICE selects the simulator by name or UDID when more than one is
+# booted. It defaults to "booted".
 set -euo pipefail
 
 ios_version="${1:-16.0}"
@@ -16,7 +19,8 @@ example_dir="$repo_root/examples/ios-embedding"
 framework_dir="$repo_root/bin/LoomMobile.xcframework/ios-arm64_x86_64-simulator"
 app_dir="$repo_root/bin/LoomDemo.app"
 bundle_id="com.teradata.loom.demo"
-wait_seconds=60
+wait_seconds=120
+device="${LOOM_SIM_DEVICE:-booted}"
 
 if [[ ! -d "$framework_dir" ]]; then
     echo "error: $framework_dir not found; run 'just build-apple-framework' first" >&2
@@ -42,8 +46,8 @@ codesign --sign - --force "$app_dir" >/dev/null 2>&1
 
 log="$(mktemp -t loom-demo)"
 trap 'rm -f "$log"' EXIT
-xcrun simctl install booted "$app_dir"
-SIMCTL_CHILD_LOOM_DEMO_MODEL="$model" xcrun simctl launch --console-pty --terminate-running-process booted "$bundle_id" >"$log" 2>&1 &
+xcrun simctl install "$device" "$app_dir"
+SIMCTL_CHILD_LOOM_DEMO_MODEL="$model" xcrun simctl launch --console-pty --terminate-running-process "$device" "$bundle_id" >"$log" 2>&1 &
 launch_pid=$!
 
 for ((i = 0; i < wait_seconds; i++)); do
@@ -52,7 +56,7 @@ for ((i = 0; i < wait_seconds; i++)); do
     fi
     sleep 1
 done
-xcrun simctl terminate booted "$bundle_id" >/dev/null 2>&1 || true
+xcrun simctl terminate "$device" "$bundle_id" >/dev/null 2>&1 || true
 wait "$launch_pid" 2>/dev/null || true
 
 sed -n '/LOOM_DEMO_BEGIN/,/LOOM_DEMO_END/p' "$log"

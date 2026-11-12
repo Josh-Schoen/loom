@@ -1,6 +1,6 @@
 # iOS Embedding Example
 
-⚠️ Partial: the engine is verified in the iOS simulator and on macOS, not on a physical iPhone.
+⚠️ Partial: verified in the iOS simulator and on macOS, not on a physical iPhone.
 
 A demo that runs a Loom agent in-process through `pkg/mobile`, with the model, one tool and a progress listener implemented in Swift.
 
@@ -24,6 +24,6 @@ Files:
 - `MacDemo/main.swift` — command-line entry point for macOS
 - `run-simulator.sh`, `run-macos.sh` — build against `bin/LoomMobile.xcframework`, run, and print the demo's report
 
-The on-device model does not generate in an iOS 27 simulator on a macOS 26 host, because the simulator hands generation to the Mac and the Mac's older model rejects the request; see the guide's Limitations.
+The on-device model also runs in the simulator (`just run-ios-example 16.0 on-device`) when the simulator's iOS version is not newer than the Mac's macOS version: it works in an iOS 26.5 simulator on macOS 26.6 and fails in iOS 27 simulators on that host. See the guide's Limitations.
 
 See [docs/guides/ios-embedding.md](../../docs/guides/ios-embedding.md).

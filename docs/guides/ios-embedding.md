@@ -1,6 +1,6 @@
 # iOS Embedding Guide
 
-> **Note:** Added after v1.4.0. ⚠️ Partial: the engine is verified in the iOS simulator and on macOS. It has not been run on a physical iPhone, and Apple's on-device model has been verified on macOS only.
+> **Note:** Added after v1.4.0. ⚠️ Partial: the engine and the on-device model provider are verified in the iOS simulator and on macOS. Nothing has been run on a physical iPhone.
 
 ## Table of Contents
 
@@ -29,8 +29,8 @@ Status:
 - ✅ Session persistence across app launches
 - ✅ Progress streaming
 - ✅ Optional tracing to a local SQLite trace database
-- ✅ Example provider for Apple's on-device model, verified on macOS 26
-- ⚠️ iOS simulator verified with a scripted model; physical device not yet run
+- ✅ Example provider for Apple's on-device model, verified on macOS 26.6 and in an iOS 26.5 simulator
+- ⚠️ Physical device not yet run
 - ⚠️ On-device model in the iOS simulator: fails when the simulator's iOS version is newer than the Mac's macOS version (see [Limitations](#limitations))
 - 📋 Model providers that ship with the framework (the host writes its own, or copies the example)
 - 📋 Android
@@ -244,12 +244,18 @@ try engine.close()
 
 `examples/ios-embedding/Shared/DemoSupport.swift` holds the demo: a tool, a progress listener, a scripted model and three turns (one streamed, one plain, one whose tool call fails). `LoomDemo/main.swift` wraps it in a SwiftUI app for `just run-ios-example`; `MacDemo/main.swift` runs it from the command line with `OnDeviceModel` for `just run-macos-example`.
 
-To try the on-device model in the simulator, pass the model name: `just run-ios-example 16.0 on-device`. See [Limitations](#limitations) for what to expect.
+To run the on-device model in the simulator, pass the model name:
+
+```bash
+just run-ios-example 16.0 on-device
+```
+
+The simulator's iOS version must not be newer than the Mac's macOS version; see [Limitations](#limitations). When more than one simulator is booted, name the one to use with `LOOM_SIM_DEVICE=<name or UDID>`.
 
 ## Limitations
 
 - **No physical device run.** The device slice of the framework builds, but nothing has been run on a physical iPhone.
-- **On-device model verified on macOS only.** The iOS simulator does not run the model itself; it sends each generation to the Mac's model. With iOS 27.0 and 27.1 simulators on a macOS 26.6 host, the model reports itself available and then every generation fails. The simulator's log shows the Mac rejecting the request: `InferenceError::hostFailed ... Encountered an unknown special token: com.apple.fm.language.safety_guardrail`. The newer simulator formats prompts with a token the older Mac model does not know. Changing the guardrails or use case does not avoid it. A simulator whose iOS version matches the Mac's macOS version is expected to work but has not been tried. The same provider source completes all three demo turns on macOS, and it has not been run on an iPhone.
+- **On-device model needs a simulator no newer than the Mac.** The iOS simulator does not run the model itself; it sends each generation to the Mac's model. On a macOS 26.6 host the provider completes all three demo turns in an iOS 26.5 simulator and on macOS. In iOS 27.0 and 27.1 simulators on the same host, the model reports itself available and then every generation fails; the simulator's log shows the Mac rejecting the request with `InferenceError::hostFailed ... Encountered an unknown special token: com.apple.fm.language.safety_guardrail`. Changing the guardrails or use case does not avoid it. The provider has not been run on an iPhone.
 - **No bundled model providers.** Loom's Anthropic, Bedrock, OpenAI and other providers are not exposed through this API. The host implements the model call or copies the on-device example.
 - **Text only.** Image content blocks are not carried to the host model.
 - **Callbacks must be thread-safe.** The engine can call the model and tools from several threads at once.
@@ -280,7 +286,16 @@ The simulator sends generation to the Mac, and the Mac's model is older than the
 xcrun simctl spawn booted log show --last 2m --predicate 'process == "modelmanagerd" AND eventMessage CONTAINS "hostFailed"'
 ```
 
-A line containing `Encountered an unknown special token` means the iOS simulator is newer than the Mac's macOS. Use a simulator runtime that matches the Mac's OS version, or update macOS. Until then, use the scripted model in the simulator (`just run-ios-example`) and test the on-device model with `just run-macos-example` or on a device.
+A line containing `Encountered an unknown special token` means the iOS simulator is newer than the Mac's macOS. Install a simulator runtime from the Mac's OS generation and run there, or update macOS:
+
+```bash
+xcodebuild -downloadPlatform iOS -buildVersion 26.5
+xcrun simctl create "iPhone 17 (iOS 26.5)" "iPhone 17" com.apple.CoreSimulator.SimRuntime.iOS-26-5
+xcrun simctl boot "iPhone 17 (iOS 26.5)"
+LOOM_SIM_DEVICE="iPhone 17 (iOS 26.5)" examples/ios-embedding/run-simulator.sh 16.0 on-device
+```
+
+On a macOS 26.6 host, iOS 26.6 was not offered for download and iOS 26.5 worked.
 
 ### `error: no booted iOS simulator`
 
