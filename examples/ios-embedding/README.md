@@ -24,6 +24,6 @@ Files:
 - `MacDemo/main.swift` — command-line entry point for macOS
 - `run-simulator.sh`, `run-macos.sh` — build against `bin/LoomMobile.xcframework`, run, and print the demo's report
 
-The on-device model does not generate in the iOS 27.0 simulator on a macOS 26 host; see the guide's Limitations.
+The on-device model does not generate in an iOS 27 simulator on a macOS 26 host, because the simulator hands generation to the Mac and the Mac's older model rejects the request; see the guide's Limitations.
 
 See [docs/guides/ios-embedding.md](../../docs/guides/ios-embedding.md).

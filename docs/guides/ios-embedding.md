@@ -31,7 +31,7 @@ Status:
 - ✅ Optional tracing to a local SQLite trace database
 - ✅ Example provider for Apple's on-device model, verified on macOS 26
 - ⚠️ iOS simulator verified with a scripted model; physical device not yet run
-- ⚠️ On-device model in the iOS simulator: fails where the simulator has no model assets (see [Limitations](#limitations))
+- ⚠️ On-device model in the iOS simulator: fails when the simulator's iOS version is newer than the Mac's macOS version (see [Limitations](#limitations))
 - 📋 Model providers that ship with the framework (the host writes its own, or copies the example)
 - 📋 Android
 
@@ -249,7 +249,7 @@ To try the on-device model in the simulator, pass the model name: `just run-ios-
 ## Limitations
 
 - **No physical device run.** The device slice of the framework builds, but nothing has been run on a physical iPhone.
-- **On-device model verified on macOS only.** In the iOS 27.0 simulator on a macOS 26 host, the model reports itself available and then every generation fails with "no underlying assets ... com.apple.modelcatalog". The same provider source completes all three demo turns on macOS. It has not been run on an iPhone.
+- **On-device model verified on macOS only.** The iOS simulator does not run the model itself; it sends each generation to the Mac's model. With iOS 27.0 and 27.1 simulators on a macOS 26.6 host, the model reports itself available and then every generation fails. The simulator's log shows the Mac rejecting the request: `InferenceError::hostFailed ... Encountered an unknown special token: com.apple.fm.language.safety_guardrail`. The newer simulator formats prompts with a token the older Mac model does not know. Changing the guardrails or use case does not avoid it. A simulator whose iOS version matches the Mac's macOS version is expected to work but has not been tried. The same provider source completes all three demo turns on macOS, and it has not been run on an iPhone.
 - **No bundled model providers.** Loom's Anthropic, Bedrock, OpenAI and other providers are not exposed through this API. The host implements the model call or copies the on-device example.
 - **Text only.** Image content blocks are not carried to the host model.
 - **Callbacks must be thread-safe.** The engine can call the model and tools from several threads at once.
@@ -272,9 +272,15 @@ Pass the full path of a directory in the app container, for example one under Ap
 
 A field name in the request JSON is misspelled. Names are the ones in the `.proto` files (`session_id`, `query`).
 
-### `on-device model: Model Catalog error ... no underlying assets`
+### On-device model fails in the simulator with `LanguageModelError error -1` or `no underlying assets`
 
-The simulator has no on-device model assets to run. Use the scripted model in the simulator (`just run-ios-example`) and test the on-device model with `just run-macos-example` or on a device.
+The simulator sends generation to the Mac, and the Mac's model is older than the simulator expects. Confirm it in the simulator's log:
+
+```bash
+xcrun simctl spawn booted log show --last 2m --predicate 'process == "modelmanagerd" AND eventMessage CONTAINS "hostFailed"'
+```
+
+A line containing `Encountered an unknown special token` means the iOS simulator is newer than the Mac's macOS. Use a simulator runtime that matches the Mac's OS version, or update macOS. Until then, use the scripted model in the simulator (`just run-ios-example`) and test the on-device model with `just run-macos-example` or on a device.
 
 ### `error: no booted iOS simulator`
 
