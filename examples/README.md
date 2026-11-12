@@ -2,7 +2,7 @@
 
 Configuration examples for Loom agents, workflows, backends, and patterns.
 
-**All examples are YAML-based** - No Go code required for these configurations.
+**All examples are YAML-based** - No Go code required for these configurations. The one exception is `ios-embedding/`, a Swift app.
 
 ## Quick Start
 
@@ -28,6 +28,7 @@ loom chat --thread=weaver "hi there"
 examples/
 ├── backends/           # Backend integration configurations
 ├── config/             # Server configurations
+├── ios-embedding/      # Swift app that runs an agent in-process (⚠️ simulator only)
 ├── patterns/           # Pattern libraries (domain knowledge)
 └── reference/          # Reference implementations and examples
     ├── agents/         # Agent configurations

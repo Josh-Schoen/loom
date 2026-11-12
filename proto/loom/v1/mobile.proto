@@ -1,0 +1,131 @@
+// Copyright 2026 Teradata
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+syntax = "proto3";
+
+package loom.v1;
+
+import "google/protobuf/struct.proto";
+import "loom/v1/agent_config.proto";
+import "loom/v1/loom.proto";
+
+option go_package = "github.com/teradata-labs/loom/gen/go/loom/v1;loomv1";
+
+// The messages in this file are the contract between a host application
+// (for example an iOS app) and a Loom engine compiled into that application
+// with gomobile (pkg/mobile). There is no service here: the engine is called
+// in-process. Turns use the existing WeaveRequest, WeaveResponse and
+// WeaveProgress messages; this file adds only what an in-process host needs
+// on top of them. Every message crosses the language boundary as proto3 JSON.
+
+// MobileEngineConfig configures one in-process engine.
+message MobileEngineConfig {
+  // Absolute path of a writable directory owned by the host application.
+  // The session database and tool-result overflow files live under it.
+  // Required.
+  string data_dir = 1;
+
+  // Agent definition. Required, with name and system_prompt set. The engine
+  // honours name, description, system_prompt, rom, behavior.max_turns,
+  // behavior.max_tool_executions and behavior.max_iterations. The host
+  // supplies the model and the tools through callbacks, so every other
+  // AgentConfig field must be left unset; the engine rejects a config that
+  // sets one.
+  AgentConfig agent = 2;
+
+  // Upper bound, in bytes, on tool results held in memory before they
+  // overflow to disk under data_dir. Zero selects the engine default.
+  // The tool-result cache is shared by the whole process: the first engine
+  // created in a process fixes its location and this bound, and engines
+  // created later share it.
+  int64 tool_result_memory_bytes = 3;
+
+  // When true, spans for model calls and tool executions are stored in a
+  // SQLite trace database under data_dir. When false nothing is recorded.
+  bool enable_tracing = 4;
+}
+
+// HostModelRequest is one model call the engine asks the host to perform.
+message HostModelRequest {
+  // Conversation so far, oldest first, including any system messages.
+  repeated HostModelMessage messages = 1;
+
+  // Tools the model may call in its response.
+  repeated HostToolSpec tools = 2;
+}
+
+// HostModelMessage is one conversation message. Text only: image and other
+// content blocks are not carried across the host boundary.
+message HostModelMessage {
+  // One of "system", "user", "assistant" or "tool".
+  string role = 1;
+
+  // Message text. Empty for an assistant message that only calls tools.
+  string content = 2;
+
+  // Tool calls requested by an assistant message.
+  repeated HostToolCall tool_calls = 3;
+
+  // For a "tool" message: the id of the HostToolCall this result answers.
+  string tool_use_id = 4;
+
+  // For a "tool" message: the data the tool returned.
+  google.protobuf.Value tool_result = 5;
+
+  // For a "tool" message: the failure text when the tool did not succeed.
+  // Empty on success.
+  string tool_error = 6;
+}
+
+// HostToolCall is a request by the model to run one tool.
+message HostToolCall {
+  // Identifier chosen by the model provider; echoed back in tool_use_id.
+  string id = 1;
+
+  // Name of the tool to run.
+  string name = 2;
+
+  // Tool arguments.
+  google.protobuf.Struct input = 3;
+}
+
+// HostToolSpec describes one tool to the model.
+message HostToolSpec {
+  // Tool name, unique within the engine.
+  string name = 1;
+
+  // What the tool does, written for the model.
+  string description = 2;
+
+  // JSON Schema for the tool arguments.
+  google.protobuf.Struct input_schema = 3;
+}
+
+// HostModelResponse is the host's answer to a HostModelRequest.
+message HostModelResponse {
+  // Text produced by the model. May be empty when tool_calls is set.
+  string content = 1;
+
+  // Tools the model wants to run before it answers.
+  repeated HostToolCall tool_calls = 2;
+
+  // Why the model stopped, in the provider's own vocabulary
+  // (for example "end_turn" or "tool_use").
+  string stop_reason = 3;
+
+  // Token usage and cost of this call, when the host knows them.
+  LLMCost usage = 4;
+
+  // Reasoning text, for models that expose it.
+  string thinking = 5;
+}

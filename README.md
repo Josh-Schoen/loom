@@ -214,6 +214,10 @@ LLM-agnostic YAML behaviors the model loads by name through the `manage_skills` 
 
 See `pkg/skills/`.
 
+### iOS Embedding
+
+⚠️ Partial. `pkg/mobile` runs an agent inside an iOS app with no server: the app links a gomobile-built framework and supplies the model and tools through callbacks, while the engine runs the agent loop and stores sessions in SQLite. Verified in the iOS simulator only; not yet run on a physical device, and Loom's own LLM providers are not exposed through it. See [docs/guides/ios-embedding.md](docs/guides/ios-embedding.md).
+
 ### Per-Role LLM Providers
 
 Assign different LLM providers per operational role (judge, orchestrator, classifier, compressor) with automatic fallback to the main agent LLM. Enables cost optimization by using smaller models for classification while reserving larger models for complex reasoning.
@@ -367,6 +371,7 @@ Releases are GPG-signed with SLSA provenance starting v1.1.0. See [docs/installa
 | MCP Apps Reference | [docs/reference/mcp-apps.md](docs/reference/mcp-apps.md) |
 | MCP Probe (real-server testing) | [docs/guides/mcp-probe.md](docs/guides/mcp-probe.md) |
 | Supabase Integration | [docs/guides/supabase-integration.md](docs/guides/supabase-integration.md) |
+| iOS Embedding | [docs/guides/ios-embedding.md](docs/guides/ios-embedding.md) |
 | Database Upgrade | `looms upgrade --help` |
 | API Reference | [pkg.go.dev](https://pkg.go.dev/github.com/teradata-labs/loom) |
 | Examples | [examples/](examples/) |

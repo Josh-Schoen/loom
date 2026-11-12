@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+#### iOS embedding: run an agent inside an app (`pkg/mobile`) — ⚠️ simulator only
+- **`pkg/mobile` runs one agent in-process, with no `looms` server.** It is written to be bound with gomobile: `NewEngine`, `RegisterTool`, `Weave`, `StreamWeave` and `Close` take and return proto3 JSON strings. The host application supplies the model (`ModelProvider`) and the tools (`HostTool`) through callbacks; the engine runs the agent loop, persists sessions to SQLite under the configured `data_dir` and, with `enable_tracing`, writes spans to a local trace database.
+- **Contract in `proto/loom/v1/mobile.proto`.** `MobileEngineConfig`, `HostModelRequest`, `HostModelResponse`, `HostModelMessage`, `HostToolCall` and `HostToolSpec`. Turns reuse `WeaveRequest`, `WeaveResponse` and `WeaveProgress`, served by the existing `pkg/server` code called in-process.
+- **Config is a checked subset of `AgentConfig`.** `name`, `description`, `system_prompt`, `rom` and the `behavior` limits `max_turns`, `max_tool_executions` and `max_iterations` are applied. A config that sets any other `AgentConfig` or `BehaviorConfig` field is rejected with an error naming the field.
+- **`just build-ios-framework` and `just run-ios-example`.** The first writes `bin/LoomMobile.xcframework` (device and simulator slices); the second builds `examples/ios-embedding/LoomDemo`, a Swift app with a scripted model and one tool, and runs it in the booted simulator. gomobile and gobind are pinned as module tools in `go.mod`.
+- **Not done.** No run on a physical device; Loom's own LLM providers are not exposed through this API; image content is not carried to the host model; Android is not built. See `docs/guides/ios-embedding.md`.
+
 #### Third-party license notices ship with every release
 - **`NOTICE` and `THIRD-PARTY-NOTICES.md` are generated** by `cmd/gen-notices` (`just notices`) from the packages compiled into `loom`, `looms` and `loom-standalone`, resolved for every release platform and unioned. License and NOTICE texts are copied verbatim from each dependency, including the Go standard library's license; a distributed component without a license file is a hard error. `just notices-check` (part of `just check` and CI) fails when the files no longer match the dependency tree, so every dependency change must be followed by `just notices`.
 - **Release archives carry `LICENSE`, `NOTICE` and `THIRD-PARTY-NOTICES.md`**: the per-binary tarballs and zips, and the combined Windows zip. The Homebrew formulas install them to the formula's `doc` directory, and `docker/Dockerfile.runtime` copies them to `/usr/share/doc/loom/`. See `docs/reference/third-party-notices.md`.
