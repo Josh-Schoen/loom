@@ -1058,9 +1058,9 @@ message WeaveProgress {
   // Context window state (included in completion event)
   ContextState context_state = 21;
 
-  // True while the model is still writing a tool call's arguments. Carries no
-  // argument content; tool_name, tool_call_id and tool_input_bytes identify the
-  // call when the provider reports them.
+  // True while the model is still writing a tool call's arguments; tool_name,
+  // tool_call_id and tool_input_bytes identify the call when the provider
+  // reports them, and tool_input_delta carries the arguments written since.
   bool is_tool_input_stream = 22;
 
   // Bytes of tool-call argument JSON received so far (when is_tool_input_stream).
@@ -1092,6 +1092,13 @@ message WeaveProgress {
   // client_tool_call.tool_call_id or the call times out. Consumers that did
   // not declare client tools never receive this field.
   ClientToolCall client_tool_call = 1001;
+
+  // The tool-call argument JSON received since this call's last event (when
+  // is_tool_input_stream): joined in order, a call's deltas are its arguments
+  // as the model writes them (a file's text, a page's HTML), so a client can
+  // show them arriving before the call runs. tool_input_bytes is the joined
+  // length, so a missing piece shows. Empty on a bare activity pulse.
+  string tool_input_delta = 1002;
 }
 
 // ClientToolCall is a tool call the server hands to the client for execution.

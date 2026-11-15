@@ -790,6 +790,7 @@ func (c *Client) ChatStream(ctx context.Context, messages []llmtypes.Message,
 						ToolCallID: reversedName,
 						ToolName:   reversedName,
 						Bytes:      len(argsJSON),
+						Delta:      string(argsJSON),
 					})
 					llmtypes.NotifyStreamActivity(ctx)
 				}

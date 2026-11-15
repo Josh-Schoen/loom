@@ -38,7 +38,7 @@ func TestClient_ChatStream_ToolCallsReportProgress(t *testing.T) {
 	client := NewClient(Config{Endpoint: server.URL, Model: "llama3.1"})
 
 	var got []types.ToolInputProgress
-	ctx := types.WithToolInputProgress(context.Background(), func(p types.ToolInputProgress) { got = append(got, p) })
+	ctx := types.WithToolInputProgress(context.Background(), recordToolInput(t, &got))
 
 	resp, err := client.ChatStream(ctx, []types.Message{{Role: "user", Content: "go"}}, nil, nil)
 	require.NoError(t, err)
@@ -79,7 +79,7 @@ func TestClient_ChatStream_StringArgumentsReportRawLength(t *testing.T) {
 	client := NewClient(Config{Endpoint: server.URL, Model: "llama3.1"})
 
 	var got []types.ToolInputProgress
-	ctx := types.WithToolInputProgress(context.Background(), func(p types.ToolInputProgress) { got = append(got, p) })
+	ctx := types.WithToolInputProgress(context.Background(), recordToolInput(t, &got))
 
 	resp, err := client.ChatStream(ctx, []types.Message{{Role: "user", Content: "go"}}, nil, nil)
 	require.NoError(t, err)

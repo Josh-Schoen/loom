@@ -812,11 +812,13 @@ func (c *Client) ChatStream(ctx context.Context, messages []llmtypes.Message,
 				// Parse function arguments
 				var params map[string]interface{}
 				var argsLen int
+				var argsText string
 				switch args := tc.Function.Arguments.(type) {
 				case string:
 					// Report the raw argument JSON as received; a string that
 					// fails to parse still has a real size.
 					argsLen = len(args)
+					argsText = args
 					cleanedArgs := c.cleanJSONString(args)
 					if err := json.Unmarshal([]byte(cleanedArgs), &params); err != nil {
 						params = make(map[string]interface{})
@@ -827,6 +829,7 @@ func (c *Client) ChatStream(ctx context.Context, messages []llmtypes.Message,
 					// Ollama parsed it for us, so the original bytes are gone.
 					if argsJSON, err := json.Marshal(args); err == nil {
 						argsLen = len(argsJSON)
+						argsText = string(argsJSON)
 					}
 				default:
 					params = make(map[string]interface{})
@@ -844,6 +847,7 @@ func (c *Client) ChatStream(ctx context.Context, messages []llmtypes.Message,
 					ToolCallID: tc.ID,
 					ToolName:   llm.ReverseToolName(nameMap, tc.Function.Name),
 					Bytes:      argsLen,
+					Delta:      argsText,
 				})
 			}
 			llmtypes.NotifyStreamActivity(ctx)

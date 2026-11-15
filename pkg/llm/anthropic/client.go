@@ -813,6 +813,7 @@ func (c *Client) ChatStream(ctx context.Context, messages []llmtypes.Message,
 								ToolCallID: toolCalls[idx].ID,
 								ToolName:   toolCalls[idx].Name,
 								Bytes:      buf.Len(),
+								Delta:      event.Delta.PartialJSON,
 							})
 						}
 					}

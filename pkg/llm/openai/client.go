@@ -1284,6 +1284,7 @@ func (c *Client) ChatStream(ctx context.Context, messages []llmtypes.Message,
 						ToolCallID: tc.ID,
 						ToolName:   tc.Name,
 						Bytes:      len(argsSoFar),
+						Delta:      tcDelta.Function.Arguments,
 					})
 				}
 				llmtypes.NotifyStreamActivity(ctx)

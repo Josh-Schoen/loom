@@ -571,11 +571,10 @@ type ProgressEvent struct {
 	IsTokenStream bool
 
 	// IsToolInputStream indicates the provider is streaming tool-input
-	// (function-call argument) bytes. It carries no argument content — tool
-	// input is never rendered as partial text — and exists so a long
-	// tool-argument generation registers as activity instead of silence.
-	// ToolCallID, ToolName and ToolInputBytes identify the call when the
-	// provider reports them. Always Droppable.
+	// (function-call argument) bytes, so a long tool-argument generation
+	// registers as activity instead of silence. ToolCallID, ToolName and
+	// ToolInputBytes identify the call when the provider reports them; an
+	// event with no ToolInputDelta is Droppable.
 	IsToolInputStream bool
 
 	// ToolInputBytes is the length of the tool-call argument JSON received so
@@ -597,6 +596,13 @@ type ProgressEvent struct {
 	// pulse (no ToolCallID, no ToolName, 0 bytes) carries index 0 without
 	// being call 0; skip pulses.
 	ToolCallIndex int32
+
+	// ToolInputDelta is the argument JSON received since the call's last
+	// event (IsToolInputStream only): a consumer joins a call's deltas, in
+	// order, to show what the model is writing before the call runs. Never
+	// Droppable — a lost piece can't be rebuilt — and ToolInputBytes is the
+	// length of the joined deltas, so a gap shows.
+	ToolInputDelta string
 
 	// TokenCount is the running count of tokens received
 	TokenCount int32

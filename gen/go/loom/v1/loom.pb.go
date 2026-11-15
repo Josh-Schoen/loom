@@ -867,9 +867,9 @@ type WeaveProgress struct {
 	ToolCallId string `protobuf:"bytes,20,opt,name=tool_call_id,json=toolCallId,proto3" json:"tool_call_id,omitempty"`
 	// Context window state (included in completion event)
 	ContextState *ContextState `protobuf:"bytes,21,opt,name=context_state,json=contextState,proto3" json:"context_state,omitempty"`
-	// True while the model is still writing a tool call's arguments. Carries no
-	// argument content; tool_name, tool_call_id and tool_input_bytes identify the
-	// call when the provider reports them.
+	// True while the model is still writing a tool call's arguments; tool_name,
+	// tool_call_id and tool_input_bytes identify the call when the provider
+	// reports them, and tool_input_delta carries the arguments written since.
 	IsToolInputStream bool `protobuf:"varint,22,opt,name=is_tool_input_stream,json=isToolInputStream,proto3" json:"is_tool_input_stream,omitempty"`
 	// Bytes of tool-call argument JSON received so far (when is_tool_input_stream).
 	// Events are throttled, so the last value can lag the final size. A bare pulse
@@ -898,6 +898,12 @@ type WeaveProgress struct {
 	// client_tool_call.tool_call_id or the call times out. Consumers that did
 	// not declare client tools never receive this field.
 	ClientToolCall *ClientToolCall `protobuf:"bytes,1001,opt,name=client_tool_call,json=clientToolCall,proto3" json:"client_tool_call,omitempty"`
+	// The tool-call argument JSON received since this call's last event (when
+	// is_tool_input_stream): joined in order, a call's deltas are its arguments
+	// as the model writes them (a file's text, a page's HTML), so a client can
+	// show them arriving before the call runs. tool_input_bytes is the joined
+	// length, so a missing piece shows. Empty on a bare activity pulse.
+	ToolInputDelta string `protobuf:"bytes,1002,opt,name=tool_input_delta,json=toolInputDelta,proto3" json:"tool_input_delta,omitempty"`
 	unknownFields  protoimpl.UnknownFields
 	sizeCache      protoimpl.SizeCache
 }
@@ -1105,6 +1111,13 @@ func (x *WeaveProgress) GetClientToolCall() *ClientToolCall {
 		return x.ClientToolCall
 	}
 	return nil
+}
+
+func (x *WeaveProgress) GetToolInputDelta() string {
+	if x != nil {
+		return x.ToolInputDelta
+	}
+	return ""
 }
 
 // ClientToolCall is a tool call the server hands to the client for execution.
@@ -11887,7 +11900,7 @@ const file_loom_v1_loom_proto_rawDesc = "" +
 	"\bmetadata\x18\x06 \x01(\v2\x1a.loom.v1.ExecutionMetadataR\bmetadata\x12@\n" +
 	"\vcorrections\x18\a \x03(\v2\x1e.loom.v1.SelfCorrectionAttemptR\vcorrections\x12\x19\n" +
 	"\bagent_id\x18\b \x01(\tR\aagentId\x12:\n" +
-	"\rcontext_state\x18\t \x01(\v2\x15.loom.v1.ContextStateR\fcontextState\"\xb5\b\n" +
+	"\rcontext_state\x18\t \x01(\v2\x15.loom.v1.ContextStateR\fcontextState\"\xe0\b\n" +
 	"\rWeaveProgress\x12-\n" +
 	"\x05stage\x18\x01 \x01(\x0e2\x17.loom.v1.ExecutionStageR\x05stage\x12\x1a\n" +
 	"\bprogress\x18\x02 \x01(\x05R\bprogress\x12\x18\n" +
@@ -11919,7 +11932,8 @@ const file_loom_v1_loom_proto_rawDesc = "" +
 	"\x14is_tool_input_stream\x18\x16 \x01(\bR\x11isToolInputStream\x12(\n" +
 	"\x10tool_input_bytes\x18\x17 \x01(\x03R\x0etoolInputBytes\x12&\n" +
 	"\x0ftool_call_index\x18\x18 \x01(\x05R\rtoolCallIndex\x12B\n" +
-	"\x10client_tool_call\x18\xe9\a \x01(\v2\x17.loom.v1.ClientToolCallR\x0eclientToolCall\"\xbe\x01\n" +
+	"\x10client_tool_call\x18\xe9\a \x01(\v2\x17.loom.v1.ClientToolCallR\x0eclientToolCall\x12)\n" +
+	"\x10tool_input_delta\x18\xea\a \x01(\tR\x0etoolInputDelta\"\xbe\x01\n" +
 	"\x0eClientToolCall\x12 \n" +
 	"\ftool_call_id\x18\x01 \x01(\tR\n" +
 	"toolCallId\x12\x1b\n" +

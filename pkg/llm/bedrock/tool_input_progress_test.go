@@ -63,7 +63,7 @@ data: {"type":"message_stop"}
 	}
 
 	var got []types.ToolInputProgress
-	ctx := types.WithToolInputProgress(context.Background(), func(p types.ToolInputProgress) { got = append(got, p) })
+	ctx := types.WithToolInputProgress(context.Background(), recordToolInput(t, &got))
 
 	resp, err := c.ChatStream(
 		ctx,
@@ -124,7 +124,7 @@ data: {"type":"message_stop"}
 	}
 
 	var got []types.ToolInputProgress
-	ctx := types.WithToolInputProgress(context.Background(), func(p types.ToolInputProgress) { got = append(got, p) })
+	ctx := types.WithToolInputProgress(context.Background(), recordToolInput(t, &got))
 
 	resp, err := c.ChatStream(
 		ctx,
@@ -188,7 +188,7 @@ data: {"type":"message_stop"}
 	}
 
 	var got []types.ToolInputProgress
-	ctx := types.WithToolInputProgress(context.Background(), func(p types.ToolInputProgress) { got = append(got, p) })
+	ctx := types.WithToolInputProgress(context.Background(), recordToolInput(t, &got))
 
 	resp, err := c.ChatStream(
 		ctx,

@@ -75,7 +75,7 @@ func TestClient_ChatStream_ToolCallDeltasReportProgress(t *testing.T) {
 	client := NewClient(Config{APIKey: "test-key", Endpoint: server.URL})
 
 	var got []types.ToolInputProgress
-	ctx := types.WithToolInputProgress(context.Background(), func(p types.ToolInputProgress) { got = append(got, p) })
+	ctx := types.WithToolInputProgress(context.Background(), recordToolInput(t, &got))
 
 	_, err := client.ChatStream(ctx, []types.Message{{Role: "user", Content: "go"}}, nil, nil)
 	require.NoError(t, err)

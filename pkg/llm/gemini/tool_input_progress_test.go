@@ -39,7 +39,7 @@ func TestClient_ChatStream_FunctionCallsReportProgress(t *testing.T) {
 	client.httpClient.Transport = &mockTransport{baseURL: server.URL}
 
 	var got []types.ToolInputProgress
-	ctx := types.WithToolInputProgress(context.Background(), func(p types.ToolInputProgress) { got = append(got, p) })
+	ctx := types.WithToolInputProgress(context.Background(), recordToolInput(t, &got))
 
 	resp, err := client.ChatStream(ctx, []types.Message{{Role: "user", Content: "go"}}, nil, nil)
 	require.NoError(t, err)
