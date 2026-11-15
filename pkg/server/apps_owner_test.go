@@ -141,11 +141,22 @@ func TestAppsPagesOverHTTPAreScopedToTheCaller(t *testing.T) {
 	srv := &HTTPServer{appHTMLProvider: registry, gatewayMux: runtime.NewServeMux()}
 	srv.SetStreamInterceptors(UserIDStreamInterceptor(UserIDConfig{}))
 
+	// The caller's identity arrives the way an authenticating interceptor
+	// leaves it (postgres.ContextWithUserID). A Grpc-Metadata-X-User-Id
+	// header is not forwarded by the gateway (grpc-gateway v2.33 and later),
+	// so it cannot claim an identity.
 	get := func(path, user string) *httptest.ResponseRecorder {
 		req := httptest.NewRequest(http.MethodGet, path, nil)
 		if user != "" {
-			req.Header.Set("Grpc-Metadata-X-User-Id", user)
+			req = req.WithContext(postgres.ContextWithUserID(req.Context(), user))
 		}
+		rr := httptest.NewRecorder()
+		srv.handleApps(rr, req)
+		return rr
+	}
+	claim := func(path, user string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		req.Header.Set("Grpc-Metadata-X-User-Id", user)
 		rr := httptest.NewRecorder()
 		srv.handleApps(rr, req)
 		return rr
@@ -157,6 +168,7 @@ func TestAppsPagesOverHTTPAreScopedToTheCaller(t *testing.T) {
 
 	assert.Equal(t, http.StatusNotFound, get("/apps/notes", "bob").Code)
 	assert.Equal(t, http.StatusNotFound, get("/apps/notes", "").Code)
+	assert.Equal(t, http.StatusNotFound, claim("/apps/notes", "alice").Code, "a forwarded header claims no identity")
 
 	assert.Contains(t, get("/apps/", "alice").Body.String(), "/apps/notes")
 	assert.NotContains(t, get("/apps/", "bob").Body.String(), "/apps/notes")

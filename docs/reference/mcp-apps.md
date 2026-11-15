@@ -761,8 +761,8 @@ one with `CreateUIApp` `shared: true`, or share an existing app with
   cannot contain control characters; `looms pair --user` rejects them too).
 
 **Only as strong as the identity.** With no authentication configured, the
-user ID comes from the `X-User-Id` header (`Grpc-Metadata-X-User-Id` on the
-gateway), which any caller can set, so ownership separates users' apps but
+user ID comes from the gRPC `x-user-id` metadata (HTTP callers cannot set it:
+the gateway does not forward `Grpc-Metadata-*` headers), which any gRPC caller can set, so ownership separates users' apps but
 does not protect them from each other. To enforce it, turn on
 `server.auth.enabled` or `server.device_pairing.required`; a paired device
 always acts as the user it was paired for (`looms pair --user`) and cannot

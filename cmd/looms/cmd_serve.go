@@ -36,15 +36,18 @@ import (
 	"github.com/teradata-labs/loom/pkg/clienttools"
 	"github.com/teradata-labs/loom/pkg/communication"
 	loomconfig "github.com/teradata-labs/loom/pkg/config"
+	"github.com/teradata-labs/loom/pkg/decision"
 	"github.com/teradata-labs/loom/pkg/devices"
 	"github.com/teradata-labs/loom/pkg/embedding"
 	"github.com/teradata-labs/loom/pkg/evals"
+	"github.com/teradata-labs/loom/pkg/eventlog"
 	"github.com/teradata-labs/loom/pkg/fabric"
 	fabricfactory "github.com/teradata-labs/loom/pkg/fabric/factory"
 	"github.com/teradata-labs/loom/pkg/llm"
 	"github.com/teradata-labs/loom/pkg/llm/anthropic"
 	"github.com/teradata-labs/loom/pkg/llm/azureopenai"
 	"github.com/teradata-labs/loom/pkg/llm/bedrock"
+	"github.com/teradata-labs/loom/pkg/llm/bedrockmantle"
 	"github.com/teradata-labs/loom/pkg/llm/factory"
 	"github.com/teradata-labs/loom/pkg/llm/gemini"
 	"github.com/teradata-labs/loom/pkg/llm/huggingface"
@@ -55,6 +58,7 @@ import (
 	llmscheduler "github.com/teradata-labs/loom/pkg/llm/scheduler"
 	"github.com/teradata-labs/loom/pkg/llm/scripted"
 	"github.com/teradata-labs/loom/pkg/llm/spending"
+	"github.com/teradata-labs/loom/pkg/luasandbox"
 	"github.com/teradata-labs/loom/pkg/mcp/apps"
 	"github.com/teradata-labs/loom/pkg/mcp/manager"
 	"github.com/teradata-labs/loom/pkg/memory"
@@ -220,6 +224,8 @@ func registerYAMLBuiltinTools(
 		"delete_ui_app":                   "UI app subsystem (AppCompiler/AppProvider)",
 		"get_ui_app":                      "UI app subsystem (AppCompiler/AppProvider)",
 		"contact_human":                   "HITL store (registerContactHumanFromYAML)",
+		"run_lua":                         "Lua subsystem (tools.lua.enabled, registerLuaTools)",
+		"manage_lua_scripts":              "Lua subsystem (saved scripts; not available yet)",
 		// Registered by the agent itself; declaring one keeps it surfaced
 		// under tools.minimal/none (agent.SuppressedFor).
 		"task_board":        "agent (task board, with memory.task_board.enabled)",
@@ -274,6 +280,17 @@ func registerYAMLBuiltinTools(
 			logger.Warn(indent+"  Unknown builtin tool", zap.String("name", toolName))
 		}
 	}
+}
+
+// serveAgentConfig is the agent.Config both serve paths (startup and hot
+// reload) start from: delegated to agent.RegistryAgentConfig so registry,
+// startup, and hot-reload builds share a single source of truth for
+// DefaultConfig(), behavior limits, pattern config, context limits, skills
+// config, and metadata-encoded behavior flags.
+func serveAgentConfig(cfg *loomv1.AgentConfig, tracing bool) *agent.Config {
+	agentCfg := agent.RegistryAgentConfig(cfg, agent.ResolveSkillsConfig(cfg))
+	agentCfg.EnableTracing = tracing
+	return agentCfg
 }
 
 // createPermissionChecker creates a PermissionChecker based on configuration.
@@ -398,6 +415,7 @@ type registrySubsystemSink interface {
 	SetGraphMemoryStore(store memory.GraphMemoryStore, embedder memory.Embedder)
 	SetSuppressedBuiltinTools(names []string)
 	GraphMemoryEnabledFor(nameOrID string) bool
+	SetDecisionShadowStore(store decision.ShadowStore)
 }
 
 // resolveJudgeFallback picks the judge's fallback LLM: the pool's active
@@ -431,8 +449,13 @@ func wireRegistrySubsystems(
 	graphMemoryStore memory.GraphMemoryStore,
 	memoryEmbedder memory.Embedder,
 	suppressed []string,
+	decisionShadowStore decision.ShadowStore,
 	logger *zap.Logger,
 ) {
+	if decisionShadowStore != nil {
+		reg.SetDecisionShadowStore(decisionShadowStore)
+		logger.Info("Decision shadow store injected into agent registry")
+	}
 	if taskManager != nil {
 		reg.SetTaskManager(taskManager, taskDecomposer)
 		logger.Info("Task manager injected into agent registry",
@@ -518,8 +541,20 @@ func inheritCredentials(dst, src LLMConfig) LLMConfig {
 	if dst.BedrockProfile == "" {
 		dst.BedrockProfile = src.BedrockProfile
 	}
+	// An entry that sets its own bedrock_region keeps it for bedrock-mantle
+	// too: the main LLM's bedrock_mantle_region is inherited only when the
+	// entry sets neither region, so an explicit entry setting always wins.
+	if dst.BedrockMantleRegion == "" && dst.BedrockRegion == "" {
+		dst.BedrockMantleRegion = src.BedrockMantleRegion
+	}
 	if dst.BedrockRegion == "" {
 		dst.BedrockRegion = src.BedrockRegion
+	}
+	if dst.BedrockMantleEndpoint == "" {
+		dst.BedrockMantleEndpoint = src.BedrockMantleEndpoint
+	}
+	if dst.BedrockMantleAPIKey == "" {
+		dst.BedrockMantleAPIKey = src.BedrockMantleAPIKey
 	}
 	if dst.OllamaEndpoint == "" {
 		dst.OllamaEndpoint = src.OllamaEndpoint
@@ -562,6 +597,62 @@ func resolveBedrockCredentials(cfg LLMConfig) (accessKeyID, secretAccessKey, ses
 	return loomconfig.ExpandEnvPlaceholders(cfg.BedrockAccessKeyID),
 		loomconfig.ExpandEnvPlaceholders(cfg.BedrockSecretAccessKey),
 		loomconfig.ExpandEnvPlaceholders(cfg.BedrockSessionToken)
+}
+
+// resolveBedrockMantleAPIKey returns the Bedrock API key for the bedrock-mantle
+// provider: llm.bedrock_mantle_api_key with ${ENV_VAR} placeholders expanded,
+// or BEDROCK_MANTLE_API_KEY when the config field is empty. An empty result
+// selects SigV4 signing from the AWS credential chain.
+func resolveBedrockMantleAPIKey(cfg LLMConfig) string {
+	if key := loomconfig.ExpandEnvPlaceholders(cfg.BedrockMantleAPIKey); key != "" {
+		return key
+	}
+	return os.Getenv("BEDROCK_MANTLE_API_KEY")
+}
+
+// withMantleEnvFallback applies the environment to a bedrock-mantle client
+// built for agent YAML under `looms serve`, as the agent registry does. The
+// region is llm.bedrock_mantle_region when the operator set it, else
+// BEDROCK_MANTLE_REGION, else AWS_REGION, else what mantleConfigFrom resolved
+// (llm.bedrock_region, which has a built-in default, so the environment must
+// be read before it). The endpoint is BEDROCK_MANTLE_ENDPOINT when
+// llm.bedrock_mantle_endpoint is empty. The API key already falls back to
+// BEDROCK_MANTLE_API_KEY in resolveBedrockMantleAPIKey.
+func withMantleEnvFallback(mcfg bedrockmantle.Config, cfg LLMConfig) bedrockmantle.Config {
+	if cfg.BedrockMantleRegion == "" {
+		if region := os.Getenv("BEDROCK_MANTLE_REGION"); region != "" {
+			mcfg.Region = region
+		} else if region := os.Getenv("AWS_REGION"); region != "" {
+			mcfg.Region = region
+		}
+	}
+	if mcfg.Endpoint == "" {
+		mcfg.Endpoint = os.Getenv("BEDROCK_MANTLE_ENDPOINT")
+	}
+	return mcfg
+}
+
+// mantleConfigFrom builds the bedrockmantle.Config shared by every looms path
+// that constructs a bedrock-mantle client: the region (llm.bedrock_mantle_region,
+// else llm.bedrock_region), the endpoint with ${ENV_VAR} placeholders expanded,
+// the API key from resolveBedrockMantleAPIKey, the Bedrock SigV4 credentials
+// and profile, and the model, max tokens and temperature from cfg. Callers set
+// the fields their path overrides (Model, MaxTokens, Temperature, Timeout,
+// RateLimiterConfig).
+func mantleConfigFrom(cfg LLMConfig) bedrockmantle.Config {
+	accessKeyID, secretAccessKey, sessionToken := resolveBedrockCredentials(cfg)
+	return bedrockmantle.Config{
+		Region:          mantleRegion(cfg),
+		Endpoint:        loomconfig.ExpandEnvPlaceholders(cfg.BedrockMantleEndpoint),
+		APIKey:          resolveBedrockMantleAPIKey(cfg),
+		AccessKeyID:     accessKeyID,
+		SecretAccessKey: secretAccessKey,
+		SessionToken:    sessionToken,
+		Profile:         cfg.BedrockProfile,
+		Model:           cfg.BedrockMantleModel,
+		MaxTokens:       cfg.MaxTokens,
+		Temperature:     cfg.Temperature,
+	}
 }
 
 func buildProviderPool(cfg *Config, _ *factory.ProviderFactory, logger *zap.Logger) (map[string]agent.LLMProvider, error) {
@@ -643,6 +734,18 @@ func createProviderWithRateLimit(cfg LLMConfig, logger *zap.Logger) (agent.LLMPr
 		})
 		if err != nil {
 			return nil, fmt.Errorf("bedrock: %w", err)
+		}
+		return client, nil
+
+	case bedrockmantle.ProviderName:
+		// Mantle shares the Bedrock SigV4 credential fields; a Bedrock API key
+		// (bearer) is opt-in. The region falls back to llm.bedrock_region.
+		mcfg := mantleConfigFrom(cfg)
+		mcfg.Timeout = time.Duration(cfg.Timeout) * time.Second
+		mcfg.RateLimiterConfig = rlCfg
+		client, err := bedrockmantle.NewClientForModel(mcfg)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", bedrockmantle.ProviderName, err)
 		}
 		return client, nil
 
@@ -826,6 +929,11 @@ func getDefaultModelForProvider(cfg *Config) string {
 			return cfg.LLM.BedrockModelID
 		}
 		return "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
+	case bedrockmantle.ProviderName:
+		if cfg.LLM.BedrockMantleModel != "" {
+			return cfg.LLM.BedrockMantleModel
+		}
+		return bedrockmantle.DefaultModel
 	case "ollama":
 		if cfg.LLM.OllamaModel != "" {
 			return cfg.LLM.OllamaModel
@@ -932,6 +1040,21 @@ func createLLMProviderFromProtoConfig(protoConfig *loomv1.LLMConfig, serverConfi
 			Temperature:       temperature,
 			RateLimiterConfig: rlCfg,
 		})
+
+	case bedrockmantle.ProviderName:
+		mcfg := withMantleEnvFallback(mantleConfigFrom(serverConfig.LLM), serverConfig.LLM)
+		if protoConfig.Model != "" {
+			mcfg.Model = protoConfig.Model
+		}
+		mcfg.MaxTokens = maxTokens
+		mcfg.Temperature = temperature
+		mcfg.Timeout = timeout
+		mcfg.RateLimiterConfig = rlCfg
+		client, err := bedrockmantle.NewClientForModel(mcfg)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", bedrockmantle.ProviderName, err)
+		}
+		return client, nil
 
 	case "ollama":
 		model := protoConfig.Model
@@ -1084,7 +1207,46 @@ func createLLMProviderFromProtoConfig(protoConfig *loomv1.LLMConfig, serverConfi
 		}), nil
 
 	default:
-		return nil, fmt.Errorf("unsupported LLM provider: %s (supported: anthropic, bedrock, ollama, openai, azure-openai, mistral, gemini, huggingface, litellm)", protoConfig.Provider)
+		return nil, fmt.Errorf("unsupported LLM provider: %s (supported: anthropic, bedrock, bedrock-mantle, ollama, openai, azure-openai, mistral, gemini, huggingface, litellm)", protoConfig.Provider)
+	}
+}
+
+// customLLMFallbackAllowed reports whether `looms serve` may run an agent role
+// (primary, compressor_llm or classifier_llm) on a substitute LLM when the
+// provider that the agent YAML declares for that role cannot be built. The
+// startup agent loop calls it before it falls back. It returns false for
+// bedrock-mantle: an operator selects Mantle to keep model traffic in their
+// AWS account, so a silent move to another provider is not acceptable. The
+// loop skips such an agent and logs an error instead. Other providers keep the
+// existing fall-back-to-default behaviour.
+func customLLMFallbackAllowed(provider string) bool {
+	switch provider {
+	case "bedrock-mantle":
+		return false
+	default:
+		return true
+	}
+}
+
+// skipAgentForUnbuildableLLM is called by the `looms serve` startup agent loop
+// when customLLMFallbackAllowed refuses a fallback. It logs the refusal at error
+// level, so the operator sees that the agent did not start, and closes the
+// agent's execution backend, which the loop opened before it built the LLMs.
+// The caller then skips the agent.
+func skipAgentForUnbuildableLLM(logger *zap.Logger, agentName, role string, llmCfg *loomv1.LLMConfig, backend fabric.ExecutionBackend, buildErr error) {
+	logger.Error("    Skipping agent: its LLM provider cannot be built and the provider does not allow a fallback LLM",
+		zap.String("name", agentName),
+		zap.String("role", role),
+		zap.String("provider", llmCfg.GetProvider()),
+		zap.String("model", llmCfg.GetModel()),
+		zap.Error(buildErr))
+	if backend == nil {
+		return
+	}
+	if err := backend.Close(); err != nil {
+		logger.Warn("    Failed to close backend of skipped agent",
+			zap.String("name", agentName),
+			zap.Error(err))
 	}
 }
 
@@ -1193,7 +1355,7 @@ func runServe(cmd *cobra.Command, args []string) {
 		llmscheduler.Default().SetLogger(logger)
 	}
 
-	logger.Info("Starting Loom Server", zap.String("version", rootCmd.Version))
+	logger.Info("Starting Loom Server", zap.String("version", rootCmd.Version), zap.String("commit", gitCommit))
 
 	// Show actual config file used (not just the --config flag)
 	configFileUsed := viper.ConfigFileUsed()
@@ -1331,10 +1493,32 @@ func runServe(cmd *cobra.Command, args []string) {
 	// Extract individual stores from backend
 	store := storageBackend.SessionStorage()
 
+	// Durable execution log (opt-in, execution_log.enabled). Every agent built
+	// below records it, so `loom sessions resume` can finish a turn a crash
+	// interrupted. Enabled on a backend without support is a startup error,
+	// not a silent no-op: resume would then refuse every turn.
+	var executionLog eventlog.EventLogStore
+	if config.ExecutionLog.Enabled {
+		elp, ok := storageBackend.(backend.EventLogProvider)
+		if !ok || elp.EventLogStore() == nil {
+			logger.Fatal("execution_log.enabled is set, but the storage backend does not provide an execution log")
+		}
+		executionLog = elp.EventLogStore()
+		logger.Info("Execution log enabled: agents record write-ahead events for crash resume")
+	}
+
 	// Extract graph memory store if available (optional interface)
 	var graphMemoryStore memory.GraphMemoryStore
 	if gmp, ok := storageBackend.(backend.GraphMemoryProvider); ok {
 		graphMemoryStore = gmp.GraphMemoryStore()
+	}
+
+	// Extract the typed-decision shadow store if available (optional
+	// interface). Agents with a decision provider configured persist their
+	// shadow comparisons here; `loom decision report` reads them.
+	var decisionShadowStore decision.ShadowStore
+	if dsp, ok := storageBackend.(backend.DecisionShadowProvider); ok {
+		decisionShadowStore = dsp.DecisionShadowStore()
 	}
 
 	// Extract task store if available (optional interface)
@@ -1669,6 +1853,12 @@ func runServe(cmd *cobra.Command, args []string) {
 		BedrockProfile:         config.LLM.BedrockProfile,
 		BedrockModelID:         config.LLM.BedrockModelID,
 
+		// Bedrock Mantle (SigV4 credentials are the Bedrock fields above)
+		BedrockMantleRegion:   mantleRegion(config.LLM),
+		BedrockMantleEndpoint: config.LLM.BedrockMantleEndpoint,
+		BedrockMantleAPIKey:   config.LLM.BedrockMantleAPIKey,
+		BedrockMantleModel:    config.LLM.BedrockMantleModel,
+
 		// Ollama
 		OllamaEndpoint: config.LLM.OllamaEndpoint,
 		OllamaModel:    config.LLM.OllamaModel,
@@ -1737,9 +1927,48 @@ func runServe(cmd *cobra.Command, args []string) {
 		time.Second,
 		hitlNotifier(),
 	)
-	admissionChain, err := createAdmissionChain(config, shuttle.ChainDeps{Perm: permissionChecker, Ask: askResolver, Custom: shuttle.ProcessCustomHookRegistry()}, logger)
+	// Jailed shell mode (tools.shell_execute.mode: jailed): pin programs, run
+	// the self-test, and install the runner before any agent registers
+	// shell_execute. A failure aborts startup rather than fall back to bash.
+	commandPolicy, err := setupShellJail(context.Background(), config, loomconfig.GetLoomDataDir(), logger)
+	if err != nil {
+		logger.Fatal("Failed to start the jailed shell", zap.Error(err))
+	}
+
+	admissionChain, err := createAdmissionChain(config, shuttle.ChainDeps{
+		Perm:          permissionChecker,
+		Ask:           askResolver,
+		Custom:        shuttle.ProcessCustomHookRegistry(),
+		CommandPolicy: commandPolicy,
+	}, logger)
 	if err != nil {
 		logger.Fatal("Failed to build admission chain", zap.Error(err))
+	}
+
+	// run_lua wiring (tools.lua, off by default): one policy and one run gate
+	// for the whole server, sized from the process memory limit. A malformed
+	// tool pattern aborts startup, like a malformed hook binding.
+	luaRT, err := newLuaRuntime(config.Tools.Lua, luaGuards{
+		YOLO:          config.Tools.Permissions.YOLO,
+		HookBindings:  len(config.Tools.Hooks.Bindings),
+		ShellGoverned: scriptShellGoverned(config),
+	}, luasandbox.ProcessMemoryLimit(), loomconfig.GetLoomDataDir(), logger)
+	if err != nil {
+		logger.Fatal("Invalid tools.lua configuration", zap.Error(err))
+	}
+	if luaRT != nil {
+		for _, w := range luaRT.warnings {
+			logger.Warn("tools.lua", zap.String("detail", w))
+		}
+		logger.Info("Lua scripts enabled (run_lua)",
+			zap.Int("run_slots", luaRT.slots),
+			zap.Int("runs_per_agent", luaRT.perKey),
+			zap.Uint64("memory_bytes_per_run", luaRT.runMem),
+			zap.Bool("save_enabled", luaRT.scripts.SaveEnabled),
+			zap.Bool("publish_as_tool_enabled", luaRT.scripts.PublishEnabled))
+		for _, loadErr := range luaRT.store.LoadErrors() {
+			logger.Warn("Skipped a saved Lua script that could not be loaded", zap.Error(loadErr))
+		}
 	}
 
 	// Initialize empty agents map - all agents loaded from $LOOM_DATA_DIR/agents/ via registry below
@@ -1747,6 +1976,9 @@ func runServe(cmd *cobra.Command, args []string) {
 	// Agents whose YAML lists a UI app tool in tools.builtin are always
 	// offered the UI app tools (see registerUIAppTools); keyed like agents.
 	uiAppToolsDeclared := make(map[string]bool)
+	// Proto configs of the statically loaded agents, keyed like agents, so the
+	// server can report them from GetAgent/ListAgents (SetAgentConfig below).
+	staticAgentConfigs := make(map[string]*loomv1.AgentConfig)
 	logger.Info("Agents will be loaded from $LOOM_DATA_DIR/agents/ directory via registry system")
 
 	// Also load agents from $LOOM_DATA_DIR/agents/ directory (created by meta-agent)
@@ -1778,8 +2010,11 @@ func runServe(cmd *cobra.Command, args []string) {
 		// the chain would silently become ungoverned (C-007).
 		PermissionChecker: permissionChecker,
 		AdmissionChain:    admissionChain,
+		RunLuaTool:        luaRT.registryOptions(),
+		LuaScripts:        luaRT.scriptsRegistryOptions(),
 		IdentityResolver:  postgres.UserIDFromContext,
 		LLMWrapper:        guardLLM,
+		EventLogStore:     executionLog,
 	})
 	if err != nil {
 		logger.Warn("Failed to create agent registry", zap.Error(err))
@@ -1872,55 +2107,7 @@ func runServe(cmd *cobra.Command, args []string) {
 					agentOpts = append(agentOpts, agent.WithSystemPrompt(cfg.SystemPrompt))
 				}
 
-				// Create config from proto LLMConfig
-				// Set max_turns and max_tool_executions from behavior config if specified, otherwise use defaults
-				maxTurns := 25          // Default from pkg/agent/types.go:145
-				maxToolExecutions := 50 // Default from pkg/agent/types.go:146
-				if cfg.Behavior != nil {
-					if cfg.Behavior.MaxTurns > 0 {
-						maxTurns = int(cfg.Behavior.MaxTurns)
-					}
-					if cfg.Behavior.MaxToolExecutions > 0 {
-						maxToolExecutions = int(cfg.Behavior.MaxToolExecutions)
-					}
-				}
-
-				agentCfg := &agent.Config{
-					Name:              cfg.Name,
-					Description:       cfg.Description,
-					SystemPrompt:      cfg.SystemPrompt,
-					Rom:               cfg.Rom,      // ROM identifier for domain-specific knowledge
-					Metadata:          cfg.Metadata, // Metadata includes backend_path for ROM auto-detection
-					MaxTurns:          maxTurns,
-					MaxToolExecutions: maxToolExecutions,
-					EnableTracing:     config.Observability.Enabled,
-				}
-
-				// Set context limits if specified in LLM config
-				if cfg.Llm != nil {
-					if cfg.Llm.MaxContextTokens > 0 {
-						agentCfg.MaxContextTokens = int(cfg.Llm.MaxContextTokens)
-					}
-					// The EFFECTIVE reservation, not the raw field: NewAgent
-					// re-applies SetContextLimits from this config onto the same
-					// Memory, so a raw (often zero) value here would clobber the
-					// value computed above and drop the reserve to window/10.
-					agentCfg.ReservedOutputTokens = agent.EffectiveOutputReservation(
-						cfg.Llm.Provider, cfg.Llm.Model,
-						int(cfg.Llm.MaxTokens), int(cfg.Llm.ReservedOutputTokens),
-						int(cfg.Llm.MaxContextTokens))
-				}
-
-				// Transfer pattern configuration from proto if present
-				if cfg.Behavior != nil && cfg.Behavior.Patterns != nil {
-					agentCfg.PatternConfig = &agent.PatternConfig{
-						Enabled:            cfg.Behavior.Patterns.Enabled,
-						MinConfidence:      float64(cfg.Behavior.Patterns.MinConfidence),
-						MaxPatternsPerTurn: int(cfg.Behavior.Patterns.MaxPatternsPerTurn),
-						EnableTracking:     cfg.Behavior.Patterns.EnableTracking,
-						UseLLMClassifier:   cfg.Behavior.Patterns.UseLlmClassifier,
-					}
-				}
+				agentCfg := serveAgentConfig(cfg, config.Observability.Enabled)
 
 				// Set PatternsDir from metadata or the server-level default.
 				// Patterns are enabled by default (DefaultPatternConfig), so all agents
@@ -1932,12 +2119,6 @@ func runServe(cmd *cobra.Command, args []string) {
 				} else {
 					agentCfg.PatternsDir = filepath.Join(loomconfig.GetLoomDataDir(), "patterns")
 				}
-				// Skills config: just attach to agentCfg here. Discovery
-				// wiring requires the agent's LLM provider and is performed
-				// below once agentLLMProvider is resolved.
-				if sc := agent.ExtractSkillsConfig(cfg.Metadata); sc != nil && sc.Enabled {
-					agentCfg.SkillsConfig = sc
-				}
 
 				agentOpts = append(agentOpts, agent.WithConfig(agentCfg))
 
@@ -1947,6 +2128,12 @@ func runServe(cmd *cobra.Command, args []string) {
 				// tools.minimal/none never disables the extractor itself, so
 				// background entity extraction keeps running (via compressor_llm
 				// when declared) even when the tool is hidden from the LLM.
+
+				// Decision layer: the agent resolves its configured decider
+				// against its own LLMs after options apply; a nil config is
+				// off. Same wiring as registry.buildAgent.
+				agentOpts = append(agentOpts, agent.WithDecisionConfig(cfg.GetDecision(), decisionShadowStore))
+
 				if graphMemoryStore != nil {
 					gmCfg := cfg.Memory.GetGraphMemory()
 					explicitlyDisabled := gmCfg != nil && !gmCfg.Enabled
@@ -2005,10 +2192,17 @@ func runServe(cmd *cobra.Command, args []string) {
 				// deployment. A nil chain leaves tool execution a pass-through.
 				agentOpts = append(agentOpts, agent.WithAdmissionHooks(admissionChain))
 				agentOpts = append(agentOpts, agent.WithIdentityResolver(postgres.UserIDFromContext))
+				agentOpts = append(agentOpts, agent.WithEventLog(executionLog))
 
 				// The agent's own models from its YAML (llm, compressor_llm,
 				// classifier_llm), or the server default.
 				roles := buildAgentLLMs(cfg, llmProvider, config, tracer, guardLLM, logger)
+				if roles.unbuildable != nil {
+					// A provider that allows no fallback (bedrock-mantle) could
+					// not be built: the agent does not start.
+					skipAgentForUnbuildableLLM(logger, cfg.Name, roles.unbuildableRole, roles.unbuildableCfg, backend, roles.unbuildable)
+					continue
+				}
 				agentLLMProvider := roles.primary
 				staticClassifierLLM := roles.classifier
 				agentOpts = append(agentOpts, roles.opts...)
@@ -2064,6 +2258,7 @@ func runServe(cmd *cobra.Command, args []string) {
 				// hot-reload path via registerYAMLBuiltinTools so the two
 				// paths cannot drift.
 				registerYAMLBuiltinTools(ag, cfg, registry, logger, "    ", "agent_management")
+				registerLuaTools(ag, cfg, luaRT, logger, "    ")
 
 				// Register contact_human tool with the shared HITL store (if listed in builtin tools)
 				if cfg.Tools != nil {
@@ -2126,7 +2321,9 @@ func runServe(cmd *cobra.Command, args []string) {
 				// Register tool_search and enable dynamic tool registration if tool registry available.
 				// Suppressed by tools.minimal=true so the LLM cannot discover or auto-load tools.
 				if toolRegistry != nil && !toolsMinimalActive() {
-					searchTool := toolregistry.NewSearchTool(toolRegistry)
+					// Per-agent: the agent's decision layer (if any) travels
+					// with its own SearchTool, never with the shared registry.
+					searchTool := toolregistry.NewSearchTool(toolRegistry, ag.SearchToolOptions()...)
 					// Hide tools the permission policy would refuse, so the model
 					// never discovers (then calls) a disabled tool via tool_search.
 					if permissionChecker != nil {
@@ -2168,6 +2365,7 @@ func runServe(cmd *cobra.Command, args []string) {
 				// Store agent with GUID as key for stable references
 				agents[agentGUID] = ag
 				uiAppToolsDeclared[agentGUID] = declaresUIAppTools(cfg)
+				staticAgentConfigs[agentGUID] = cfg
 			}
 		}
 		// DO NOT close registry - keep it alive for hot-reload
@@ -2346,6 +2544,9 @@ func runServe(cmd *cobra.Command, args []string) {
 		grpcServer = grpc.NewServer(serverOpts...)
 	}
 	loomService := server.NewMultiAgentServer(agents, store)
+	for guid, cfg := range staticAgentConfigs {
+		loomService.SetAgentConfig(guid, cfg)
+	}
 	// Authenticated deployments are multi-tenant: blank identities must not
 	// act as session-ownership wildcards. Unauthenticated deployments keep
 	// the explicit single-tenant compatibility mode.
@@ -2552,7 +2753,7 @@ func runServe(cmd *cobra.Command, args []string) {
 	// policy. See wireRegistrySubsystems for the regression this guards.
 	if registry != nil {
 		wireRegistrySubsystems(registry, taskManager, taskDecomposer,
-			graphMemoryStore, memoryEmbedder, builtinToolsToSuppress(), logger)
+			graphMemoryStore, memoryEmbedder, builtinToolsToSuppress(), decisionShadowStore, logger)
 	}
 
 	// Wire the eval store for ABTest result persistence — pool-independent.
@@ -2637,6 +2838,12 @@ func runServe(cmd *cobra.Command, args []string) {
 	if uiRegistry.Count() > 0 {
 		loomService.SetAppProvider(uiRegistry)
 		logger.Info("UI apps registered for gRPC", zap.Int("count", uiRegistry.Count()))
+	}
+
+	// Saved Lua scripts over RPC (ListLuaScripts/GetLuaScript/SaveLuaScript/
+	// DeleteLuaScript); left unset, they return FailedPrecondition.
+	if luaRT != nil {
+		loomService.SetLuaScriptStore(luaRT.store)
 	}
 
 	// Wire up the UI app compiler for dynamic app creation (CreateUIApp/UpdateUIApp RPCs)
@@ -3172,40 +3379,7 @@ func runServe(cmd *cobra.Command, args []string) {
 				backend = &mockBackend{}
 			}
 
-			// Create agent configuration
-			// Set max_turns and max_tool_executions from behavior config if specified, otherwise use defaults
-			maxTurns := 25          // Default from pkg/agent/types.go:145
-			maxToolExecutions := 50 // Default from pkg/agent/types.go:146
-			if agentConfig.Behavior != nil {
-				if agentConfig.Behavior.MaxTurns > 0 {
-					maxTurns = int(agentConfig.Behavior.MaxTurns)
-				}
-				if agentConfig.Behavior.MaxToolExecutions > 0 {
-					maxToolExecutions = int(agentConfig.Behavior.MaxToolExecutions)
-				}
-			}
-
-			cfg := &agent.Config{
-				Name:              agentConfig.Name,
-				Description:       agentConfig.Description,
-				MaxTurns:          maxTurns,
-				MaxToolExecutions: maxToolExecutions,
-				SystemPrompt:      agentConfig.SystemPrompt,
-				Rom:               agentConfig.Rom,      // ROM identifier for domain-specific knowledge
-				Metadata:          agentConfig.Metadata, // Metadata includes backend_path for ROM auto-detection
-				EnableTracing:     config.Observability.Enabled,
-			}
-
-			// Transfer pattern configuration from proto if present
-			if agentConfig.Behavior != nil && agentConfig.Behavior.Patterns != nil {
-				cfg.PatternConfig = &agent.PatternConfig{
-					Enabled:            agentConfig.Behavior.Patterns.Enabled,
-					MinConfidence:      float64(agentConfig.Behavior.Patterns.MinConfidence),
-					MaxPatternsPerTurn: int(agentConfig.Behavior.Patterns.MaxPatternsPerTurn),
-					EnableTracking:     agentConfig.Behavior.Patterns.EnableTracking,
-					UseLLMClassifier:   agentConfig.Behavior.Patterns.UseLlmClassifier,
-				}
-			}
+			cfg := serveAgentConfig(agentConfig, config.Observability.Enabled)
 
 			// Set PatternsDir from metadata or the server-level default.
 			if pd, ok := agentConfig.Metadata["patterns_dir"]; ok && pd != "" {
@@ -3214,18 +3388,6 @@ func runServe(cmd *cobra.Command, args []string) {
 				cfg.PatternsDir = config.PatternsDir
 			} else {
 				cfg.PatternsDir = filepath.Join(loomconfig.GetLoomDataDir(), "patterns")
-			}
-
-			// Set context limits if specified in LLM config
-			if agentConfig.Llm != nil {
-				if agentConfig.Llm.MaxContextTokens > 0 {
-					cfg.MaxContextTokens = int(agentConfig.Llm.MaxContextTokens)
-				}
-				// The EFFECTIVE reservation — see the note at the other build site.
-				cfg.ReservedOutputTokens = agent.EffectiveOutputReservation(
-					agentConfig.Llm.Provider, agentConfig.Llm.Model,
-					int(agentConfig.Llm.MaxTokens), int(agentConfig.Llm.ReservedOutputTokens),
-					int(agentConfig.Llm.MaxContextTokens))
 			}
 
 			// Create memory instance for this agent
@@ -3274,6 +3436,10 @@ func runServe(cmd *cobra.Command, args []string) {
 			// Wire graph memory SUBSYSTEM (mirrors the static-loader path).
 			// tools.minimal/none never disables the extractor; tool surfacing
 			// is gated separately via WithoutBuiltinTool below.
+
+			// Decision layer, as at startup (hot-reload path).
+			agentOpts = append(agentOpts, agent.WithDecisionConfig(agentConfig.GetDecision(), decisionShadowStore))
+
 			if graphMemoryStore != nil {
 				gmCfg := agentConfig.GetMemory().GetGraphMemory()
 				explicitlyDisabled := gmCfg != nil && !gmCfg.Enabled
@@ -3325,13 +3491,40 @@ func runServe(cmd *cobra.Command, args []string) {
 			// deployment. A nil chain leaves tool execution a pass-through.
 			agentOpts = append(agentOpts, agent.WithAdmissionHooks(admissionChain))
 			agentOpts = append(agentOpts, agent.WithIdentityResolver(postgres.UserIDFromContext))
+			agentOpts = append(agentOpts, agent.WithEventLog(executionLog))
 
 			// The agent's own models from its YAML, as at startup. (This used
 			// to wrap the shared server provider in place, adding a layer of
 			// instrumentation on every reload and dropping the agent's own
 			// llm and compressor_llm.)
 			roles := buildAgentLLMs(agentConfig, llmProvider, config, tracer, guardLLM, logger)
+			if roles.unbuildable != nil {
+				// Keep the running agent rather than start one on the wrong
+				// provider (bedrock-mantle allows no fallback).
+				return fmt.Errorf("agent %q: %s provider %q cannot be built: %w",
+					agentConfig.Name, roles.unbuildableRole, roles.unbuildableCfg.GetProvider(), roles.unbuildable)
+			}
 			agentOpts = append(agentOpts, roles.opts...)
+			reloadClassifierLLM := roles.classifier
+
+			// Wire skills (orchestrator + Discovery + hierarchical router) via
+			// the shared BuildSkillsOptions helper, matching the cold-start path.
+			if cfg.SkillsConfig != nil && cfg.SkillsConfig.Enabled {
+				if registry != nil {
+					agentOpts = append(agentOpts,
+						registry.BuildSkillsOptions(cfg.SkillsConfig, reloadClassifierLLM, roles.primary, agentConfig.Name)...)
+				} else {
+					agentOpts = append(agentOpts,
+						agent.BuildSkillsOptions(agent.SkillsWiringDeps{
+							SkillsConfig:  cfg.SkillsConfig,
+							ClassifierLLM: reloadClassifierLLM,
+							PrimaryLLM:    roles.primary,
+							AgentName:     agentConfig.Name,
+							Tracer:        tracer,
+							Logger:        logger,
+						})...)
+				}
+			}
 
 			// Create new agent
 			newAgent := agent.NewAgent(backend, roles.primary, agentOpts...)
@@ -3376,6 +3569,7 @@ func runServe(cmd *cobra.Command, args []string) {
 			// on toolName=="shell_execute" and silently dropped YAML-declared
 			// shell_execute on hot reload under tools.minimal/none.
 			registerYAMLBuiltinTools(newAgent, agentConfig, registry, logger, "  ", "agent_management (reload)")
+			registerLuaTools(newAgent, agentConfig, luaRT, logger, "  ")
 
 			// Register contact_human tool with shared HITL store (if listed in builtin tools)
 			if agentConfig.Tools != nil {
@@ -3438,7 +3632,8 @@ func runServe(cmd *cobra.Command, args []string) {
 			// Register tool_search and enable dynamic tool registration if tool registry available.
 			// Suppressed by tools.minimal=true so the LLM cannot discover or auto-load tools.
 			if toolRegistry != nil && !toolsMinimalActive() {
-				searchTool := toolregistry.NewSearchTool(toolRegistry)
+				// Per-agent decision layer, as at startup.
+				searchTool := toolregistry.NewSearchTool(toolRegistry, newAgent.SearchToolOptions()...)
 				if permissionChecker != nil {
 					searchTool.SetToolFilter(permissionChecker.Advertisable)
 				}
@@ -3483,12 +3678,14 @@ func runServe(cmd *cobra.Command, args []string) {
 				if err := loomService.UpdateAgent(agentGUIDToUse, newAgent); err != nil {
 					return fmt.Errorf("failed to update agent in server: %w", err)
 				}
+				loomService.SetAgentConfig(agentGUIDToUse, agentConfig)
 				logger.Info("  Agent reloaded in server successfully",
 					zap.String("agent", name),
 					zap.String("guid", agentGUIDToUse))
 			} else {
 				// New agent from metaagent: add to server
 				loomService.AddAgent(agentGUIDToUse, newAgent)
+				loomService.SetAgentConfig(agentGUIDToUse, agentConfig)
 				logger.Info("  Agent added to server successfully",
 					zap.String("agent", name),
 					zap.String("guid", agentGUIDToUse))
@@ -3932,6 +4129,8 @@ func initializeMCPManager(config *Config, logger *zap.Logger) (*mcpManager, erro
 			Headers:          expandMCPHeaders(serverConfig.Headers),
 			EnableSessions:   serverConfig.EnableSessions,
 			EnableResumption: serverConfig.EnableResumption,
+			MaxResponseBytes: serverConfig.MaxResponseBytes,
+			TrustAnnotations: serverConfig.TrustAnnotations,
 			Enabled:          enabled,
 			// Per-person servers learn who the agent is acting for.
 			ForwardCallerIdentity: serverConfig.ForwardCallerIdentity,
@@ -4137,6 +4336,13 @@ type agentLLMs struct {
 	classifier agent.LLMProvider
 	// opts wire compressor_llm and classifier_llm into the agent.
 	opts []agent.Option
+	// unbuildable is set when a role's provider failed to build and that
+	// provider allows no fallback (customLLMFallbackAllowed): the agent must
+	// not run. unbuildableRole ("llm", "compressor_llm", "classifier_llm")
+	// and unbuildableCfg say which.
+	unbuildable     error
+	unbuildableRole string
+	unbuildableCfg  *loomv1.LLMConfig
 }
 
 // buildAgentLLMs builds an agent's providers from cfg: its llm (else
@@ -4158,6 +4364,10 @@ func buildAgentLLMs(cfg *loomv1.AgentConfig, serverDefault agent.LLMProvider, co
 			zap.String("provider", cfg.Llm.Provider),
 			zap.String("model", cfg.Llm.Model))
 		customLLM, err := createLLMProviderFromProtoConfig(cfg.Llm, config, logger)
+		if err != nil && !customLLMFallbackAllowed(cfg.Llm.Provider) {
+			out.unbuildable, out.unbuildableRole, out.unbuildableCfg = err, "llm", cfg.Llm
+			return out
+		}
 		if err != nil {
 			logger.Warn("    Failed to create custom LLM provider, using server default",
 				zap.Error(err))
@@ -4177,6 +4387,10 @@ func buildAgentLLMs(cfg *loomv1.AgentConfig, serverDefault agent.LLMProvider, co
 	// a single-slot local model. Mirrors pkg/agent/registry.go buildAgent.
 	if cfg.CompressorLlm != nil && cfg.CompressorLlm.Provider != "" {
 		compLLM, err := createLLMProviderFromProtoConfig(cfg.CompressorLlm, config, logger)
+		if err != nil && !customLLMFallbackAllowed(cfg.CompressorLlm.Provider) {
+			out.unbuildable, out.unbuildableRole, out.unbuildableCfg = err, "compressor_llm", cfg.CompressorLlm
+			return out
+		}
 		if err != nil {
 			logger.Warn("    Failed to create compressor LLM, extractor will use primary",
 				zap.Error(err),
@@ -4191,6 +4405,10 @@ func buildAgentLLMs(cfg *loomv1.AgentConfig, serverDefault agent.LLMProvider, co
 	}
 	if cfg.ClassifierLlm != nil && cfg.ClassifierLlm.Provider != "" {
 		classLLM, err := createLLMProviderFromProtoConfig(cfg.ClassifierLlm, config, logger)
+		if err != nil && !customLLMFallbackAllowed(cfg.ClassifierLlm.Provider) {
+			out.unbuildable, out.unbuildableRole, out.unbuildableCfg = err, "classifier_llm", cfg.ClassifierLlm
+			return out
+		}
 		if err != nil {
 			logger.Warn("    Failed to create classifier LLM, router will use primary",
 				zap.Error(err),

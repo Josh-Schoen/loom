@@ -100,7 +100,7 @@ When Loom runs with a SQLite storage backend:
 1. **Identity is optional**: a request's identity is the `x-user-id` gRPC metadata header (or the JWT subject when authentication is enabled) when present, and `"default-user"` otherwise.
 2. **No Row Level Security (RLS)**: SQLite does not support RLS. There is no database-level isolation.
 3. **`require_user_id` is ignored**: Even if `require_user_id` is set to `true` in configuration, the SQLite backend forces it to `false`. A warning is logged at startup: `"SQLite backend does not support user ID requirement; require_user_id ignored"`.
-4. **Store-level filtering only**: the session store and the graph memory store add `user_id` predicates to their queries, so sessions and graph memory (entities, edges, memories) are separated per identity. Other data is shared. Loom does not authenticate the identity, so the separation is only as strong as whatever sets it.
+4. **Store-level filtering only**: the session store and the graph memory store add `user_id` predicates to their queries, so sessions and graph memory (entities, edges, memories) are separated per identity. Lessons the agent mines from tool calls are graph memories, so they stay with the user whose session produced them; `fleet_lesson_sharing` shares them across agents, not across users. Other data is shared. Loom does not authenticate the identity, so the separation is only as strong as whatever sets it.
 
 ### When to Use SQLite
 

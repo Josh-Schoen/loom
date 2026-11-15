@@ -115,9 +115,12 @@ type Message struct {
 	Thinking string
 
 	// ThinkingBlocks carries the assistant's extended-thinking blocks for
-	// in-turn replay (tool-loop continuations). Opaque: signatures are
-	// provider-signed and never interpreted. Never persisted — the compile
-	// strips settled turns and the persist seam drops them entirely.
+	// replay: always within the turn (tool-loop continuations), and on a
+	// settled turn only while the compiled context before the message — with
+	// the model ID and the advertised tool schemas — fingerprints as it did
+	// when the model wrote them (pkg/agent thinkingPrefix). Opaque: signatures
+	// are provider-signed and never interpreted. Never persisted — the persist
+	// seam drops them, so a reloaded session has none to replay.
 	ThinkingBlocks []ThinkingBlock
 
 	// ToolUseID is the ID of the tool_use block this result corresponds to (if role is tool)
@@ -579,6 +582,21 @@ type ProgressEvent struct {
 	// far; set only on IsToolInputStream events. Events are throttled, so the
 	// last value a consumer sees can lag the final size until tool-started.
 	ToolInputBytes int64
+
+	// ToolCallIndex is the provider's stream index for this tool call; set
+	// only on IsToolInputStream events. On providers that deliver calls in
+	// order (Anthropic, Bedrock, Gemini, Ollama) it matches the call's
+	// position in the response's tool-call list. On OpenAI-compatible
+	// providers (OpenAI, Azure, LiteLLM, Mistral, HuggingFace) the final
+	// tool-call list is built from a map, so its order is not guaranteed to
+	// match this index; match a progress event to its tool-started event by
+	// ToolCallID there. Gemini repeats the function name in ToolCallID, so
+	// two parallel calls to the same tool share an ID and only this index
+	// tells them apart. The agent's throttling keys on the same index, so
+	// events for one call never interleave with another's. A bare activity
+	// pulse (no ToolCallID, no ToolName, 0 bytes) carries index 0 without
+	// being call 0; skip pulses.
+	ToolCallIndex int32
 
 	// TokenCount is the running count of tokens received
 	TokenCount int32
