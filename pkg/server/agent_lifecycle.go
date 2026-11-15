@@ -7,6 +7,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/google/uuid"
@@ -147,6 +148,23 @@ func ensureConfigDefaults(config *loomv1.AgentConfig) {
 	}
 }
 
+func directAgentOptions(config *loomv1.AgentConfig) []agent.Option {
+	opts := []agent.Option{agent.WithName(config.Name)}
+	if config.Description != "" {
+		opts = append(opts, agent.WithDescription(config.Description))
+	}
+	if config.SystemPrompt != "" {
+		opts = append(opts, agent.WithSystemPrompt(config.SystemPrompt))
+	}
+	if config.Rom != "" {
+		opts = append(opts, agent.WithROM(config.Rom))
+	}
+	if len(config.Metadata) > 0 {
+		opts = append(opts, agent.WithMetadata(config.Metadata))
+	}
+	return opts
+}
+
 // CreateAgentFromConfig creates a new agent from the provided configuration or config file path.
 func (s *MultiAgentServer) CreateAgentFromConfig(ctx context.Context, req *loomv1.CreateAgentRequest) (*loomv1.AgentInfo, error) {
 	if req.Config == nil && req.ConfigPath == "" {
@@ -217,17 +235,7 @@ func (s *MultiAgentServer) CreateAgentFromConfig(ctx context.Context, req *loomv
 	// Fallback: create agent directly without registry (for testing or simple setups)
 	agentID := uuid.New().String()
 
-	opts := []agent.Option{
-		agent.WithName(agentConfig.Name),
-	}
-	if agentConfig.Description != "" {
-		opts = append(opts, agent.WithDescription(agentConfig.Description))
-	}
-	if agentConfig.SystemPrompt != "" {
-		opts = append(opts, agent.WithSystemPrompt(agentConfig.SystemPrompt))
-	}
-
-	ag := agent.NewAgent(nil, nil, opts...)
+	ag := agent.NewAgent(nil, nil, directAgentOptions(agentConfig)...)
 	ag.SetID(agentID)
 
 	s.AddAgent(agentID, ag)
@@ -490,20 +498,84 @@ func (s *MultiAgentServer) ReloadAgent(ctx context.Context, req *loomv1.ReloadAg
 
 	if req.ReloadFromFile {
 		if s.registry != nil {
-			// ForceReload rebuilds the agent the way the config file watcher
-			// does (tools, MCP servers, UI app tools) and puts it in this
-			// server through the registry's reload callback. The registry's
-			// own ReloadAgent only replaced the registry's copy, so the agent
-			// answering kept its old instructions and tools.
-			name := ag.GetName()
-			if reloadErr := s.registry.ForceReload(ctx, name); reloadErr != nil {
-				return nil, status.Errorf(codes.Internal, "failed to reload agent from file: %v", reloadErr)
+			var refreshed *agent.Agent
+			if s.registry.OwnsRuntimeAgent(ag) {
+				if reloadErr := s.registry.ReloadAgent(ctx, resolvedID); reloadErr != nil {
+					if errors.Is(reloadErr, agent.ErrAgentChanged) {
+						return nil, status.Errorf(codes.Aborted, "failed to reload agent from file: %v", reloadErr)
+					}
+					return nil, status.Errorf(codes.Internal, "failed to reload agent from file: %v", reloadErr)
+				}
+				refreshed, err = s.registry.GetAgent(ctx, resolvedID)
+				if err != nil {
+					return nil, status.Errorf(codes.Internal, "failed to retrieve reloaded agent: %v", err)
+				}
+				if updateErr := s.UpdateAgent(resolvedID, refreshed); updateErr != nil {
+					return nil, status.Errorf(codes.Internal, "failed to update reloaded agent: %v", updateErr)
+				}
+			} else if s.registry.HasReloadCallback() {
+				previousConfig := s.registry.GetConfig(ag.GetName())
+				s.mu.RLock()
+				beforeKeys := make(map[string]*agent.Agent, len(s.agents))
+				for k, v := range s.agents {
+					beforeKeys[k] = v
+				}
+				s.mu.RUnlock()
+
+				if reloadErr := s.registry.ForceReload(ctx, ag.GetName()); reloadErr != nil {
+					if errors.Is(reloadErr, agent.ErrAgentChanged) {
+						return nil, status.Errorf(codes.Aborted, "failed to reload agent from file: %v", reloadErr)
+					}
+					return nil, status.Errorf(codes.Internal, "failed to reload agent from file: %v", reloadErr)
+				}
+				refreshed, _, err = s.getAgent(resolvedID)
+				if err != nil {
+					return nil, status.Errorf(codes.Internal, "failed to retrieve reloaded agent: %v", err)
+				}
+				if refreshed == ag {
+					// If the server and registry disagreed on the agent GUID,
+					// the callback may have registered the rebuilt agent under
+					// a different key (its registry GUID or name). Reconcile it
+					// onto resolvedID so the duplicate entry does not linger.
+					var extraKey string
+					var candidate *agent.Agent
+					s.mu.RLock()
+					for k, v := range s.agents {
+						if k != resolvedID && v != ag && v != nil && v.GetName() == ag.GetName() && beforeKeys[k] != v {
+							extraKey = k
+							candidate = v
+							break
+						}
+					}
+					s.mu.RUnlock()
+					if candidate != nil {
+						candidate.SetID(resolvedID)
+						if updateErr := s.UpdateAgent(resolvedID, candidate); updateErr != nil {
+							return nil, status.Errorf(codes.Internal, "failed to update reloaded agent: %v", updateErr)
+						}
+						s.mu.Lock()
+						delete(s.agents, extraKey)
+						if s.agentStates != nil {
+							delete(s.agentStates, extraKey)
+						}
+						s.mu.Unlock()
+						refreshed = candidate
+					} else {
+						if previousConfig != nil {
+							s.registry.RegisterConfig(previousConfig)
+						}
+						return nil, status.Errorf(codes.Internal, "reload callback did not replace agent %q", resolvedID)
+					}
+				}
+			} else {
+				return nil, status.Errorf(codes.FailedPrecondition, "agent %q has no registry runtime or reload callback", resolvedID)
 			}
-			newConfig = s.registry.GetConfig(name)
-			if fresh, _, freshErr := s.getAgent(resolvedID); freshErr == nil && fresh != ag {
-				ag = fresh
-				applied = true
+			newConfig = s.registry.GetConfig(refreshed.GetName())
+			if newConfig == nil {
+				return nil, status.Errorf(codes.Internal, "reloaded agent %q has no config", refreshed.GetName())
 			}
+			ag = refreshed
+			applied = true
 		} else {
 			return nil, status.Error(codes.FailedPrecondition, "reload_from_file requires an agent registry; no registry configured")
 		}
@@ -543,17 +615,7 @@ func (s *MultiAgentServer) ReloadAgent(ctx context.Context, req *loomv1.ReloadAg
 			applied = true
 		} else {
 			// Simple reload without registry: create new agent with updated opts
-			opts := []agent.Option{
-				agent.WithName(newConfig.Name),
-			}
-			if newConfig.Description != "" {
-				opts = append(opts, agent.WithDescription(newConfig.Description))
-			}
-			if newConfig.SystemPrompt != "" {
-				opts = append(opts, agent.WithSystemPrompt(newConfig.SystemPrompt))
-			}
-
-			newAgent := agent.NewAgent(nil, nil, opts...)
+			newAgent := agent.NewAgent(nil, nil, directAgentOptions(newConfig)...)
 			newAgent.SetID(resolvedID)
 
 			if updateErr := s.UpdateAgent(resolvedID, newAgent); updateErr != nil {
@@ -603,4 +665,37 @@ func (s *MultiAgentServer) ReloadAgent(ctx context.Context, req *loomv1.ReloadAg
 		info.Metadata["reload_applied"] = "true"
 	}
 	return info, nil
+}
+
+// SetAgentConfig records the proto configuration an agent was built from,
+// so GetAgent and ListAgents can return it. Agents created through
+// CreateAgentFromConfig and ReloadAgent record theirs on the way in; agents
+// the host loads itself (looms serve at startup and on hot-reload) call this
+// after AddAgent, or GetAgent returns them with no config, which is what
+// left the LongMemEval runner cloning a template instead of the named agent.
+func (s *MultiAgentServer) SetAgentConfig(agentID string, cfg *loomv1.AgentConfig) {
+	if cfg == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	states := s.getOrInitAgentStates()
+	now := time.Now()
+	if st, ok := states[agentID]; ok {
+		st.Config = cfg
+		st.UpdatedAt = now
+		return
+	}
+	name := cfg.GetName()
+	if ag, ok := s.agents[agentID]; ok && ag != nil {
+		name = ag.GetName()
+	}
+	states[agentID] = &agentState{
+		ID:        agentID,
+		Name:      name,
+		Status:    "running",
+		CreatedAt: now,
+		UpdatedAt: now,
+		Config:    cfg,
+	}
 }

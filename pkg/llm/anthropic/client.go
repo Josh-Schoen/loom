@@ -39,6 +39,9 @@ const (
 	DefaultAnthropicModel = "claude-sonnet-4-5-20250929"
 	// DefaultAnthropicEndpoint is the default Anthropic API endpoint
 	DefaultAnthropicEndpoint = "https://api.anthropic.com/v1/messages"
+	// DefaultCatalogProvider is the pkg/llm/catalog namespace costs are
+	// resolved under when Config.CatalogProvider is empty.
+	DefaultCatalogProvider = "anthropic"
 	// DefaultMaxTokens is the default maximum tokens per request
 	DefaultMaxTokens = 4096
 	// DefaultTemperature is the default LLM temperature
@@ -78,19 +81,22 @@ func DefaultAnthropicRateLimiterConfig() llm.RateLimiterConfig {
 
 // Client implements the LLMProvider interface for Anthropic's Claude API.
 type Client struct {
-	apiKey     string
-	model      string
-	endpoint   string
-	httpClient *http.Client
+	schemaPolicy      llm.ToolSchemaPolicy
+	strictToolSchemas bool
+	apiKey            string
+	model             string
+	endpoint          string
+	httpClient        *http.Client
+	maxTokens         int
+	temperature       float64
+	thinkingLevel     string
+	rateLimiter       *llm.RateLimiter
+	noBetaHeaders     bool
+	catalogProvider   string
 	// streamClient has no overall timeout: a streamed reply is bounded by
 	// the time to its first byte and by StreamIdleTimeout between events.
-	streamClient  *http.Client
-	streamIdle    time.Duration
-	maxTokens     int
-	temperature   float64
-	thinkingLevel string
-	rateLimiter   *llm.RateLimiter
-	toolNameMap   map[string]string // sanitized name → original name
+	streamClient *http.Client
+	streamIdle   time.Duration
 	// noFallbacks is set when the API rejected the server-side fallback
 	// option; later requests from this client leave it out.
 	noFallbacks atomic.Bool
@@ -98,17 +104,34 @@ type Client struct {
 
 // Config holds configuration for the Anthropic client.
 type Config struct {
-	APIKey      string
-	Model       string // Default: claude-sonnet-4-5-20250929
-	Endpoint    string // Default: https://api.anthropic.com/v1/messages
-	Timeout     time.Duration
-	MaxTokens   int     // Default: 4096
-	Temperature float64 // Default: 1.0
+	StrictToolSchemas bool
+	APIKey            string
+	Model             string // Default: claude-sonnet-4-5-20250929
+	Endpoint          string // Default: https://api.anthropic.com/v1/messages
+	Timeout           time.Duration
+	MaxTokens         int     // Default: 4096
+	Temperature       float64 // Default: 1.0
 	// ThinkingLevel requests extended thinking ("", "none" = off). Non-off
 	// levels map to adaptive (display summarized) on 4.6+/5 models and to
 	// budget_tokens tiers (low 4k / medium+auto 16k / high 32k) on older ones.
 	ThinkingLevel     string
 	RateLimiterConfig llm.RateLimiterConfig
+	// NoBetaHeaders suppresses the anthropic-beta header on every request.
+	// Anthropic-compatible gateways such as Amazon Bedrock Mantle reject any
+	// beta value with 400 "Unexpected value(s) … for the anthropic-beta header"
+	// (verified live 2026-11-04). Prompt caching does not depend on the header:
+	// cache_control blocks are honored without it.
+	NoBetaHeaders bool
+	// CatalogProvider is the pkg/llm/catalog namespace calculateCost prices
+	// under. Default "anthropic". Set it when this client fronts a gateway whose
+	// model ids are not Anthropic's (Bedrock Mantle's "anthropic.claude-haiku-4-5",
+	// for example) so costs resolve against that namespace instead of the
+	// substring fallback rates.
+	CatalogProvider string
+	// WrapTransport, when set, wraps the client's HTTP transport. It receives
+	// http.DefaultTransport and returns the RoundTripper to use. Used to sign
+	// requests (AWS SigV4 for Bedrock Mantle) and to inject test doubles.
+	WrapTransport func(http.RoundTripper) http.RoundTripper
 }
 
 // NewClient creates a new Anthropic client.
@@ -142,22 +165,56 @@ func NewClient(config Config) *Client {
 	// Initialize rate limiter if enabled
 	var rateLimiter *llm.RateLimiter
 	if config.RateLimiterConfig.Enabled {
-		rateLimiter = llm.SharedRateLimiter("anthropic|"+llm.CredentialScope(config.APIKey)+"|"+config.Model, mergedRateLimiterConfig(config.RateLimiterConfig))
+		// Keyed by credential+endpoint+model so a client pointed at a gateway
+		// (Bedrock Mantle) never shares a limiter with one on api.anthropic.com.
+		rateLimiter = llm.SharedRateLimiter("anthropic|"+llm.CredentialScope(config.APIKey)+"|"+config.Endpoint+"|"+config.Model, mergedRateLimiterConfig(config.RateLimiterConfig))
+	}
+	if config.CatalogProvider == "" {
+		config.CatalogProvider = DefaultCatalogProvider
+	}
+
+	var transport http.RoundTripper
+	stream := streamTransport(config.Timeout)
+	if config.WrapTransport != nil {
+		stream = config.WrapTransport(stream)
+		transport = config.WrapTransport(http.DefaultTransport)
 	}
 
 	return &Client{
-		apiKey:        config.APIKey,
-		model:         config.Model,
-		endpoint:      config.Endpoint,
-		maxTokens:     config.MaxTokens,
-		temperature:   config.Temperature,
-		thinkingLevel: config.ThinkingLevel,
-		rateLimiter:   rateLimiter,
+		strictToolSchemas: config.StrictToolSchemas,
+		apiKey:            config.APIKey,
+		model:             config.Model,
+		endpoint:          config.Endpoint,
+		maxTokens:         config.MaxTokens,
+		temperature:       config.Temperature,
+		thinkingLevel:     config.ThinkingLevel,
+		rateLimiter:       rateLimiter,
+		noBetaHeaders:     config.NoBetaHeaders,
+		catalogProvider:   config.CatalogProvider,
 		httpClient: &http.Client{
-			Timeout: config.Timeout,
+			Timeout:   config.Timeout,
+			Transport: transport,
 		},
-		streamClient: &http.Client{Transport: streamTransport(config.Timeout)},
+		streamClient: &http.Client{Transport: stream},
 		streamIdle:   StreamIdleTimeout,
+	}
+}
+
+// setRequestHeaders applies the Messages API headers. The API key is omitted
+// when empty so a signing transport (Config.WrapTransport) can supply the
+// credential instead of an empty x-api-key reaching the server. The
+// prompt-caching beta header is kept for api.anthropic.com, where existing
+// deployments rely on it, and dropped when NoBetaHeaders is set.
+func (c *Client) setRequestHeaders(r *http.Request, betaHeader string) {
+	r.Header.Set("Content-Type", "application/json")
+	if c.apiKey != "" {
+		r.Header.Set("x-api-key", c.apiKey)
+	}
+	r.Header.Set("anthropic-version", "2023-06-01")
+	if !c.noBetaHeaders && betaHeader != "" {
+		// Prompt caching (cached tokens don't count against Anthropic's ITPM
+		// rate limit) and any model-specific betas (see applyModelRules).
+		r.Header.Set("anthropic-beta", betaHeader)
 	}
 }
 
@@ -210,9 +267,14 @@ func (c *Client) Chat(ctx context.Context, messages []llmtypes.Message, tools []
 	// Extract system messages and convert to Anthropic format
 	systemPrompt, apiMessages := c.convertMessages(messages)
 
-	// Convert tools to Anthropic format with name sanitization
-	c.toolNameMap = make(map[string]string)
-	apiTools := c.convertTools(tools)
+	// Convert tools to Anthropic format with name sanitization. The sanitized →
+	// original map is per request: clients are shared across sessions (the
+	// server's provider pool), so it must never live on the Client.
+	nameMap := make(map[string]string)
+	apiTools, err := c.convertTools(ctx, tools, nameMap)
+	if err != nil {
+		return nil, err
+	}
 
 	// Build request
 	req := &MessagesRequest{
@@ -240,7 +302,7 @@ func (c *Client) Chat(ctx context.Context, messages []llmtypes.Message, tools []
 	}
 
 	// Convert response
-	return c.convertResponse(resp), nil
+	return c.convertResponse(resp, nameMap), nil
 }
 
 // thinkingParam returns the request's thinking field, or nil (omitted) when
@@ -389,9 +451,10 @@ func (c *Client) convertMessages(messages []llmtypes.Message) ([]TextBlockParam,
 		case "assistant":
 			var content []ContentBlock
 
-			// In-turn thinking replay: blocks ride back verbatim and FIRST
-			// (the response order). Empty text stays valid — MarshalJSON keeps
-			// the field present. Settled turns arrive already stripped.
+			// Thinking replay: blocks ride back verbatim and FIRST (the
+			// response order). Empty text stays valid — MarshalJSON keeps the
+			// field present. A settled turn carries its blocks only while the
+			// context before them is unchanged; the compile decides.
 			for _, tb := range msg.ThinkingBlocks {
 				if tb.Type == "redacted_thinking" {
 					content = append(content, ContentBlock{Type: "redacted_thinking", Data: tb.Thinking})
@@ -484,14 +547,24 @@ func appendUserOrCoalesce(msgs []Message, blocks []ContentBlock) []Message {
 // Tool names are sanitized to replace colons with underscores for provider compatibility.
 // The last tool in the list is marked with cache_control: ephemeral so the entire tool
 // list is cached. For Anthropic, cached tool tokens don't count against ITPM rate limits.
-func (c *Client) convertTools(tools []shuttle.Tool) []CacheableTool {
+// convertTools converts tools to the Messages API wire format. Sanitized names
+// are recorded in nameMap (sanitized → original) when it is non-nil so
+// responses can be mapped back with llm.ReverseToolName.
+func (c *Client) convertTools(ctx context.Context, tools []shuttle.Tool, nameMap map[string]string) ([]CacheableTool, error) {
 	var apiTools []CacheableTool
 
 	for _, tool := range tools {
 		originalName := tool.Name()
+		keywords, keep, err := c.schemaPolicy.Prepare(ctx, originalName, tool.InputSchema(), c.strictToolSchemas)
+		if err != nil {
+			return nil, err
+		}
+		if !keep {
+			continue
+		}
 		sanitizedName := llm.SanitizeToolName(originalName)
-		if c.toolNameMap != nil {
-			c.toolNameMap[sanitizedName] = originalName
+		if nameMap != nil {
+			nameMap[sanitizedName] = originalName
 		}
 
 		apiTool := CacheableTool{
@@ -500,12 +573,18 @@ func (c *Client) convertTools(tools []shuttle.Tool) []CacheableTool {
 		}
 
 		// Convert JSONSchema to Anthropic's input schema format
-		schema := tool.InputSchema()
-		if schema != nil {
+		if keywords != nil {
+			schemaType, _ := keywords["type"].(string)
+			properties := make(map[string]map[string]interface{})
+			for name, property := range keywords["properties"].(map[string]interface{}) {
+				properties[name], _ = property.(map[string]interface{})
+			}
+			required, _ := keywords["required"].([]string)
 			apiTool.InputSchema = InputSchema{
-				Type:       schema.Type,
-				Properties: c.convertSchemaProperties(schema.Properties),
-				Required:   schema.Required,
+				Type:       schemaType,
+				Properties: properties,
+				Required:   required,
+				keywords:   keywords,
 			}
 		}
 
@@ -518,59 +597,11 @@ func (c *Client) convertTools(tools []shuttle.Tool) []CacheableTool {
 		apiTools[len(apiTools)-1].CacheControl = &CacheControl{Type: "ephemeral"}
 	}
 
-	return apiTools
-}
-
-// convertSchemaProperties converts JSONSchema properties to Anthropic format.
-func (c *Client) convertSchemaProperties(props map[string]*shuttle.JSONSchema) map[string]map[string]interface{} {
-	if props == nil {
-		return nil
-	}
-
-	result := make(map[string]map[string]interface{})
-	for key, schema := range props {
-		propMap := make(map[string]interface{})
-		propType := schema.Type
-		if propType == "" {
-			propType = "string" // MCP tools may omit type; default to string
-		}
-		propMap["type"] = propType
-
-		if schema.Description != "" {
-			propMap["description"] = schema.Description
-		}
-		if schema.Enum != nil {
-			propMap["enum"] = schema.Enum
-		}
-		if schema.Default != nil {
-			propMap["default"] = schema.Default
-		}
-		if schema.Properties != nil {
-			propMap["properties"] = c.convertSchemaProperties(schema.Properties)
-			if propType == "string" {
-				propMap["type"] = "object"
-			}
-		}
-		if schema.Items != nil {
-			itemType := schema.Items.Type
-			if itemType == "" {
-				itemType = "string"
-			}
-			propMap["items"] = map[string]interface{}{
-				"type": itemType,
-			}
-			if propType == "string" {
-				propMap["type"] = "array"
-			}
-		}
-
-		result[key] = propMap
-	}
-	return result
+	return apiTools, nil
 }
 
 // convertResponse converts Anthropic response to agent format.
-func (c *Client) convertResponse(resp *MessagesResponse) *llmtypes.LLMResponse {
+func (c *Client) convertResponse(resp *MessagesResponse, nameMap map[string]string) *llmtypes.LLMResponse {
 	llmResp := &llmtypes.LLMResponse{
 		StopReason: resp.StopReason,
 		Usage: llmtypes.Usage{
@@ -605,7 +636,7 @@ func (c *Client) convertResponse(resp *MessagesResponse) *llmtypes.LLMResponse {
 		case "tool_use":
 			llmResp.ToolCalls = append(llmResp.ToolCalls, llmtypes.ToolCall{
 				ID:    block.ID,
-				Name:  llm.ReverseToolName(c.toolNameMap, block.Name),
+				Name:  llm.ReverseToolName(nameMap, block.Name),
 				Input: block.Input,
 			})
 		}
@@ -616,51 +647,29 @@ func (c *Client) convertResponse(resp *MessagesResponse) *llmtypes.LLMResponse {
 
 // calculateCost estimates the cost in USD based on token usage.
 // Pricing varies by model family. Cache pricing derives from input price:
-// cache_write = 1.25x input, cache_read = 0.10x input.
+// cache_write = 1.25x input, cache_read = catalog.ClaudeCacheReadMultiplier.
 func (c *Client) calculateCost(inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens int) float64 {
-	// The catalog (pkg/llm/catalog) is the source of truth for the base
-	// per-million-token rates. Fall back to substring matching only for model
-	// ids it does not list.
-	// IMPORTANT: in the fallback, check opus-4-1 BEFORE opus-4 since "opus-4-1"
-	// contains "opus-4".
-	inputPricePerM, outputPricePerM, ok := catalog.LookupPricing("anthropic", c.model)
+	// The catalog (pkg/llm/catalog) is the source of truth for the
+	// per-million-token rates; catalog.RequestPricing resolves the catalog
+	// (under c.catalogProvider, "anthropic" unless the client fronts a gateway
+	// such as Bedrock Mantle), then the Claude family fallback, and the
+	// published long-context card. Anything unrecognised gets the Sonnet 4
+	// rate. Anthropic's three input buckets are additive; together they are
+	// the prompt. A Client built without NewClient has no catalogProvider;
+	// it prices under the default namespace, as NewClient would set it.
+	provider := c.catalogProvider
+	if provider == "" {
+		provider = DefaultCatalogProvider
+	}
+	inputPricePerM, outputPricePerM, ok := catalog.RequestPricing(provider, c.model, inputTokens+cacheReadTokens+cacheCreationTokens)
 	if !ok {
-		switch {
-		case strings.Contains(c.model, "opus-4-1"):
-			// Claude Opus 4.1: $15/$75
-			inputPricePerM = 15.0
-			outputPricePerM = 75.0
-		case strings.Contains(c.model, "opus-4"):
-			// Claude Opus 4.5, 4.6, 4.7: $5/$25
-			inputPricePerM = 5.0
-			outputPricePerM = 25.0
-		case strings.Contains(c.model, "opus"):
-			// Any Opus 5+ absent from the catalog: $5/$25, never the
-			// sonnet default — a missing catalog entry must not silently
-			// under-price Opus at sonnet rates.
-			inputPricePerM = 5.0
-			outputPricePerM = 25.0
-		case strings.Contains(c.model, "fable"):
-			// Claude Fable 5: $10/$50. Not the sonnet default — Fable is the
-			// most expensive family, so a missing catalog entry must never
-			// under-price it.
-			inputPricePerM = 10.0
-			outputPricePerM = 50.0
-		case strings.Contains(c.model, "haiku"):
-			// Claude Haiku 4.5: $1/$5
-			inputPricePerM = 1.0
-			outputPricePerM = 5.0
-		default:
-			// Claude Sonnet 4.5, 4.6 and any unrecognized model: $3/$15
-			inputPricePerM = 3.0
-			outputPricePerM = 15.0
-		}
+		inputPricePerM, outputPricePerM = 3.0, 15.0
 	}
 
 	inputCost := float64(inputTokens) * inputPricePerM / 1_000_000
 	outputCost := float64(outputTokens) * outputPricePerM / 1_000_000
-	cacheWriteCost := float64(cacheCreationTokens) * (inputPricePerM * 1.25) / 1_000_000
-	cacheReadCost := float64(cacheReadTokens) * (inputPricePerM * 0.10) / 1_000_000
+	cacheWriteCost := float64(cacheCreationTokens) * inputPricePerM * catalog.ClaudeCacheWriteMultiplier / 1_000_000
+	cacheReadCost := float64(cacheReadTokens) * inputPricePerM * catalog.ClaudeCacheReadMultiplier(c.model) / 1_000_000
 	return inputCost + outputCost + cacheWriteCost + cacheReadCost
 }
 
@@ -672,8 +681,11 @@ func (c *Client) ChatStream(ctx context.Context, messages []llmtypes.Message,
 
 	// 1. Build request body (extract system messages and convert to Anthropic format)
 	systemPrompt, apiMessages := c.convertMessages(messages)
-	c.toolNameMap = make(map[string]string)
-	apiTools := c.convertTools(tools)
+	nameMap := make(map[string]string)
+	apiTools, err := c.convertTools(ctx, tools, nameMap)
+	if err != nil {
+		return nil, err
+	}
 
 	req := &MessagesRequest{
 		Model:        c.model,
@@ -713,9 +725,11 @@ func (c *Client) ChatStream(ctx context.Context, messages []llmtypes.Message,
 		// Positive identification of the provider's context-too-long refusal
 		// (HLD §5.2 step 12) — the only relief trigger.
 		if llm.IsAnthropicContextTooLong(httpResp.StatusCode, respBody) {
-			return nil, fmt.Errorf("API error (status %d): %s: %w", httpResp.StatusCode, string(respBody), llm.ErrContextTooLong)
+			return nil, llm.WrapHTTPStatus(httpResp.StatusCode,
+				fmt.Errorf("API error (status %d): %s: %w", httpResp.StatusCode, string(respBody), llm.ErrContextTooLong))
 		}
-		return nil, fmt.Errorf("API error (status %d): %s", httpResp.StatusCode, string(respBody))
+		return nil, llm.WrapHTTPStatus(httpResp.StatusCode,
+			fmt.Errorf("API error (status %d): %s", httpResp.StatusCode, string(respBody)))
 	}
 
 	// 3. Process Server-Sent Events (SSE) stream
@@ -822,7 +836,7 @@ func (c *Client) ChatStream(ctx context.Context, messages []llmtypes.Message,
 					idx := len(toolCalls)
 					toolCalls = append(toolCalls, llmtypes.ToolCall{
 						ID:    event.ContentBlock.ID,
-						Name:  llm.ReverseToolName(c.toolNameMap, event.ContentBlock.Name),
+						Name:  llm.ReverseToolName(nameMap, event.ContentBlock.Name),
 						Input: make(map[string]interface{}),
 					})
 					toolInputBuffers[event.Index] = &strings.Builder{}
@@ -958,9 +972,11 @@ func (c *Client) callAPI(ctx context.Context, req *MessagesRequest) (*MessagesRe
 		// Positive identification of the provider's context-too-long refusal
 		// (HLD §5.2 step 12) — the only relief trigger.
 		if llm.IsAnthropicContextTooLong(httpResp.StatusCode, respBody) {
-			return nil, fmt.Errorf("API error (status %d): %s: %w", httpResp.StatusCode, string(respBody), llm.ErrContextTooLong)
+			return nil, llm.WrapHTTPStatus(httpResp.StatusCode,
+				fmt.Errorf("API error (status %d): %s: %w", httpResp.StatusCode, string(respBody), llm.ErrContextTooLong))
 		}
-		return nil, fmt.Errorf("API error (status %d): %s", httpResp.StatusCode, string(respBody))
+		return nil, llm.WrapHTTPStatus(httpResp.StatusCode,
+			fmt.Errorf("API error (status %d): %s", httpResp.StatusCode, string(respBody)))
 	}
 
 	// Parse response
@@ -1041,12 +1057,7 @@ func (c *Client) post(ctx context.Context, req *MessagesRequest, betaHeader stri
 		if err != nil {
 			return nil, fmt.Errorf("failed to create request: %w", err)
 		}
-		r.Header.Set("Content-Type", "application/json")
-		r.Header.Set("x-api-key", c.apiKey)
-		r.Header.Set("anthropic-version", "2023-06-01")
-		// Prompt caching (cached tokens don't count against Anthropic's ITPM
-		// rate limit) and any model-specific betas.
-		r.Header.Set("anthropic-beta", betaHeader)
+		c.setRequestHeaders(r, betaHeader)
 		return r, nil
 	}
 	if c.rateLimiter == nil {
@@ -1075,6 +1086,16 @@ func (c *Client) post(ctx context.Context, req *MessagesRequest, betaHeader stri
 			return nil, llm.NewThrottleError(
 				fmt.Errorf("API error (status 429): %s", string(respBody)),
 				llm.RetryAfterFromHeaders(resp.Header))
+		}
+		// 500/502/503/504/529 (overloaded): retried by the rate limiter
+		// under the throttle budget; status known before any content
+		// streams, so the re-send duplicates nothing.
+		if llm.IsTransientStatus(resp.StatusCode) {
+			respBody, _ := io.ReadAll(io.LimitReader(resp.Body, llm.MaxErrorBodyBytes))
+			_ = resp.Body.Close()
+			return nil, llm.NewTransientError(
+				fmt.Errorf("API error (status %d): %s", resp.StatusCode, string(respBody)),
+				resp.StatusCode, llm.RetryAfterFromHeaders(resp.Header))
 		}
 		return resp, nil
 	})

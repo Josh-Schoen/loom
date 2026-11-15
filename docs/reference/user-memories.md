@@ -49,8 +49,9 @@ SQLite and PostgreSQL graph memory stores).
 
 Every request reads and changes only the caller's memories. The caller is the
 user ID set by the identity interceptors: the paired device's user
-([device pairing](device-pairing.md)), the authenticated user, or the
-`Grpc-Metadata-X-User-Id` header (when authentication is off). Without one it is `default-user`. Another user's memory
+([device pairing](device-pairing.md)), the authenticated user, or gRPC
+`x-user-id` metadata (when authentication is off; the HTTP gateway does not
+forward `Grpc-Metadata-X-User-Id`). Without one it is `default-user`. Another user's memory
 answers exactly like a missing one (`NOT_FOUND`).
 
 Isolation is only as strong as identity: when neither `server.auth.enabled`

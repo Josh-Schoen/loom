@@ -49,7 +49,7 @@ Salience-driven graph-backed episodic memory for persistent, cross-session agent
 2. **Salience-Driven Retrieval**: Not all memories are equal; salience scoring with time decay ensures the most important and recent memories surface first
 3. **Immutable Audit Trail**: Memory content is append-only with lineage tracking (SUPERSEDES, CONSOLIDATES), providing a complete historical record
 4. **Token Budget Control**: Automatic context truncation prevents memory injection from overflowing the LLM context window
-5. **Agent- and User-Scoped Isolation**: Each agent maintains its own knowledge graph, and within an agent each user (the caller's user ID) has their own entities, edges, and memories; no cross-agent or cross-user leakage
+5. **Agent- and User-Scoped Isolation**: Each agent maintains its own knowledge graph, and within an agent each user (the caller's user ID) has their own entities, edges, and memories; no cross-agent or cross-user leakage. The `agent_id` key is `Config.GraphMemoryAgentID` when set, otherwise `Config.Name`
 6. **Opt-Out by Default**: Graph memory is enabled when a store is available; agents must explicitly disable it
 
 **Non-goals**:
@@ -100,7 +100,7 @@ Salience-driven graph-backed episodic memory for persistent, cross-session agent
 ```
 
 **External Dependencies**:
-- **LLM Provider**: Context window constraint; graph memory context sent in the trailing `<system-reminder>` note, after the cached prefix
+- **LLM Provider**: Context window constraint; graph memory context sent as a `<system-reminder>` user message pinned after the turn's user message, past the cached prefix
 - **Agent Runtime**: Calls `graphMemoryNote()` each turn, registers `graph_memory` tool
 - **Storage Backend**: Must implement `GraphMemoryProvider` interface to supply a `GraphMemoryStore`
 
@@ -232,9 +232,9 @@ Enforcement differs by backend:
 Background work that runs without a user identity (for example, the skill-eviction
 salience boost, which uses `context.Background()`) operates on `default-user` rows only.
 
-Migrations: SQLite `000010_graph_entities_per_user` rebuilds `graph_entities` to
+Migrations: SQLite `000015_graph_entities_per_user` rebuilds `graph_entities` to
 change `UNIQUE(agent_id, name)` to `UNIQUE(agent_id, user_id, name)`; PostgreSQL
-`000025_graph_entities_per_user` swaps the constraint in place. Rolling either back
+`000030_graph_entities_per_user` swaps the constraint in place. Rolling either back
 fails if two users under one agent have an entity with the same name.
 
 
@@ -414,7 +414,27 @@ Uses multiplicative combination (`CombineScores` in `pkg/memory/salience.go:122`
 1. Extract topic from the most recent user message (truncated to 200 chars)
 2. Query `ContextFor()` on the agent's own entity name, using topic as search filter
 3. Format result via `EntityRecall.Format()` into structured text
-4. Return the note `[Graph Memory Context]\n{formatted_recall}`, which every LLM call of the turn carries in its trailing `<system-reminder>` user message (`withTransientTail`, with the request context and soft reminder). It is never added to the session, so it is not persisted and a resumed turn recalls again. It is not a system message: the Anthropic client moves system messages into the request's `system` field, ahead of the conversation, where a note that changes every turn would miss the prompt cache on every call.
+4. Return the note `[Graph Memory Context]\n{formatted_recall}`. The turn's first LLM call sends it as a `<system-reminder>` user message after the user message, and every later call of the turn, the synthesis call included, sends it at that same position (`SegmentedMemory.PinTurnNotes`). The request context (`WeaveRequest.context`, `ReminderRequestContext`), soft reminders and the tool-change note are pinned the same way, after the rows of the call that first sent them. A status reminder whose text changes from call to call (the tool and turn budget reminders, the context relief warning) is sent once per turn with the first call's figures, since a later call can't replace it; event notes (a repeat-call hint, a tool-set delta) are sent on every call that carries one, except a resend after a refusal, which adds no row and repeats none of them (`TurnReminder` in `pkg/agent/context_compilation.go`). It is never added to the stored session, so it is not persisted and a resumed turn recalls again. When the next turn starts, the turn's reminders are no longer compiled.
+
+   The reminder stays in place for the whole turn because of preserved thinking (https://platform.claude.com/docs/en/build-with-claude/preserved-thinking): a thinking block stays valid only while everything sent before it is unchanged, and removing a text block from an earlier user turn invalidates the thinking blocks after it. A reminder appended to the end of each call and dropped on the next would do that on the second call of every tool turn, which is a 400 `invalid_request_error` for accounts created on or after 2026-08-31 on Claude Opus 5.5, Sonnet 5.5, Haiku 5.5 and Fable 5.1. Pinned in place, the request only grows within a turn. The thinking fingerprint (`thinkingPrefix`) includes the pinned reminders, so a settled turn's thinking written after a reminder is left out once the reminder is gone.
+
+   It is not a system message: the Anthropic client moves system messages into the request's `system` field, ahead of the conversation, where a note that changes every turn would miss the prompt cache on every call.
+
+   `TestGraphMemoryRecall_PromptCacheLive` (`pkg/agent/graph_memory_prompt_cache_live_test.go`, needs `ANTHROPIC_API_KEY`) runs an eight-message conversation against the Anthropic API and logs the cache read, cache write and uncached input tokens the API reports for each main call. It requests thinking at level `auto` (`LOOM_LIVE_CACHE_THINKING` sets another, `none` turns it off) and logs how many thinking blocks each request replays. `TestGraphMemoryRecall_PromptCache` checks the same properties offline on every run, with every message a two-call tool turn whose first response carries a thinking block: one recall note per request, none in the `system` field, each call reading back what the previous one cached up to its recall note, and every replayed thinking block following the exact prefix it was written after (`thinkingPrefixFailures`, which applies the provider's rule to the captured request bodies). In its prefix-cache model, requests 2 to 16 read 94% of their bytes from the cache. The earlier trailing-reminder layout read 97% in the same model, but it fails the thinking check on the second call of every tool turn.
+
+   One run each on 2026-10-27, `claude-haiku-5-5`, each message sent right after the previous one (inside the 5-minute cache lifetime). "Before" is `main` at 99c51663 with the live test added; "After" is this change. Totals are for every main call after the first; the runs made 16 and 14 main calls in all, because the model chose its own `graph_memory` tool calls, so compare the shares. Cost is loom's estimate (`calculateCost`), which prices `claude-haiku-5-5` at the generic Haiku fallback rate.
+
+   | Calls 2 onward | Before | After |
+   |---|---|---|
+   | Input tokens read from cache | 162,770 (82%) | 164,752 (97%) |
+   | Input tokens written to cache | 16,331 | 3,544 |
+   | Uncached input tokens | 19,520 | 1,652 |
+   | Estimated cost | $0.0740 | $0.0383 |
+   | Recall notes in the last request | 7 | 1 |
+
+   These runs did not request thinking (the live test then left `ThinkingLevel` unset), so they measure the recall note's move. Whether the model returned thinking blocks anyway was not recorded (the request bodies were not kept). They also predate pinning: "After" sent the note as a trailing message, which reads more of the previous turn back from the cache than the pinned layout does (a pinned note sits after the previous message, so the next message's first call reads the cache only up to that message). No live run of the pinned layout has been recorded here yet. With thinking on, the cache also depends on settled turns keeping their thinking blocks while the context before them is unchanged (`compileLocked` in `pkg/agent/context_compilation.go`): current models keep earlier turns' thinking, so leaving it out changes the request from the first tool call of each earlier message that used tools. The offline test covers that; a live run with thinking on has not been recorded here yet.
+
+   The recall note is not stored, but it is sent, so the relief estimate and the provider-count calibration include it, as they include the advertised tool schemas. Before a call, the notes it will pin count as the pending tail (`SegmentedMemory.SetTransientTail`). Once pinned, they are compiled messages.
 
 **Token Budget**: Controlled by config. Default: 20% of context window (200K * 20% = 40K tokens). Can be overridden with absolute `max_context_tokens`. Within `ContextFor()`, the budget is allocated in three phases: entity profile (200 tokens reserved), graph neighborhood (300 tokens reserved), and remaining budget for ranked memories via `AllocateMemoryBudget()` in `pkg/memory/budget.go`.
 
@@ -721,6 +741,8 @@ SELECT DISTINCT * FROM neighbor_walk
 **Description**: Knowledge graphs are isolated per `agent_id`, and per user within an agent. No cross-agent or cross-user memory sharing.
 
 **Impact**: Two agents, or two users of one agent, cannot share knowledge unless explicitly copied. This is by design for isolation. On SQLite, isolation depends on the caller's identity reaching the request context (see `docs/reference/security-model.md`); Loom does not authenticate that identity itself.
+
+**Key**: `agent_id` is `Config.GraphMemoryAgentID` when set, otherwise `Config.Name`; set an ID to keep memories across a rename. Two agents given the same ID share one graph. The ID is set from Go only (`agent.WithGraphMemoryAgentID` or `agent.WithConfig`); there is no YAML or proto field. The `graph_memory.recall` span records the key as `graph_memory.agent_key`.
 
 ### Constraint 3: Keyword Search Only
 

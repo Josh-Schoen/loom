@@ -445,9 +445,11 @@ func sseClientToolRun(t *testing.T, h *HTTPServer, srv *MultiAgentServer, header
 }
 
 // With the gRPC identity interceptor installed, an SSE stream is attributed
-// the same way a gateway call is: the default user when no identity is sent,
-// or the user forwarded in a Grpc-Metadata-X-User-Id header. Results from that
-// identity are accepted; results from anyone else are not.
+// the same way a gateway call is: the default user when no identity is sent.
+// A Grpc-Metadata-X-User-Id header claims nothing: the gateway stopped
+// forwarding Grpc-Metadata-* headers in grpc-gateway v2.33, and the SSE route
+// maps headers through the same mux. Results from the stream's identity are
+// accepted; results from anyone else are not.
 func TestStreamWeaveSSE_IdentityMatchesGateway(t *testing.T) {
 	userIDCfg := UserIDConfig{DefaultUserID: "default-user"}
 	tests := []struct {
@@ -458,8 +460,8 @@ func TestStreamWeaveSSE_IdentityMatchesGateway(t *testing.T) {
 	}{
 		{"default identity", nil, "default-user", true},
 		{"default identity, other submitter", nil, "mallory", false},
-		{"forwarded user", map[string]string{"Grpc-Metadata-X-User-Id": "alice"}, "alice", true},
-		{"forwarded user, default submitter", map[string]string{"Grpc-Metadata-X-User-Id": "alice"}, "default-user", false},
+		{"forwarded header ignored", map[string]string{"Grpc-Metadata-X-User-Id": "alice"}, "alice", false},
+		{"forwarded header ignored, default submitter", map[string]string{"Grpc-Metadata-X-User-Id": "alice"}, "default-user", true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

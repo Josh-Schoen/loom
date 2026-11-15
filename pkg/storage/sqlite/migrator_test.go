@@ -19,6 +19,7 @@ package sqlite
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -404,55 +405,62 @@ func TestNewMigrator_NilTracer(t *testing.T) {
 	assert.Equal(t, latestMigrationVersion(t), version, "migration should succeed with nil tracer fallback")
 }
 
-// TestMigrateUp_RepairsRenumberedForkMigration simulates a database from
-// this fork before it merged upstream: it ran the fork's
-// 000009_graph_entities_per_user, recorded as version 9, and never ran
-// upstream's 000009_task_created_via. MigrateUp must move the fork's record
-// to 10 (it is now 000010), apply upstream's 9, and leave the database at
-// the latest version without running the graph rebuild twice.
+// TestMigrateUp_RepairsRenumberedForkMigration simulates databases from
+// this fork before it merged upstream: they ran the fork's
+// graph_entities_per_user migration recorded as version 9 (its first number)
+// or 10 (its second), and never ran the upstream migrations that now hold
+// those numbers. MigrateUp must move the fork's record to 15 (it is now
+// 000015), apply every upstream migration from the old number on, and leave
+// the database at the latest version without running the graph rebuild
+// twice.
 func TestMigrateUp_RepairsRenumberedForkMigration(t *testing.T) {
-	db := newTestDB(t)
-	ctx := context.Background()
+	for _, oldVersion := range []int{9, 10} {
+		t.Run(fmt.Sprintf("recorded_as_%d", oldVersion), func(t *testing.T) {
+			db := newTestDB(t)
+			ctx := context.Background()
 
-	migrator, err := NewMigrator(db, observability.NewNoOpTracer())
-	require.NoError(t, err)
-	require.NoError(t, migrator.ensureMigrationsTable(ctx))
-	for _, mig := range migrator.migrations {
-		switch {
-		case mig.Version < 9:
-			require.NoError(t, migrator.applyMigration(ctx, mig))
-		case mig.Version == 10:
-			// The fork's graph migration, recorded under its old number.
-			require.Equal(t, "graph_entities_per_user", mig.Description)
-			_, err := db.ExecContext(ctx, mig.UpSQL)
+			migrator, err := NewMigrator(db, observability.NewNoOpTracer())
 			require.NoError(t, err)
-			_, err = db.ExecContext(ctx, "INSERT INTO schema_migrations (version, description) VALUES (9, 'graph_entities_per_user')")
+			require.NoError(t, migrator.ensureMigrationsTable(ctx))
+			for _, mig := range migrator.migrations {
+				switch {
+				case mig.Version < oldVersion:
+					require.NoError(t, migrator.applyMigration(ctx, mig))
+				case mig.Version == 15:
+					// The fork's graph migration, recorded under its old number.
+					require.Equal(t, "graph_entities_per_user", mig.Description)
+					_, err := db.ExecContext(ctx, mig.UpSQL)
+					require.NoError(t, err)
+					_, err = db.ExecContext(ctx, "INSERT INTO schema_migrations (version, description) VALUES (?, 'graph_entities_per_user')", oldVersion)
+					require.NoError(t, err)
+				}
+			}
+			require.False(t, tableExists(t, db, "workflow_checkpoints"), "precondition: upstream's 10 never ran")
+
+			require.NoError(t, migrator.MigrateUp(ctx), "MigrateUp should repair the renumber, not fail")
+
+			assert.True(t, columnExists(t, db, "tasks", "created_via"), "upstream's 000009_task_created_via applied")
+			assert.True(t, tableExists(t, db, "workflow_checkpoints"), "upstream's 000010_workflow_checkpoints applied")
+			rows, err := db.QueryContext(ctx, "SELECT version, description FROM schema_migrations WHERE version IN (9, 10, 15) ORDER BY version")
 			require.NoError(t, err)
-		}
+			defer func() { _ = rows.Close() }()
+			got := map[int]string{}
+			for rows.Next() {
+				var v int
+				var d string
+				require.NoError(t, rows.Scan(&v, &d))
+				got[v] = d
+			}
+			assert.Equal(t, map[int]string{9: "task_created_via", 10: "workflow_checkpoints", 15: "graph_entities_per_user"}, got)
+
+			version, err := migrator.CurrentVersion(ctx)
+			require.NoError(t, err)
+			assert.Equal(t, latestMigrationVersion(t), version)
+
+			// Running again changes nothing.
+			require.NoError(t, migrator.MigrateUp(ctx))
+		})
 	}
-	require.False(t, columnExists(t, db, "tasks", "created_via"), "precondition: upstream's 9 never ran")
-
-	require.NoError(t, migrator.MigrateUp(ctx), "MigrateUp should repair the renumber, not fail")
-
-	assert.True(t, columnExists(t, db, "tasks", "created_via"), "upstream's 000009_task_created_via applied")
-	rows, err := db.QueryContext(ctx, "SELECT version, description FROM schema_migrations WHERE version IN (9, 10) ORDER BY version")
-	require.NoError(t, err)
-	defer func() { _ = rows.Close() }()
-	got := map[int]string{}
-	for rows.Next() {
-		var v int
-		var d string
-		require.NoError(t, rows.Scan(&v, &d))
-		got[v] = d
-	}
-	assert.Equal(t, map[int]string{9: "task_created_via", 10: "graph_entities_per_user"}, got)
-
-	version, err := migrator.CurrentVersion(ctx)
-	require.NoError(t, err)
-	assert.Equal(t, latestMigrationVersion(t), version)
-
-	// Running again changes nothing.
-	require.NoError(t, migrator.MigrateUp(ctx))
 }
 
 func columnExists(t *testing.T, db *sql.DB, table, column string) bool {
