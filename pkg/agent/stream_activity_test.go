@@ -185,3 +185,37 @@ func TestChatWithStreaming_ToolInputProgressCarriesCallIndex(t *testing.T) {
 	assert.Equal(t, "files", inputEvents[0].ToolCallID)
 	assert.Equal(t, inputEvents[0].ToolCallID, inputEvents[1].ToolCallID, "both calls share one ID — only the index tells them apart")
 }
+
+func TestChatWithStreaming_ToolInputTextArrivesWholeAndInOrder(t *testing.T) {
+	var events []ProgressEvent
+	ctx := newTestContextWithProgress(nil)
+	pieces := []string{`{"path":"index.html",`, `"text":"<h1>`, `Lake trip`, `</h1>"}`}
+	var steps []llmtypes.ToolInputProgress
+	total := 0
+	for _, p := range pieces {
+		total += len(p)
+		steps = append(steps, llmtypes.ToolInputProgress{Index: 0, ToolCallID: "call_1", ToolName: "write_file", Bytes: total, Delta: p})
+	}
+	steps = append(steps, llmtypes.ToolInputProgress{Index: 1, ToolCallID: "call_2", ToolName: "notes", Bytes: 2, Delta: "{}"})
+	a := &Agent{llm: &toolInputProgressProvider{steps: steps}}
+
+	_, err := a.chatWithStreaming(ctx, []Message{{Role: "user", Content: "make a page"}}, nil, func(e ProgressEvent) { events = append(events, e) })
+	require.NoError(t, err)
+
+	joined := map[string]string{}
+	bytes := map[string]int64{}
+	for _, e := range events {
+		if !e.IsToolInputStream {
+			continue
+		}
+		if e.ToolInputDelta != "" {
+			assert.False(t, e.Droppable, "a piece of the arguments must never be dropped")
+		}
+		joined[e.ToolCallID] += e.ToolInputDelta
+		bytes[e.ToolCallID] = e.ToolInputBytes
+		assert.Empty(t, e.PartialContent, "tool input never leaks into the visible partial content")
+	}
+	assert.Equal(t, `{"path":"index.html","text":"<h1>Lake trip</h1>"}`, joined["call_1"])
+	assert.Equal(t, int64(len(joined["call_1"])), bytes["call_1"])
+	assert.Equal(t, "{}", joined["call_2"])
+}

@@ -11445,7 +11445,7 @@
         },
         "isToolInputStream": {
           "type": "boolean",
-          "description": "True while the model is still writing a tool call's arguments. Carries no\nargument content; tool_name, tool_call_id and tool_input_bytes identify the\ncall when the provider reports them."
+          "description": "True while the model is still writing a tool call's arguments; tool_name,\ntool_call_id and tool_input_bytes identify the call when the provider\nreports them, and tool_input_delta carries the arguments written since."
         },
         "toolInputBytes": {
           "type": "string",
@@ -11460,6 +11460,10 @@
         "clientToolCall": {
           "$ref": "#/definitions/v1ClientToolCall",
           "description": "Fork-only WeaveProgress fields use numbers from 1001 up so upstream's\nnext fields cannot collide with them. loom-mobile reads this message as\nJSON by name, so the number is not part of its contract.\n\nSet when the agent called one of the request's client_tools. The turn is\nheld until the caller posts SubmitClientToolResult for\nclient_tool_call.tool_call_id or the call times out. Consumers that did\nnot declare client tools never receive this field."
+        },
+        "toolInputDelta": {
+          "type": "string",
+          "description": "The tool-call argument JSON received since this call's last event (when\nis_tool_input_stream): joined in order, a call's deltas are its arguments\nas the model writes them (a file's text, a page's HTML), so a client can\nshow them arriving before the call runs. tool_input_bytes is the joined\nlength, so a missing piece shows. Empty on a bare activity pulse."
         }
       },
       "description": "WeaveProgress streams incremental updates during execution."

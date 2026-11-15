@@ -9,6 +9,7 @@ package loadtest
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"math/rand"
 	"sync"
@@ -258,8 +259,55 @@ func (p *Provider) ChatStream(ctx context.Context, messages []types.Message, too
 		}
 	}
 
+	// Tool calls' arguments, streamed in chunks as a model writes them, for
+	// a caller watching tool-input progress (types.WithToolInputProgress).
+	for idx, call := range resp.ToolCalls {
+		input, err := json.Marshal(call.Input)
+		if err != nil {
+			continue
+		}
+		sent := 0
+		if err := p.streamChunks(ctx, string(input), func(chunk string) {
+			sent += len(chunk)
+			types.NotifyToolInputProgress(ctx, types.ToolInputProgress{Index: idx, ToolCallID: call.ID, ToolName: call.Name, Bytes: sent, Delta: chunk})
+			types.NotifyStreamActivity(ctx)
+		}); err != nil {
+			p.recordCall(time.Since(start), false)
+			return nil, err
+		}
+	}
+
 	p.recordCall(time.Since(start), true)
 	return resp, nil
+}
+
+// streamChunks passes text on in chunks of StreamChunkSize characters with
+// StreamChunkDelay between them.
+func (p *Provider) streamChunks(ctx context.Context, text string, send func(string)) error {
+	size := p.config.StreamChunkSize
+	if size <= 0 {
+		size = 10
+	}
+	wait := p.config.StreamChunkDelay
+	if wait <= 0 {
+		wait = 5 * time.Millisecond
+	}
+	runes := []rune(text)
+	for i := 0; i < len(runes); i += size {
+		end := min(i+size, len(runes))
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		send(string(runes[i:end]))
+		if end < len(runes) {
+			select {
+			case <-time.After(wait):
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+	}
+	return nil
 }
 
 // simulateLatency returns the delay for this call.

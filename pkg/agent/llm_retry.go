@@ -559,6 +559,14 @@ func (p *throttlePatience) recordWait(ctx Context, wait time.Duration, waitStart
 // not one event per JSON fragment.
 const toolInputActivityInterval = time.Second
 
+// toolInputTextInterval and toolInputTextBytes pace the pieces of a tool
+// call's argument text (ProgressEvent.ToolInputDelta): often enough to watch
+// a file being written, not one event per JSON fragment.
+const (
+	toolInputTextInterval = 100 * time.Millisecond
+	toolInputTextBytes    = 4 << 10
+)
+
 // chatWithStreaming uses streaming API with token buffering and progress emission.
 func (a *Agent) chatWithStreaming(ctx Context, messages []Message, tools []shuttle.Tool, progressCallback ProgressCallback) (*LLMResponse, error) {
 	streamingProvider, ok := a.llm.(llmtypes.StreamingLLMProvider)
@@ -662,22 +670,57 @@ func (a *Agent) chatWithStreaming(ctx Context, messages []Message, tools []shutt
 		})
 	})
 
-	// Providers that know which call is streaming also report its id, name and
-	// size so far. The first delta of each call (and the delta that first
-	// supplies its name or id) is emitted immediately so a consumer can show
-	// the tool before its arguments finish; later deltas are throttled.
+	// Providers that know which call is streaming also report its id, name,
+	// size so far and the argument JSON just received. The first delta of
+	// each call (and the delta that first supplies its name or id) is emitted
+	// immediately so a consumer can show the tool before its arguments
+	// finish. The argument text goes out in pieces at most every
+	// toolInputTextInterval or toolInputTextBytes, so a consumer can show
+	// what the model is writing (a file, a page) as it writes it; a call with
+	// nothing new since its last event gets the slower activity pulse.
 	type toolInputCall struct {
 		id, name string
+		index    int32
 		lastEmit time.Time
+		pending  strings.Builder
+		bytes    int
 	}
 	toolInputCalls := map[int]*toolInputCall{}
+	var toolInputOrder []int
+	emitToolInput := func(call *toolInputCall, now time.Time) {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		delta := call.pending.String()
+		call.pending.Reset()
+		call.lastEmit = now
+		progressCallback(ProgressEvent{
+			Stage:             StageLLMGeneration,
+			Progress:          50,
+			Message:           "Generating tool call...",
+			Timestamp:         now,
+			IsToolInputStream: true,
+			// A piece of the arguments can't be rebuilt if it's lost.
+			Droppable:      delta == "",
+			TokenCount:     tokenCount,
+			TTFT:           ttft,
+			ToolName:       call.name,
+			ToolCallID:     call.id,
+			ToolInputBytes: int64(call.bytes),
+			ToolInputDelta: delta,
+			ToolCallIndex:  call.index,
+		})
+	}
 	streamCtx = llmtypes.WithToolInputProgress(streamCtx, func(p llmtypes.ToolInputProgress) {
 		toolInputReported = true
 		now := time.Now()
 		call, seen := toolInputCalls[p.Index]
 		if !seen {
-			call = &toolInputCall{}
+			call = &toolInputCall{index: int32(p.Index)}
 			toolInputCalls[p.Index] = call
+			toolInputOrder = append(toolInputOrder, p.Index)
 		}
 		identityChanged := !seen ||
 			(p.ToolName != "" && p.ToolName != call.name) ||
@@ -688,29 +731,14 @@ func (a *Agent) chatWithStreaming(ctx Context, messages []Message, tools []shutt
 		if p.ToolCallID != "" {
 			call.id = p.ToolCallID
 		}
-		if !identityChanged && now.Sub(call.lastEmit) < toolInputActivityInterval {
+		call.pending.WriteString(p.Delta)
+		call.bytes = p.Bytes
+		since := now.Sub(call.lastEmit)
+		textDue := call.pending.Len() > 0 && (since >= toolInputTextInterval || call.pending.Len() >= toolInputTextBytes)
+		if !identityChanged && !textDue && since < toolInputActivityInterval {
 			return
 		}
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
-		call.lastEmit = now
-		progressCallback(ProgressEvent{
-			Stage:             StageLLMGeneration,
-			Progress:          50,
-			Message:           "Generating tool call...",
-			Timestamp:         now,
-			IsToolInputStream: true,
-			Droppable:         true,
-			TokenCount:        tokenCount,
-			TTFT:              ttft,
-			ToolName:          call.name,
-			ToolCallID:        call.id,
-			ToolInputBytes:    int64(p.Bytes),
-			ToolCallIndex:     int32(p.Index),
-		})
+		emitToolInput(call, now)
 	})
 
 	// Call streaming provider. Throttling pauses and re-invokes — the
@@ -726,6 +754,7 @@ func (a *Agent) chatWithStreaming(ctx Context, messages []Message, tools []shutt
 		ttft = 0
 		ttftRecorded = false
 		clear(toolInputCalls)
+		toolInputOrder = toolInputOrder[:0]
 
 		var err error
 		resp, err = streamingProvider.ChatStream(streamCtx, messages, tools, tokenCallback)
@@ -739,6 +768,12 @@ func (a *Agent) chatWithStreaming(ctx Context, messages []Message, tools []shutt
 			continue
 		}
 		return nil, err
+	}
+	// The rest of each call's arguments, before the call starts.
+	for _, idx := range toolInputOrder {
+		if call := toolInputCalls[idx]; call.pending.Len() > 0 {
+			emitToolInput(call, time.Now())
+		}
 	}
 
 	// Emit final progress event with complete content

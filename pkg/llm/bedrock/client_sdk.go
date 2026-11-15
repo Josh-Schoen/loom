@@ -808,6 +808,7 @@ func (c *SDKClient) ChatStream(ctx context.Context, messages []llmtypes.Message,
 							ToolCallID: toolCalls[toolIdx].ID,
 							ToolName:   toolCalls[toolIdx].Name,
 							Bytes:      buf.Len(),
+							Delta:      event.Delta.PartialJSON,
 						})
 					}
 				}

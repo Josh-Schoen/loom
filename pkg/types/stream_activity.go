@@ -49,6 +49,10 @@ type ToolInputProgress struct {
 	ToolName   string
 	// Bytes is the length of the argument JSON received so far for this call.
 	Bytes int
+	// Delta is the argument JSON this report adds: the piece just received
+	// (the whole of it from a provider that sends a call complete). Joined
+	// in order, a call's deltas are its argument JSON, Bytes long.
+	Delta string
 }
 
 type toolInputProgressKey struct{}
